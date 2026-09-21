@@ -1,0 +1,9 @@
+# .cargo/config.toml — 构建参数
+#
+# 让 MSVC 工具链静态链接 C 运行时（CRT）。
+# 这样 everything_mcp.dll 不依赖 vcruntime140.dll / ucrtbase.dll 这类可分发库；
+# 最终导入表里只剩 Windows 自带的 kernel32 / ws2_32 / advapi32 等。
+#
+# Rust 用 target-feature=+crt-static 在 MSVC 上自动选择 /MT + libcmt.lib。
+[target.'cfg(target_env = "msvc")']
+rustflags = ["-C", "target-feature=+crt-static"]

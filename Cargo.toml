@@ -1,0 +1,48 @@
+[package]
+name = "everything_mcp"
+version = "1.0.0"
+edition = "2021"
+authors = ["JOJO"]
+description = "Everything 1.5 in-process plugin exposing file search as an MCP server for LLMs"
+license = "MIT"
+readme = "README.md"
+
+# 输出 DLL：Everything 1.5 通过 LoadLibrary 加载本插件，
+# 只需要 cdylib（动态链接库）。rlib 同时声明方便单元测试引用内部类型。
+[lib]
+name = "everything_mcp"
+crate-type = ["cdylib", "rlib"]
+
+# ====== 关键：零第三方 DLL 依赖 ======
+# 所有依赖项必须满足「编译产物不含额外 DLL」的硬性要求：
+#   - 不引入任何非系统 DLL（仅允许 kernel32/user32/ws2_32/advapi32 等 Windows 自带库）
+#   - tokio/axum/hyper/reqwest 等重量级 crate 一律不用
+#   - serde / serde_json 是纯 Rust 实现，静态链接，零 DLL 依赖
+#   - windows-sys 仅通过 `link` 属性绑定系统 DLL，不引入额外组件
+#
+# HTTP 服务端用 std::net + std::thread 手写（同步阻塞 IO 完全够 MCP 单机调用场景）。
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# windows-sys 仅声明系统 API 的 FFI 绑定，不携带任何 DLL。
+# 只启用我们真正用到的功能：事件、线程同步。
+[dependencies.windows-sys]
+version = "0.59"
+features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+    "Win32_Security",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Graphics_Gdi",
+]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.dev]
+panic = "abort"

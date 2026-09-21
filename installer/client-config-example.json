@@ -1,0 +1,36 @@
+{
+  "_comment": "Claude Desktop / Cursor / 任意支持 MCP 的客户端接入示例",
+  "_comment_2": "把这个 mcpServers 段合并到你的 MCP 客户端配置文件里。",
+
+  "mcpServers": {
+    "everything": {
+      "_comment": "MCP 协议要求本地进程或 HTTP 端点。",
+      "_comment_2": "Everything MCP 插件以 Streamable HTTP 方式暴露服务。",
+      "_comment_3": "默认监听 127.0.0.1:8285 —— 与 Everything 主进程同机部署。",
+
+      "url": "http://127.0.0.1:8285/",
+
+      "_transport": "http",
+
+      "_example_tools": [
+        "search_in_folder  在指定文件夹下按 Everything 语法搜索",
+        "list_folder       列出某个目录的直接子项（文件/文件夹）",
+        "count             统计匹配文件数量"
+      ],
+
+      "_example_call": {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+          "name": "search_in_folder",
+          "arguments": {
+            "folder": "D:\\source\\repos\\my-project",
+            "pattern": "ext:rs;toml",
+            "max_results": 30
+          }
+        }
+      }
+    }
+  }
+}

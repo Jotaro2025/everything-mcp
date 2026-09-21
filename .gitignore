@@ -1,0 +1,37 @@
+# ===== Rust / Cargo =====
+/target/
+**/target/
+
+# ===== 构建产物 =====
+*.dll
+*.exe
+*.lib
+*.obj
+*.exp
+*.ilk
+*.pdb
+*.rlib
+*.log
+build_out.txt
+FAILED
+
+# reference/ 下是 voidtools 官方 SDK 与示例，其自带的 .dll/.lib 需要随仓库分发
+!reference/**/*.dll
+!reference/**/*.lib
+
+# ===== NSIS 安装包输出 =====
+installer/bin/
+
+# ===== 操作系统 / 编辑器 =====
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*~
+
+# ===== ZCode 本地配置（工作区专用，不必入库）=====
+.zcode/
+/.vs

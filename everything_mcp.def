@@ -1,0 +1,13 @@
+; =====================================================================
+; everything_mcp.def  — 模块定义文件，控制 DLL 导出表
+; ---------------------------------------------------------------------
+; Everything 1.5 插件协议只识别一个导出函数：
+;     void* WINAPI everything_plugin_proc(DWORD msg, void* data)
+;
+; 其他符号（Rust 生成的 _ZN*, panic 处理器, std 库内部符号等）一律不导出，
+; 既减小体积，也避免与 Everything 主体或其他插件发生符号冲突。
+; =====================================================================
+
+LIBRARY everything_mcp
+EXPORTS
+    everything_plugin_proc
