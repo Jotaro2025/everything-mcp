@@ -25,7 +25,19 @@ pub const PM_START: u32 = 8;
 pub const PM_STOP: u32 = 9;
 pub const PM_KILL: u32 = 10;
 pub const PM_GET_PLUGIN_VERSION: u32 = 11;
+/// 注册选项页：data 是 everything_plugin_ui_options_add_custom_page_s*。
 pub const PM_ADD_OPTIONS_PAGES: u32 = 12;
-pub const PM_CONFIG_CHANGED: u32 = 13;
+/// 加载选项页：data 是 everything_plugin_load_options_page_t*。
+pub const PM_LOAD_OPTIONS_PAGE: u32 = 13;
+/// 保存选项页：data 是 everything_plugin_save_options_page_t*。
+pub const PM_SAVE_OPTIONS_PAGE: u32 = 14;
+/// 查询选项页最小尺寸：data 是 everything_plugin_get_options_page_minmax_t*。
+pub const PM_GET_OPTIONS_PAGE_MINMAX: u32 = 15;
+/// 选项页尺寸变化：data 是 everything_plugin_size_options_page_t*。
+pub const PM_SIZE_OPTIONS_PAGE: u32 = 16;
+/// 选项页窗口消息转发：data 是 everything_plugin_options_page_proc_t*。
+pub const PM_OPTIONS_PAGE_PROC: u32 = 17;
+/// 选项页销毁后的清理回调：data 是注册时的 user_data。
+pub const PM_KILL_OPTIONS_PAGE: u32 = 18;
 /// 保存设置：data 是设置上下文，插件在此写回自己的配置项（见 etp_server.c）。
 pub const PM_SAVE_SETTINGS: u32 = 19;

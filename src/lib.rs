@@ -6,8 +6,11 @@
 //! 主程序只调用一个导出函数 [`everything_plugin_proc`]，
 //! 我们根据 msg 分发到不同生命周期阶段：
 //!   - PM_INIT：索取 host 函数指针
-//!   - PM_START：安装主线程消息窗口、启动 MCP HTTP 服务
+//!   - PM_START：安装主线程消息窗口、读设置并按需启动 MCP HTTP 服务
 //!     （db 引用与 query 懒创建于第一次搜索，见 plugin::state）
+//!   - PM_ADD_OPTIONS_PAGES..PM_KILL_OPTIONS_PAGE：Everything 选项对话框里
+//!     的插件设置页（启用开关、绑定地址、端口），见 options 模块
+//!   - PM_SAVE_SETTINGS：把设置写回 Everything.ini
 //!   - PM_STOP / PM_KILL：关闭服务、释放引用
 //!
 //! 详见 `docs/PLUGIN_SDK_API_CN.md` 与 `README.md`。
@@ -15,6 +18,7 @@
 #![allow(non_snake_case)]
 
 mod mcp;
+mod options;
 mod plugin;
 
 use core::ffi::c_void;
@@ -96,7 +100,7 @@ unsafe fn everything_plugin_proc_impl(msg: u32, data: *mut c_void) -> *mut c_voi
         }
 
         // ============================================================
-        // PM_START：读取设置、注册主线程窗口、启动 HTTP 服务。
+        // PM_START：读取设置、注册主线程窗口、按需启动 HTTP 服务。
         // db 引用与 query 对象懒创建（首次搜索时）—— 见 plugin::state 文档。
         // ============================================================
         plugin::PM_START => {
@@ -106,11 +110,17 @@ unsafe fn everything_plugin_proc_impl(msg: u32, data: *mut c_void) -> *mut c_voi
                 return core::ptr::null_mut();
             }
             // 此时 host 表已就绪。读取我们关心的配置项：
-            //   - mcp_enabled：是否启用 MCP 服务（默认 1）
+            //   - mcp_enabled：是否启用 MCP 服务（默认 0 —— 不启用，
+            //     用户在 Everything 选项 → 插件 → MCP 设置页勾选启用）
             //   - mcp_port：HTTP 监听端口（默认 8285）
             //   - mcp_bind：监听地址（默认 127.0.0.1）
-            let enabled = read_setting_int(data, "mcp_enabled\0", 1);
-            let port = read_setting_int(data, "mcp_port\0", 8285) as u16;
+            let enabled = read_setting_int(data, "mcp_enabled\0", 0) != 0;
+            let port_raw = read_setting_int(data, "mcp_port\0", 8285);
+            let port = if (1..=65535).contains(&port_raw) {
+                port_raw as u16
+            } else {
+                options::DEFAULT_PORT
+            };
             let bind = read_setting_string(data, "mcp_bind\0", "127.0.0.1\0");
             plugin::diag::write(&format!("PM_START: enabled={} port={} bind={}", enabled, port, bind));
 
@@ -131,29 +141,9 @@ unsafe fn everything_plugin_proc_impl(msg: u32, data: *mut c_void) -> *mut c_voi
             // 把状态装到全局槽位。
             let _ = plugin::state::STATE.set(state);
 
-            if enabled != 0 {
-                // 启动 MCP HTTP 服务线程。
-                match mcp::server::start(&bind, port) {
-                    Ok(()) => {
-                        let msg = format!("PM_START: MCP listening on {}:{}", bind, port);
-                        plugin::diag::write(&msg);
-                        let mut buf = String::from("everything_mcp: MCP listening on ");
-                        buf.push_str(&bind);
-                        buf.push(':');
-                        buf.push_str(&port.to_string());
-                        Host::debug(&buf);
-                    }
-                    Err(e) => {
-                        let msg = format!("PM_START: MCP start failed: {}", e);
-                        plugin::diag::write(&msg);
-                        let mut buf = String::from("everything_mcp: MCP start failed: ");
-                        buf.push_str(&e);
-                        Host::debug(&buf);
-                    }
-                }
-            } else {
-                plugin::diag::write("PM_START: MCP disabled (mcp_enabled=0)");
-            }
+            // 载入设置并应用：启用则启动监听，否则保持关闭。
+            // 之后用户在设置页的改动也走同一条应用路径（options::apply）。
+            options::init(enabled, bind, port);
 
             1 as *mut c_void
         }
@@ -164,6 +154,7 @@ unsafe fn everything_plugin_proc_impl(msg: u32, data: *mut c_void) -> *mut c_voi
         plugin::PM_STOP => {
             Host::debug("everything_mcp: PM_STOP");
             mcp::server::stop();
+            options::mark_stopped();
             unsafe { plugin::state::destroy() };
             1 as *mut c_void
         }
@@ -171,21 +162,29 @@ unsafe fn everything_plugin_proc_impl(msg: u32, data: *mut c_void) -> *mut c_voi
         plugin::PM_KILL => {
             Host::debug("everything_mcp: PM_KILL");
             mcp::server::stop();
+            options::mark_stopped();
             unsafe { plugin::state::destroy() };
             1 as *mut c_void
         }
 
         // ============================================================
-        // PM_SAVE_SETTINGS：主程序在关闭/保存设置时调用，期望插件把自己的
-        // 配置项写回设置上下文（data）。我们的配置（mcp_enabled/mcp_port/
-        // mcp_bind）目前是只读的 —— 用户直接编辑 Everything.ini，
-        // 没有选项页，因此没有可写回的动态状态。返回 1 表示已处理。
-        // 若未来加选项页，这里配合 set_setting_int/set_setting_string 持久化。
+        // 选项页消息组 —— Everything 选项对话框里的「MCP」设置页。
+        // 控件由主程序的 os_create_* 工厂创建，消息处理见 options 模块。
         // ============================================================
-        plugin::PM_SAVE_SETTINGS => {
-            plugin::diag::write("PM_SAVE_SETTINGS: no dynamic settings to persist");
-            1 as *mut c_void
-        }
+        plugin::PM_ADD_OPTIONS_PAGES => options::add_page(data),
+        plugin::PM_LOAD_OPTIONS_PAGE => options::load_page(data),
+        plugin::PM_SAVE_OPTIONS_PAGE => options::save_page(data),
+        plugin::PM_GET_OPTIONS_PAGE_MINMAX => options::minmax(data),
+        plugin::PM_SIZE_OPTIONS_PAGE => options::size_page(data),
+        plugin::PM_OPTIONS_PAGE_PROC => options::page_proc(data),
+        plugin::PM_KILL_OPTIONS_PAGE => options::kill_page(data),
+
+        // ============================================================
+        // PM_SAVE_SETTINGS：主程序在关闭/保存设置时调用，期望插件把自己的
+        // 配置项写回设置上下文（data）。设置来源可能是设置页、也可能是用户
+        // 手改 Everything.ini —— 统一由 options 模块持有并在此持久化。
+        // ============================================================
+        plugin::PM_SAVE_SETTINGS => options::save_settings(data),
 
         // ============================================================
         // 元信息查询：返回静态 UTF-8 字符串指针。

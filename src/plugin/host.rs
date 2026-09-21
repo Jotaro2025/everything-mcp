@@ -48,6 +48,16 @@ pub type GetSettingIntFn =
 pub type GetSettingStringFn =
     unsafe extern "system" fn(data: *mut c_void, name: *const u8, current: *mut u8) -> *mut u8;
 
+/// 设置写回（PM_SAVE_SETTINGS 时把配置写进主程序的设置输出流）。
+/// data 是 output_stream_t；键名与读取时一致（如 "mcp_port"）。
+pub type SetSettingIntFn = unsafe extern "system" fn(data: *mut c_void, name: *const u8, value: i32);
+pub type SetSettingStringFn =
+    unsafe extern "system" fn(data: *mut c_void, name: *const u8, value: *const u8);
+
+/// 取主程序本地化字符串（返回 UTF-8 null 结尾指针，主程序所有）。
+/// 选项页 UI 文本用它探测界面语言（见 options 模块）。
+pub type LocalizationGetStringFn = unsafe extern "system" fn(id: i32) -> *const u8;
+
 /// 数据库引用计数管理。
 pub type DbAddLocalRefFn = unsafe extern "system" fn() -> DbHandle;
 pub type DbReleaseFn = unsafe extern "system" fn(db: DbHandle);
@@ -225,6 +235,69 @@ pub type OsCreateWindowFn = unsafe extern "system" fn(
 ) -> HWND;
 
 // ====================================================================
+// 选项页 UI 工厂函数
+//
+// Everything 选项对话框里的插件页由主程序提供的这些工厂函数搭建控件，
+// 以保持与主程序一致的视觉风格、DPI 缩放与本地化。
+// 签名与 http_server.c 中的 typedef 字节一致；控件 ID 由插件自定义，
+// 之后即可按标准 Win32 对话框方式操作（如 IsDlgButtonChecked）。
+//
+// 这些函数全部是**可选**依赖：主程序未暴露时插件照常加载，
+// 只是没有设置页（见 options 模块的降级处理）。
+// ====================================================================
+
+/// 在 Everything 选项对话框中注册一个插件设置页（PM_ADD_OPTIONS_PAGES 时调用）。
+/// 第一个参数是 PM_ADD_OPTIONS_PAGES 的 data（不透明，直接透传）。
+pub type UiOptionsAddPluginPageFn =
+    unsafe extern "system" fn(
+        add_custom_page: *mut c_void,
+        user_data: *mut c_void,
+        name: *const u8,
+    ) -> *mut c_void;
+
+pub type OsCreateCheckboxFn = unsafe extern "system" fn(
+    parent: HWND,
+    id: i32,
+    extra_style: DWORD,
+    checked: i32,
+    text: *const u8,
+) -> HWND;
+pub type OsCreateStaticFn = unsafe extern "system" fn(
+    parent: HWND,
+    id: i32,
+    extra_style: DWORD,
+    text: *const u8,
+) -> HWND;
+pub type OsCreateEditFn = unsafe extern "system" fn(
+    parent: HWND,
+    id: i32,
+    extra_style: DWORD,
+    text: *const u8,
+) -> HWND;
+/// 数字编辑框 —— `number` 是 __int64。
+pub type OsCreateNumberEditFn =
+    unsafe extern "system" fn(parent: HWND, id: i32, extra_style: DWORD, number: i64) -> HWND;
+pub type OsCreateButtonFn = unsafe extern "system" fn(
+    parent: HWND,
+    id: i32,
+    extra_style: DWORD,
+    text: *const u8,
+) -> HWND;
+pub type OsAddTooltipFn =
+    unsafe extern "system" fn(tooltip: HWND, parent: HWND, id: i32, text: *const u8);
+pub type OsSetDlgRectFn =
+    unsafe extern "system" fn(parent: HWND, id: i32, x: i32, y: i32, wide: i32, high: i32);
+pub type OsSetDlgTextFn = unsafe extern "system" fn(hwnd: HWND, id: i32, s: *const u8) -> i32;
+pub type OsGetDlgTextFn = unsafe extern "system" fn(hwnd: HWND, id: i32, cbuf: *mut Utf8Buf);
+pub type OsEnableOrDisableDlgItemFn = unsafe extern "system" fn(parent: HWND, id: i32, enable: i32);
+/// 逻辑像素尺寸（DPI 感知）—— 布局时把物理像素换算成逻辑像素用。
+pub type OsGetLogicalWideFn = unsafe extern "system" fn() -> i32;
+pub type OsGetLogicalHighFn = unsafe extern "system" fn() -> i32;
+/// 计算文本在页面上占用的逻辑宽度（展开 && 助记符），用于静态标签列宽。
+pub type OsExpandDialogTextLogicalWideNoPrefixFn =
+    unsafe extern "system" fn(parent: HWND, text: *const u8, wide: i32) -> i32;
+
+// ====================================================================
 // 函数指针表
 // ====================================================================
 
@@ -238,6 +311,9 @@ pub struct Host {
     pub os_event_set: Option<OsEventSetFn>,
     pub get_setting_int: Option<GetSettingIntFn>,
     pub get_setting_string: Option<GetSettingStringFn>,
+    pub set_setting_int: Option<SetSettingIntFn>,
+    pub set_setting_string: Option<SetSettingStringFn>,
+    pub localization_get_string: Option<LocalizationGetStringFn>,
     pub db_add_local_ref: Option<DbAddLocalRefFn>,
     pub db_release: Option<DbReleaseFn>,
     pub db_query_create: Option<DbQueryCreateFn>,
@@ -266,6 +342,22 @@ pub struct Host {
     /// 必须用这两个函数 —— 主程序的消息泵只处理它自己创建的窗口的消息。
     pub os_register_class: Option<OsRegisterClassFn>,
     pub os_create_window: Option<OsCreateWindowFn>,
+    /// 选项页注册 + 控件工厂（设置页 UI）。全部可选：
+    /// 主程序未暴露时插件无设置页，仅失去图形配置入口。
+    pub ui_options_add_plugin_page: Option<UiOptionsAddPluginPageFn>,
+    pub os_create_checkbox: Option<OsCreateCheckboxFn>,
+    pub os_create_static: Option<OsCreateStaticFn>,
+    pub os_create_edit: Option<OsCreateEditFn>,
+    pub os_create_number_edit: Option<OsCreateNumberEditFn>,
+    pub os_create_button: Option<OsCreateButtonFn>,
+    pub os_add_tooltip: Option<OsAddTooltipFn>,
+    pub os_set_dlg_rect: Option<OsSetDlgRectFn>,
+    pub os_set_dlg_text: Option<OsSetDlgTextFn>,
+    pub os_get_dlg_text: Option<OsGetDlgTextFn>,
+    pub os_enable_or_disable_dlg_item: Option<OsEnableOrDisableDlgItemFn>,
+    pub os_get_logical_wide: Option<OsGetLogicalWideFn>,
+    pub os_get_logical_high: Option<OsGetLogicalHighFn>,
+    pub os_expand_dialog_text_logical_wide_no_prefix: Option<OsExpandDialogTextLogicalWideNoPrefixFn>,
 }
 
 /// `get_proc_address` 回调的类型。
@@ -330,6 +422,12 @@ impl Host {
         // get_setting_string 读字符串再自行解析。把两者都设为可选最稳。
         opt!(get_setting_int, "get_setting_int");
         opt!(get_setting_string, "get_setting_string");
+        // 设置写回（PM_SAVE_SETTINGS / 选项页持久化）。同样按可选处理：
+        // 缺失时设置页仍可即时应用，只是无法写进 Everything.ini。
+        opt!(set_setting_int, "plugin_set_setting_int");
+        opt!(set_setting_string, "plugin_set_setting_string");
+        // 本地化字符串 —— 仅用于探测界面语言选择设置页文案（见 options 模块）。
+        opt!(localization_get_string, "localization_get_string");
 
         // 数据库 —— 强制
         req!(db_add_local_ref, "db_add_local_ref");
@@ -369,6 +467,26 @@ impl Host {
         // 这是主线程 marshaling 的关键基础设施。
         opt!(os_register_class, "os_register_class");
         opt!(os_create_window, "os_create_window");
+
+        // 选项页 UI（设置页）—— 全部可选。任一项缺失时设置页降级：
+        // 插件功能不受影响，仅没有图形配置入口（继续支持手改 Everything.ini）。
+        opt!(ui_options_add_plugin_page, "ui_options_add_plugin_page");
+        opt!(os_create_checkbox, "os_create_checkbox");
+        opt!(os_create_static, "os_create_static");
+        opt!(os_create_edit, "os_create_edit");
+        opt!(os_create_number_edit, "os_create_number_edit");
+        opt!(os_create_button, "os_create_button");
+        opt!(os_add_tooltip, "os_add_tooltip");
+        opt!(os_set_dlg_rect, "os_set_dlg_rect");
+        opt!(os_set_dlg_text, "os_set_dlg_text");
+        opt!(os_get_dlg_text, "os_get_dlg_text");
+        opt!(os_enable_or_disable_dlg_item, "os_enable_or_disable_dlg_item");
+        opt!(os_get_logical_wide, "os_get_logical_wide");
+        opt!(os_get_logical_high, "os_get_logical_high");
+        opt!(
+            os_expand_dialog_text_logical_wide_no_prefix,
+            "os_expand_dialog_text_logical_wide_no_prefix"
+        );
 
         // 安装到全局表。如果已经被填充（理论上不应发生），保留旧值。
         let _ = HOST.set(host);
