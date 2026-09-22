@@ -25,7 +25,8 @@ Context Protocol）接口暴露给 LLM（如 Claude Desktop、Cursor 等）使�
 - **入参校验与路径规范化** —— `folder` 在触达 Everything 之前统一去包裹引号、
   正斜杠转反斜杠、折叠重复反斜杠、去尾斜杠；非法路径返回带范例的
   `INVALID_PARAMS`，而不是静默返回 0 结果。
-- **可打包安装** —— 提供 NSIS 脚本，一键生成 setup.exe。
+- **可打包安装** —— 一条命令产出 x64 / x86 两个安装包；安装与卸载都由
+  Everything 自己完成（与官方插件同一套机制）。
 
 ### 仓库结构
 
@@ -54,13 +55,18 @@ everything-mcp/
 │       ├── tools.rs            工具实现（search_in_folder/list_folder/count）
 │       └── validate.rs         入参校验与路径规范化（folder 规范化、pattern 校验）
 ├── installer/
-│   ├── everything-mcp.nsi      NSIS 安装脚本
+│   ├── build-installers.ps1    一键打包脚本（x64 / x86 两个安装包）
+│   ├── setup/
+│   │   ├── setup.c             安装启动器源码（照抄官方插件做法）
+│   │   ├── setup.rc            版本信息 + 内嵌 bz2 插件 dll 的资源脚本
+│   │   ├── resource.h          资源 ID（IDR_DLL_BZ2 = 107）
+│   │   └── version.h           版本号（打包时从 Cargo.toml 自动生成）
 │   └── client-config-example.json  MCP 客户端接入示例
 ├── tests/
 │   └── mcp.rs                  MCP 协议层集成测试（cargo test）
 ├── docs/
 │   └── PLUGIN_SDK_API_CN.md    插件 SDK 中文 API 参考（含实战踩坑记录）
-├── reference/                  第三方参考材料（voidtools 官方 C 插件与 SDK，
+├── reference/                  第三方参考材料（voidtools 官方 C 插件源码，
 │                               不参与本 crate 编译，详见 reference/README.md）
 └── LICENSE
 ```
@@ -111,17 +117,54 @@ Everything 1.5 从 `Plugins\` 根目录按 `<name>64.dll` 约定加载 64 位插
 
 #### 通过安装包部署
 
+打包方式与官方插件一致：`setup.exe` 自身不拷贝任何文件，它只负责定位
+Everything，然后用 `-setup-plugin` 把 Everything 拉起来，由 Everything 自己从
+exe 资源里解出插件 dll、装进 `Plugins\` 并登记注册信息。
+
 ```powershell
 cd installer
-mkdir bin
-copy ..\target\release\everything_mcp.dll bin\everything_mcp64.dll
-# 需要 NSIS：https://nsis.sourceforge.io/
-makensis everything-mcp.nsi
-# 生成 everything-mcp-1.0.0-setup.exe
+powershell -ExecutionPolicy Bypass -File build-installers.ps1
 ```
 
-安装包默认装到 `C:\Program Files\Everything\Plugins\`，只放置
-`everything_mcp64.dll` 与随附文档；卸载时也只删除这些文件（不动 Plugins 目录本身）。
+产物在 `installer\dist\`：
+
+| 安装包                              | 架构 | 内嵌插件 dll           |
+| ----------------------------------- | ---- | ---------------------- |
+| `everything-mcp-1.0.0-x64-setup.exe` | x64  | `everything_mcp64.dll` |
+| `everything-mcp-1.0.0-x86-setup.exe` | x86  | `everything_mcp32.dll` |
+
+安装：运行对应架构的安装包 → Everything 弹出「设置插件」对话框 → 点「安装」。
+两个安装包可以一起分发，`Plugins\` 下 `everything_mcp64.dll` 与
+`everything_mcp32.dll` 可共存，Everything 按自身位数选用。卸载在 Everything
+选项 → 插件 里操作，不会动 Plugins 目录本身。
+
+打包除了 Rust 工具链外还需要（仅编译插件 dll 不需要这些）：
+
+- Visual Studio「使用 C++ 的桌面开发」工作负载（提供 `cl.exe` 与 `rc.exe`，
+  脚本通过 VsDevCmd 自动取环境变量）
+- Windows SDK（`rc.exe` 编译资源脚本）
+- `rustup target add i686-pc-windows-msvc`（脚本检测到缺失会自动添加）
+- 7-Zip 或 Python 二选一（把插件 dll 压成 bz2 再嵌进 exe，官方用 7-Zip）
+
+#### 官方插件（Everything 1.5）
+
+Everything 官方插件页：<https://www.voidtools.com/support/everything/plugins/>
+
+以下 voidtools 官方插件同样面向 Everything 1.5，安装方式与本插件相同（安装包
+一键安装，或把插件 dll 放进 Plugins 目录后重启 Everything）：
+
+| 插件              | 版本      | 说明                                                                 | 源码                                                |
+| ----------------- | --------- | -------------------------------------------------------------------- | --------------------------------------------------- |
+| HTTP Server       | 1.0.5.6   | 允许通过浏览器搜索与访问文件                                         | [voidtools/http_server](https://github.com/voidtools/http_server) |
+| ETP/FTP Server    | 1.0.2.5   | 允许通过 Everything 或 FTP 客户端搜索与访问文件                       | [voidtools/etp_server](https://github.com/voidtools/etp_server)   |
+| Everything Server | 1.0.4.5   | 允许其他 Everything 访问本机索引（需 1.5.0.1408 或更高版本，另需站点许可证） | —                                                   |
+
+官方安装说明：
+
+- **安装包方式**：下载插件安装包（`Setup.exe`）→ 运行 → 点击「Add」。
+- **手动方式**：下载插件 zip 并解压出插件 dll → 把 dll 移动到
+  `C:\Program Files\Everything\plugins`（即 Everything 安装目录下的 Plugins
+  文件夹）→ 在 Everything 的 File 菜单点击 Exit → 重启 Everything。
 
 ### 配置
 
@@ -208,6 +251,9 @@ curl -X POST http://127.0.0.1:8285/ -H "Content-Type: application/json" -d "{\"j
 
 # modern：不握手，直接 server/discover（版本同时写在请求头和 _meta 里）
 curl -X POST http://127.0.0.1:8285/ -H "Content-Type: application/json" -H "MCP-Protocol-Version: 2026-07-28" -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"server/discover\",\"params\":{\"_meta\":{\"io.modelcontextprotocol/protocolVersion\":\"2026-07-28\"}}}"
+
+# modern：tools/list（响应 result 里带 "resultType": "complete"）
+curl -X POST http://127.0.0.1:8285/ -H "Content-Type: application/json" -H "MCP-Protocol-Version: 2026-07-28" -d "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\",\"params\":{\"_meta\":{\"io.modelcontextprotocol/protocolVersion\":\"2026-07-28\"}}}"
 ```
 
 第二条返回的 `supportedVersions` 就是本端点支持的协议版本列表。
@@ -235,6 +281,11 @@ curl -X POST http://127.0.0.1:8285/ -H "Content-Type: application/json" -H "MCP-
 | ---------------------- | ------------------------------------------------------------------ | -------------------------------------------------------------------- |
 | legacy（2024-11-05）   | `initialize` 握手，或不带任何版本信息                              | 200 + JSON-RPC 响应；未知方法 200 + `-32601`；通知回 `id: null` 空响应 |
 | modern（2026-07-28）   | `MCP-Protocol-Version` 请求头 + `_meta` 里的 `io.modelcontextprotocol/protocolVersion` | `server/discover` 可用；未知方法 404；通知 202 空体；头/体不一致 `-32020`；版本不支持 400 + `-32022`（`data.supported` 列出可用版本） |
+
+**`resultType`（2026-07-28）**：modern 时代的每个响应 result 都带
+`resultType: "complete"`（该修订版起规范 MUST，缺失会被客户端判为无效结果并
+告警）；legacy 响应保持 2024-11-05 原形状，客户端按 absent-means-complete
+规则把缺失当作 complete 处理。
 
 其他安全与兼容规则：带 `Origin` 且非 localhost 来源的请求一律 403（防 DNS
 rebinding）；`Mcp-Method` / `Mcp-Name` 镜像头存在时校验与请求体一致，非 ASCII
@@ -280,8 +331,8 @@ curl -X POST http://127.0.0.1:8285/ -H "Content-Type: application/json" -d "{\"j
 
 ### 参考材料
 
-`reference/` 目录存放 voidtools 官方发布的 C 插件源码与 Everything 3.0 SDK
-（均不参与本 crate 编译），开发本插件时的主线程 marshaling、`db_query_search2`
+`reference/` 目录存放 voidtools 官方发布的 C 插件源码（均不参与本 crate
+编译），开发本插件时的主线程 marshaling、`db_query_search2`
 参数表等实现均对照 `reference/etp_server-1.0.2.5` 的源码。各材料的许可证见
 [`reference/README.md`](reference/README.md)。
 

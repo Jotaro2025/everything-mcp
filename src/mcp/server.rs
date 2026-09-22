@@ -11,7 +11,8 @@
 //! `io.modelcontextprotocol/protocolVersion`，Streamable HTTP 上还必须在
 //! `MCP-Protocol-Version` 请求头里带同一个值。时代判定：
 //!   - 声明 modern 版本 → modern 语义：server/discover 可用、未知方法 404、
-//!     通知 202 空体、头/体不一致 -32020、版本不支持 400 + -32022；
+//!     通知 202 空体、头/体不一致 -32020、版本不支持 400 + -32022、
+//!     每个 result 带 resultType（2026-07-28 MUST）；
 //!   - 声明 legacy 版本或什么都没带 → legacy 语义：initialize 握手、
 //!     200 + JSON-RPC 错误体，老客户端完全不受影响。
 //!
@@ -407,8 +408,14 @@ pub fn dispatch_rpc_http(body: &str, head: &RequestHead) -> (u16, String) {
             // modern 客户端走上面的 202 空体分支，到不了这里。
             return (200, r#"{"jsonrpc":"2.0","id":null}"#.to_string());
         }
-        "ping" => protocol::ok_response(&id, serde_json::json!({})),
-        "tools/list" => protocol::ok_response(&id, protocol::make_tools_list()),
+        "ping" => protocol::ok_response(
+            &id,
+            protocol::with_result_type(serde_json::json!({}), modern),
+        ),
+        "tools/list" => protocol::ok_response(
+            &id,
+            protocol::with_result_type(protocol::make_tools_list(), modern),
+        ),
         "tools/call" => {
             let name = params
                 .get("name")
@@ -421,7 +428,7 @@ pub fn dispatch_rpc_http(body: &str, head: &RequestHead) -> (u16, String) {
                     if is_error {
                         result["isError"] = serde_json::Value::Bool(true);
                     }
-                    protocol::ok_response(&id, result)
+                    protocol::ok_response(&id, protocol::with_result_type(result, modern))
                 }
                 Err((code, msg)) => protocol::error_response(&id, code, &msg),
             }

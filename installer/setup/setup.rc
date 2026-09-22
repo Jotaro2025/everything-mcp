@@ -1,0 +1,55 @@
+// =====================================================================
+// setup.rc — 把 bz2 压缩后的插件 DLL 作为 PE 资源嵌进 setup.exe
+// ---------------------------------------------------------------------
+// 与官方 http_server / etp_server 的 setup.rc 一致：
+//   IDR_DLL_BZ2 RCDATA "setup.dll.bz2"
+// setup.c 启动 Everything 时通过 -setup-plugin-resource-id 107 告诉它
+// 去哪里取，Everything 自己解压 bzip2 并安装成 Plugins\<name>64.dll。
+//
+// 注意：RCDATA 的文件名是相对路径，相对于 rc.exe 的工作目录，
+// 因此 build-installers.ps1 会在各自的架构临时目录里调用 rc.exe。
+// =====================================================================
+
+#include "resource.h"
+#include "version.h"
+
+/////////////////////////////////////////////////////////////////////////////
+//
+// VERSIONINFO
+//
+
+VS_VERSION_INFO VERSIONINFO
+	FILEVERSION		PLUGINMAJOR,PLUGINMINOR,PLUGINREVISION,PLUGINBUILD
+	PRODUCTVERSION	PLUGINMAJOR,PLUGINMINOR,PLUGINREVISION,PLUGINBUILD
+	FILEFLAGSMASK	0x3fL
+	FILEFLAGS		0x0L
+	FILEOS			0x00040004L		// VOS_NT_WINDOWS32
+	FILETYPE		0x1L			// VFT_APP
+	FILESUBTYPE		0x0L			// VFT2_UNKNOWN
+BEGIN
+	BLOCK "StringFileInfo"
+	BEGIN
+		BLOCK "040904b0"
+		BEGIN
+			VALUE "CompanyName",		"JOJO"
+			VALUE "FileDescription",	"Everything MCP Setup"
+			VALUE "FileVersion",		PLUGINVERSION
+			VALUE "InternalName",		"everything-mcp-setup"
+			VALUE "LegalCopyright",		"MIT"
+			VALUE "OriginalFilename",	"everything-mcp-setup.exe"
+			VALUE "ProductName",		"Everything MCP"
+			VALUE "ProductVersion",		PLUGINVERSION
+		END
+	END
+	BLOCK "VarFileInfo"
+	BEGIN
+		VALUE "Translation", 0x409, 1200
+	END
+END
+
+/////////////////////////////////////////////////////////////////////////////
+//
+// RCDATA: bzip2 压缩后的插件 DLL
+//
+
+IDR_DLL_BZ2		RCDATA	"setup.dll.bz2"

@@ -423,6 +423,66 @@ fn modern_mcp_name_header_mismatch_is_32020() {
 }
 
 // ====================================================================
+// 双时代协议：resultType（2026-07-28 起 result 必须带，缺失即无效结果）
+// ====================================================================
+
+#[test]
+fn modern_tools_list_result_carries_result_type() {
+    // modern 客户端对 tools/list 的 result 强制要求 resultType —— 缺失会被
+    // 判为无效结果并告警（absent-means-complete 桥接只适用于早期修订版）。
+    let (status, resp) = dispatch_http(
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}}"#,
+        &modern_head(),
+    );
+    assert_eq!(status, 200);
+    assert_eq!(resp["result"]["resultType"], "complete");
+    assert_eq!(resp["result"]["tools"].as_array().unwrap().len(), 3);
+}
+
+#[test]
+fn legacy_tools_list_has_no_result_type() {
+    // legacy 时代的规范没有 resultType 字段 —— 响应保持 2024-11-05 原形状，
+    // 客户端按桥接规则把缺失当作 complete。
+    let resp = dispatch(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#);
+    assert!(resp["result"].get("resultType").is_none());
+    assert_eq!(resp["result"]["tools"].as_array().unwrap().len(), 3);
+}
+
+#[test]
+fn modern_ping_result_carries_result_type() {
+    let (status, resp) = dispatch_http(
+        r#"{"jsonrpc":"2.0","id":3,"method":"ping","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}}"#,
+        &modern_head(),
+    );
+    assert_eq!(status, 200);
+    assert_eq!(resp["result"]["resultType"], "complete");
+}
+
+#[test]
+fn modern_initialize_result_carries_result_type() {
+    // 客户端用 modern 版本走 initialize 握手时，回显 modern 版本 + resultType。
+    let r = protocol::make_initialize_result(&json!({"protocolVersion": "2026-07-28"}));
+    assert_eq!(r["protocolVersion"], "2026-07-28");
+    assert_eq!(r["resultType"], "complete");
+    // legacy 握手（未声明 / 老版本）保持老形状，不带 resultType。
+    let r = protocol::make_initialize_result(&json!({}));
+    assert_eq!(r["protocolVersion"], "2024-11-05");
+    assert!(r.get("resultType").is_none());
+}
+
+#[test]
+fn with_result_type_only_decorates_modern_era() {
+    // modern：补 "complete"；legacy：原样返回；非对象结果原样透传。
+    let v = protocol::with_result_type(json!({"tools": []}), true);
+    assert_eq!(v["resultType"], "complete");
+    assert_eq!(v["tools"], json!([]));
+    let v = protocol::with_result_type(json!({"tools": []}), false);
+    assert!(v.get("resultType").is_none());
+    let v = protocol::with_result_type(json!("not-an-object"), true);
+    assert_eq!(v, json!("not-an-object"));
+}
+
+// ====================================================================
 // server：Origin 校验（防 DNS rebinding）
 // ====================================================================
 
@@ -593,6 +653,17 @@ fn end_to_end_over_real_tcp() {
     assert!(head.starts_with("HTTP/1.1 200"), "{}", head);
     let resp: Value = serde_json::from_str(&body).unwrap();
     assert_eq!(resp["result"]["supportedVersions"][1], "2026-07-28");
+
+    // modern tools/list：镜像头 + _meta 同版本，result 必须带 resultType。
+    let (head, body) = http_post(
+        port,
+        r#"{"jsonrpc":"2.0","id":6,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}}"#,
+        &[("MCP-Protocol-Version", "2026-07-28")],
+    );
+    assert!(head.starts_with("HTTP/1.1 200"), "{}", head);
+    let resp: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(resp["result"]["resultType"], "complete");
+    assert_eq!(resp["result"]["tools"].as_array().unwrap().len(), 3);
 
     // modern 未知方法 → 404。
     let (head, _) = http_post(

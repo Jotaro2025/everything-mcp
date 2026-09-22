@@ -12,6 +12,11 @@
 //!   - tools/call 调用工具
 //!   - 通知（无 id 的请求）：notifications/initialized
 //!
+//! resultType（2026-07-28）：modern 时代的每个 result 都必须带
+//! `resultType: "complete"`（规范 MUST，缺失会被客户端判为无效结果）；
+//! legacy 响应保持 2024-11-05 原形状，客户端按 absent-means-complete
+//! 桥接规则把缺失当作 complete。
+//!
 //! 传输层：单 POST / 单 GET 长连接（我们只支持单次 POST → 响应模式，
 //! 因为 LLM 客户端轮询发起工具调用足够使用）。
 
@@ -86,6 +91,10 @@ pub const SUPPORTED_PROTOCOL_VERSIONS: [&str; 2] = [PROTOCOL_VERSION_LEGACY, PRO
 /// `_meta` 中承载协议版本的键（2026-07-28）。
 pub const META_PROTOCOL_VERSION_KEY: &str = "io.modelcontextprotocol/protocolVersion";
 
+/// modern 时代 result 的类型声明值。本服务端的所有结果都是完整的最终内容
+/// （不支持分页，也不发 MRTR 的 input_required），统一用 "complete"。
+pub const RESULT_TYPE_COMPLETE: &str = "complete";
+
 /// 是否是 modern 时代的版本声明（决定逐请求语义）。
 pub fn is_modern_version(version: &str) -> bool {
     version == PROTOCOL_VERSION_MODERN
@@ -100,6 +109,32 @@ pub fn requested_version_from_meta(params: &Value) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+/// 按时代给 result 补上 `resultType` 字段。
+///
+/// 2026-07-28 起规范要求每个 result 都带 `resultType`（MUST），modern
+/// 客户端缺失即判为无效结果并告警。本服务端只返回完整结果，统一标
+/// `"complete"`。
+///
+/// legacy 时代的规范没有这个字段，客户端对缺失按 "complete" 处理
+/// （absent-means-complete 桥接只适用于早期修订版的服务端），因此
+/// legacy 响应原样返回 —— 老客户端的 wire 形状保持不变。
+/// 非对象结果（理论上是非法的 MCP result）原样透传。
+pub fn with_result_type(result: Value, modern: bool) -> Value {
+    if !modern {
+        return result;
+    }
+    match result {
+        Value::Object(mut map) => {
+            map.insert(
+                "resultType".to_string(),
+                Value::String(RESULT_TYPE_COMPLETE.to_string()),
+            );
+            Value::Object(map)
+        }
+        other => other,
+    }
+}
+
 // ====================================================================
 // MCP 协议层
 // ====================================================================
@@ -108,13 +143,14 @@ pub fn requested_version_from_meta(params: &Value) -> Option<String> {
 ///
 /// legacy 语义：回显客户端请求且我们支持的版本；客户端请求了我们不支持的
 /// 版本（或没带版本）时退回 2024-11-05，由客户端决定是否断开。
+/// 回显 modern 版本时响应同样按 modern 规则带 `resultType`。
 pub fn make_initialize_result(params: &Value) -> Value {
     let version = params
         .get("protocolVersion")
         .and_then(Value::as_str)
         .filter(|v| SUPPORTED_PROTOCOL_VERSIONS.contains(v))
         .unwrap_or(PROTOCOL_VERSION_LEGACY);
-    serde_json::json!({
+    let result = serde_json::json!({
         "protocolVersion": version,
         "capabilities": {
             "tools": {
@@ -125,7 +161,8 @@ pub fn make_initialize_result(params: &Value) -> Value {
             "name": "everything-mcp",
             "version": "1.0.0"
         }
-    })
+    });
+    with_result_type(result, is_modern_version(version))
 }
 
 /// server/discover 响应（2026-07-28，modern 客户端探测用）。

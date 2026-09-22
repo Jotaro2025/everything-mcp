@@ -30,7 +30,9 @@ an **MCP (Model Context Protocol)** server for LLMs (Claude Desktop, Cursor, …
   slash-unified, backslash-collapsed and trailing-slash-trimmed before it ever
   reaches Everything; invalid paths come back as `INVALID_PARAMS` with
   examples instead of silently returning zero results.
-- **Installable** — ships an NSIS script that produces a setup.exe in one step.
+- **Installable** — one command produces x64 and x86 installers; Everything
+  itself performs the install and uninstall (same mechanism as the official
+  plugins).
 
 ### Repository layout
 
@@ -61,15 +63,20 @@ everything-mcp/
 │       ├── tools.rs             Tool implementations (search_in_folder/list_folder/count)
 │       └── validate.rs          Argument validation & path normalization
 ├── installer/
-│   ├── everything-mcp.nsi      NSIS setup script
+│   ├── build-installers.ps1     One-command packaging script (x64 + x86 installers)
+│   ├── setup/
+│   │   ├── setup.c              Installer launcher source (follows the official plugins)
+│   │   ├── setup.rc             Version info + resource script embedding the bz2'd plugin dll
+│   │   ├── resource.h           Resource IDs (IDR_DLL_BZ2 = 107)
+│   │   └── version.h            Version numbers (generated from Cargo.toml at build time)
 │   └── client-config-example.json  MCP client configuration example
 ├── tests/
 │   └── mcp.rs                  MCP protocol integration tests (cargo test)
 ├── docs/
 │   └── PLUGIN_SDK_API_CN.md     Chinese plugin SDK API reference (with field notes)
 ├── reference/                  Third-party reference material (official voidtools C
-│                               plugins + Everything 3.0 SDK; not compiled into this
-│                               crate — see reference/README.md)
+│                               plugins; not compiled into this crate — see
+│                               reference/README.md)
 └── LICENSE
 ```
 
@@ -121,18 +128,61 @@ extra configuration.
 
 #### Deploying via the installer
 
+Packaging follows the official plugins: `setup.exe` copies no files itself. It
+locates Everything and relaunches it with `-setup-plugin`, and Everything
+extracts the plugin dll from the exe's resources, installs it into `Plugins\`
+and registers it.
+
 ```powershell
 cd installer
-mkdir bin
-copy ..\target\release\everything_mcp.dll bin\everything_mcp64.dll
-# Requires NSIS: https://nsis.sourceforge.io/
-makensis everything-mcp.nsi
-# Produces everything-mcp-1.0.0-setup.exe
+powershell -ExecutionPolicy Bypass -File build-installers.ps1
 ```
 
-The installer targets `C:\Program Files\Everything\Plugins\` and places only
-`everything_mcp64.dll` plus the accompanying documentation; uninstalling removes
-just those files (never the Plugins directory itself).
+Outputs (in `installer\dist\`):
+
+| Installer                            | Arch | Embedded plugin dll   |
+| ------------------------------------ | ---- | --------------------- |
+| `everything-mcp-1.0.0-x64-setup.exe` | x64  | `everything_mcp64.dll` |
+| `everything-mcp-1.0.0-x86-setup.exe` | x86  | `everything_mcp32.dll` |
+
+To install, run the installer for your architecture; Everything then shows its
+"Setup Plugin" dialog, where you click Install. Both installers can be
+distributed together — `everything_mcp64.dll` and `everything_mcp32.dll` coexist
+in `Plugins\`, and Everything picks the one matching its own bitness.
+Uninstalling happens in Everything's options dialog under Plugins; the Plugins
+folder itself is never touched.
+
+Packaging needs a little more than the Rust toolchain (building the plugin dll
+alone needs none of this):
+
+- Visual Studio with the "Desktop development with C++" workload (provides
+  `cl.exe` and `rc.exe`; the script picks up the environment via VsDevCmd)
+- Windows SDK (`rc.exe` compiles the resource script)
+- `rustup target add i686-pc-windows-msvc` (added automatically when missing)
+- Either 7-Zip or Python (bz2-compresses the plugin dll before embedding it;
+  the official scripts use 7-Zip)
+
+#### Official plugins (Everything 1.5)
+
+Everything's official plugin page:
+<https://www.voidtools.com/support/everything/plugins/>
+
+The official voidtools plugins below also target Everything 1.5 and install the
+same way as this one (run the installer, or drop the plugin dll into the Plugins
+folder and restart Everything):
+
+| Plugin           | Version  | Description                                                              | Source                                                |
+| ---------------- | -------- | ------------------------------------------------------------------------ | ----------------------------------------------------- |
+| HTTP Server      | 1.0.5.6  | Search and access your files from a web browser                          | [voidtools/http_server](https://github.com/voidtools/http_server) |
+| ETP/FTP Server   | 1.0.2.5  | Search and access your files from Everything or an FTP client            | [voidtools/etp_server](https://github.com/voidtools/etp_server)   |
+| Everything Server | 1.0.4.5 | Let other Everything clients access your index (requires 1.5.0.1408 or later, plus a site license) | — |
+
+Official installation instructions:
+
+- **Installer**: download a plugin installer (`Setup.exe`), run it, click Add.
+- **Manual**: download a plugin zip, extract the plugin dll, move it to
+  `C:\Program Files\Everything\plugins` (the Plugins folder in your Everything
+  installation folder), then exit Everything from the File menu and restart it.
 
 ### Configuration
 
@@ -228,6 +278,9 @@ curl -X POST http://127.0.0.1:8285/ -H "Content-Type: application/json" -d "{\"j
 
 # modern: no handshake, straight to server/discover (version in both the header and _meta)
 curl -X POST http://127.0.0.1:8285/ -H "Content-Type: application/json" -H "MCP-Protocol-Version: 2026-07-28" -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"server/discover\",\"params\":{\"_meta\":{\"io.modelcontextprotocol/protocolVersion\":\"2026-07-28\"}}}"
+
+# modern: tools/list (the response result carries "resultType": "complete")
+curl -X POST http://127.0.0.1:8285/ -H "Content-Type: application/json" -H "MCP-Protocol-Version: 2026-07-28" -d "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\",\"params\":{\"_meta\":{\"io.modelcontextprotocol/protocolVersion\":\"2026-07-28\"}}}"
 ```
 
 The `supportedVersions` in the second response is the list of protocol versions
@@ -258,6 +311,12 @@ request declares, so both client generations work:
 | ----------------------- | ---------------------------------------------------------------------- | ------------------------------------------------------------------------ |
 | legacy (2024-11-05)     | `initialize` handshake, or no version information at all               | 200 + JSON-RPC response; unknown methods 200 + `-32601`; notifications get an `id: null` ack |
 | modern (2026-07-28)     | `MCP-Protocol-Version` request header + `io.modelcontextprotocol/protocolVersion` in `_meta` | `server/discover` available; unknown methods 404; notifications 202 with empty body; header/body mismatch `-32020`; unsupported version 400 + `-32022` (`data.supported` lists the usable versions) |
+
+**`resultType` (2026-07-28):** every modern-era response result carries
+`resultType: "complete"` (a MUST from this revision onward; a missing field is
+treated by clients as an invalid result and flagged). Legacy responses keep the
+2024-11-05 shape, where clients apply the absent-means-complete rule and treat a
+missing `resultType` as `"complete"`.
 
 Other security and compatibility rules: requests carrying an `Origin` header
 from anywhere but localhost are rejected with 403 (DNS rebinding protection);
@@ -312,8 +371,8 @@ curl -X POST http://127.0.0.1:8285/ -H "Content-Type: application/json" -d "{\"j
 
 ### Reference material
 
-The `reference/` directory holds the official voidtools C plugin sources and the
-Everything 3.0 SDK (none of it is compiled into this crate). The main-thread
+The `reference/` directory holds the official voidtools C plugin sources (none
+of it is compiled into this crate). The main-thread
 marshaling scheme and the `db_query_search2` parameter list used here were
 derived from `reference/etp_server-1.0.2.5`. Licenses for each item are listed in
 [`reference/README.md`](reference/README.md).

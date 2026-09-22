@@ -31,7 +31,8 @@ use plugin::host::Host;
 
 // ============================================================
 // 插件元数据 —— 主程序通过 PM_GET_NAME / PM_GET_VERSION /
-// PM_GET_DESCRIPTION / PM_GET_AUTHOR / PM_GET_PLUGIN_VERSION 读取。
+// PM_GET_DESCRIPTION / PM_GET_AUTHOR / PM_GET_LINK /
+// PM_GET_PLUGIN_VERSION 读取。
 // 全部是 UTF-8 静态字符串，末尾必须带 \0。
 // ============================================================
 
@@ -47,6 +48,9 @@ const PLUGIN_DESCRIPTION: &[u8] =
 
 /// 插件作者。
 const PLUGIN_AUTHOR: &[u8] = b"JOJO\0";
+
+/// 插件主页链接 —— Everything 插件管理里点「链接」打开的地址。
+const PLUGIN_LINK: &[u8] = b"https://github.com/Jotaro2025/everything-mcp\0";
 
 /// Everything 1.5 唯一识别的插件入口符号。
 ///
@@ -213,6 +217,7 @@ unsafe fn everything_plugin_proc_impl(msg: u32, data: *mut c_void) -> *mut c_voi
             static_cstr_bytes(PLUGIN_DESCRIPTION).as_ptr() as *mut c_void
         }
         plugin::PM_GET_AUTHOR => static_cstr_bytes(PLUGIN_AUTHOR).as_ptr() as *mut c_void,
+        plugin::PM_GET_LINK => static_cstr_bytes(PLUGIN_LINK).as_ptr() as *mut c_void,
         plugin::PM_GET_VERSION => static_cstr_bytes(PLUGIN_VERSION).as_ptr() as *mut c_void,
         plugin::PM_GET_PLUGIN_VERSION => 1 as *mut c_void, // 协议版本
 

@@ -19,8 +19,9 @@ FAILED
 !reference/**/*.dll
 !reference/**/*.lib
 
-# ===== NSIS 安装包输出 =====
-installer/bin/
+# ===== 安装包构建产物（build-installers.ps1 的输出与中间文件）=====
+installer/build/
+installer/dist/
 
 # ===== 操作系统 / 编辑器 =====
 Thumbs.db
