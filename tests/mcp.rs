@@ -310,6 +310,20 @@ fn unknown_tool_is_method_not_found() {
     assert!(err.1.contains("delete_everything"));
 }
 
+#[test]
+fn exclude_of_wrong_shape_is_invalid_params_before_search() {
+    // 每个工具带合法 folder，只把 exclude 写错 —— 必须在触达 Everything
+    // host 之前就报错返回（CI 上没有主程序环境）。
+    for name in ["search_in_folder", "list_folder", "count"] {
+        let err = tools::dispatch(name, &json!({"folder": "C:\\", "exclude": 42})).unwrap_err();
+        assert_eq!(err.0, protocol::INVALID_PARAMS, "{}", name);
+        assert!(err.1.contains("exclude"));
+        let err = tools::dispatch(name, &json!({"folder": "C:\\", "exclude": [1]})).unwrap_err();
+        assert_eq!(err.0, protocol::INVALID_PARAMS, "{}", name);
+        assert!(err.1.contains("every item"));
+    }
+}
+
 // ====================================================================
 // 双时代协议：版本协商（2024-11-05 legacy / 2026-07-28 modern）
 // ====================================================================
@@ -654,6 +668,26 @@ fn validate_pattern_trims_and_rejects_control_chars() {
     assert_eq!(validate::validate_pattern("").unwrap(), "");
     assert_eq!(validate::validate_pattern("  *.rs  ").unwrap(), "*.rs");
     assert!(validate::validate_pattern("a\nb").is_err());
+}
+
+#[test]
+fn translate_globstar_strips_leading_prefix_only() {
+    use everything_mcp::mcp::validate;
+    // 开头的 globstar / ./ 前缀：LLM 的 shell/ripgrep 书写习惯，
+    // Everything 无此语法，剥掉后正好等于我们的递归语义。
+    assert_eq!(validate::translate_globstar("**/*.cs"), "*.cs");
+    assert_eq!(validate::translate_globstar("**\\*.cs"), "*.cs");
+    assert_eq!(validate::translate_globstar("./*.cs"), "*.cs");
+    assert_eq!(validate::translate_globstar(r".\*.cs"), "*.cs");
+    assert_eq!(validate::translate_globstar("  **/ *.cs "), "*.cs");
+    assert_eq!(validate::translate_globstar("**/**/*.cs"), "*.cs");
+    // 普通 pattern 原样保留（含首尾空白已由 validate_pattern 处理过一层）。
+    assert_eq!(validate::translate_globstar("*.rs"), "*.rs");
+    assert_eq!(validate::translate_globstar(""), "");
+    // 中间的 globstar 无法忠实翻译 —— 原样返回，客户端会看到 0 条自行修正。
+    assert_eq!(validate::translate_globstar("src/**/*.cs"), "src/**/*.cs");
+    // 尾部的 globstar 同样不属于「开头前缀」，原样保留。
+    assert_eq!(validate::translate_globstar("*.cs/**"), "*.cs/**");
 }
 
 // ====================================================================

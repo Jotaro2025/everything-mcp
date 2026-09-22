@@ -126,3 +126,32 @@ pub fn validate_pattern(input: &str) -> Result<String, String> {
     }
     Ok(p.to_string())
 }
+
+/// 把 shell/ripgrep 风格的 globstar 与 `./` 前缀翻译成 Everything 语义。
+///
+/// LLM 常直接写 `**/*.cs` —— Everything 没有 globstar 语法，原样传会得到
+/// 0 条且无从诊断（评测里正是这么踩坑的）。本插件的搜索以 folder 为根递归
+/// （`"<folder>\"` 路径前缀），`**/` 想表达的「整棵子树」恰是默认语义，
+/// 所以剥掉开头的 globstar 即可，其余部分原样保留。
+///
+/// 只处理**开头**的 globstar：`src/**/*.cs` 这类中间 globstar 无法忠实
+/// 翻译（Everything 无对应概念），原样返回 —— 客户端会看到 0 条和
+/// `total: 0`，比悄悄改错语义好。
+pub fn translate_globstar(pattern: &str) -> String {
+    let mut p = pattern.trim();
+    loop {
+        if let Some(rest) = p
+            .strip_prefix("**/")
+            .or_else(|| p.strip_prefix("**\\"))
+        {
+            p = rest.trim_start();
+            continue;
+        }
+        if let Some(rest) = p.strip_prefix("./").or_else(|| p.strip_prefix(".\\")) {
+            p = rest;
+            continue;
+        }
+        break;
+    }
+    p.to_string()
+}

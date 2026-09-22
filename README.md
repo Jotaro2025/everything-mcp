@@ -221,28 +221,51 @@ Everything 官方插件页：<https://www.voidtools.com/support/everything/plugi
 - `pattern` 支持完整 Everything 语法：`*.rs`、`"readme"`、`ext:md;txt`、
   `dm:lastweek`、`size:>1mb`、`content:"fn main"` 等。
 - **不是 shell glob**：写 `*.rs`，不要写 `**/*.rs` —— 文件夹范围本身
-  已经限定了目录树。排除项用 `!` 前缀，如 `ext:rs !test`。
+  已经限定了目录树。开头的 `**/`、`**\`、`./` 会被自动剥掉（评测里
+  `**/Program.cs` 得到 0 条就是踩这个坑），中间的 globstar 无法忠实
+  翻译，会原样传给 Everything。
+- 排除项用 `!` 前缀（如 `ext:rs !test`），或用 `exclude` 参数
+  （见下）。
+- `content:` 正文检索需要 Everything 端开启内容索引（默认关闭；
+  开启后首次建索引会明显变慢）。权限位已随插件放开，开关在
+  Everything 选项里。
 - 空字符串 `""` 表示列出该文件夹下所有文件。
 - `max_results = 0` 表示无上限（大目录慎用）。
 - 响应里 `count` 是实际返回的条数（受 `max_results` 截断），`total` 是
   命中的总条数 —— 两者不等即说明结果被截断了，可以据此调大
   `max_results` 或用 `count` 先摸底。
 
+`exclude` 参数（三个工具都支持）：字符串或字符串数组，每项作为一条
+Everything NOT 项拼进搜索词。仓库噪声默认会进结果（Everything 不知道
+gitignore），常见做法：
+
+```json
+{
+  "folder": "D:\\source\\repos\\my-project",
+  "pattern": "*.cs",
+  "exclude": ["\\obj\\", "\\.git\\", "\\node_modules\\"]
+}
+```
+
+排除项按字面匹配路径片段，带首尾反斜杠（`\obj\`）才不会误伤名字里
+含 `obj` 的文件。等效的 pattern 写法是 `*.cs !\obj\ !\.git\`。
+
 #### 2. `list_folder`
 
 列出某个文件夹的直接子项（非递归），返回名字、类型、大小。
 
 ```json
-{ "folder": "D:\\source\\repos\\my-project" }
+{ "folder": "D:\\source\\repos\\my-project", "exclude": ["\\.git\\"] }
 ```
 
 - 文件夹条目的 `size` 恒为 0 —— Everything 不计算目录大小，这是口径
   而非缺失。要整个目录树的内容，用 `search_in_folder` 递归搜索。
-- 响应同样带 `total`（该目录直接子项总数）。
+- 响应同样带 `total`（该目录直接子项总数，排除后的数量）。
 
 #### 3. `count`
 
 统计匹配文件数量，不返回名字列表。只取命中计数，不逐条读名字和路径。
+支持与 `search_in_folder` 相同的 `pattern` 与 `exclude`。
 
 ```json
 { "folder": "D:\\source\\repos\\my-project", "pattern": "ext:rs" }

@@ -243,31 +243,57 @@ Recursively find files/folders under a given folder using Everything search synt
 - `pattern` supports the full Everything syntax: `*.rs`, `"readme"`,
   `ext:md;txt`, `dm:lastweek`, `size:>1mb`, `content:"fn main"`, …
 - **Not shell glob**: write `*.rs`, not `**/*.rs` — the folder scope
-  already restricts the tree. Exclude matches with a `!` prefix, e.g.
-  `ext:rs !test`.
+  already restricts the tree. A leading `**/`, `**\` or `./` is stripped
+  for you (this is exactly why `**/Program.cs` returned 0 hits in the
+  eval); a globstar in the middle of a pattern cannot be translated
+  faithfully and is passed through as-is.
+- Exclude matches with a `!` prefix (e.g. `ext:rs !test`), or use the
+  `exclude` parameter (below).
+- `content:` needs file-content indexing enabled on the Everything side
+  (off by default; the first index build after enabling it is markedly
+  slower). The plugin already passes the required permission bits — the
+  switch lives in Everything's options.
 - An empty string `""` lists everything under the folder.
 - `max_results = 0` means unlimited (careful with huge folders).
 - The response reports `count` (entries returned, capped by `max_results`)
   and `total` (all matches found) — when they differ, results were
   truncated: raise `max_results` or use `count` to scope the folder first.
 
+`exclude` (all three tools accept it): a string or an array of strings,
+each appended as an Everything NOT term. Repository noise is in the
+results by default (Everything knows nothing about gitignore), so:
+
+```json
+{
+  "folder": "D:\\source\\repos\\my-project",
+  "pattern": "*.cs",
+  "exclude": ["\\obj\\", "\\.git\\", "\\node_modules\\"]
+}
+```
+
+Exclude terms match path fragments literally — keep the surrounding
+backslashes (`\obj\`) so that files merely *named* `obj…` are not
+dropped. The equivalent pattern spelling is `*.cs !\obj\ !\.git\`.
+
 #### 2. `list_folder`
 
 List the direct children (non-recursive) of a folder: name, kind, size.
 
 ```json
-{ "folder": "D:\\source\\repos\\my-project" }
+{ "folder": "D:\\source\\repos\\my-project", "exclude": ["\\.git\\"] }
 ```
 
 - Folder entries always report `size` 0 — Everything does not compute
   directory sizes; that is the convention, not missing data. Use
   `search_in_folder` for the whole tree.
-- The response also carries `total` (number of direct children).
+- The response also carries `total` (number of direct children, after
+  exclusions).
 
 #### 3. `count`
 
 Count matching files without returning the name list. Only the hit count
-is taken — no per-entry names or paths are materialized.
+is taken — no per-entry names or paths are materialized. Supports the
+same `pattern` and `exclude` arguments as `search_in_folder`.
 
 ```json
 { "folder": "D:\\source\\repos\\my-project", "pattern": "ext:rs" }
