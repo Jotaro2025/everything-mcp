@@ -252,7 +252,7 @@ curl -X POST http://127.0.0.1:8285/ -H "Content-Type: application/json" -d "{\"j
 # modern：不握手，直接 server/discover（版本同时写在请求头和 _meta 里）
 curl -X POST http://127.0.0.1:8285/ -H "Content-Type: application/json" -H "MCP-Protocol-Version: 2026-07-28" -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"server/discover\",\"params\":{\"_meta\":{\"io.modelcontextprotocol/protocolVersion\":\"2026-07-28\"}}}"
 
-# modern：tools/list（响应 result 里带 "resultType": "complete"）
+# modern：tools/list（响应 result 里带 "resultType": "complete" 与缓存提示 ttlMs / cacheScope）
 curl -X POST http://127.0.0.1:8285/ -H "Content-Type: application/json" -H "MCP-Protocol-Version: 2026-07-28" -d "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\",\"params\":{\"_meta\":{\"io.modelcontextprotocol/protocolVersion\":\"2026-07-28\"}}}"
 ```
 
@@ -286,6 +286,13 @@ curl -X POST http://127.0.0.1:8285/ -H "Content-Type: application/json" -H "MCP-
 `resultType: "complete"`（该修订版起规范 MUST，缺失会被客户端判为无效结果并
 告警）；legacy 响应保持 2024-11-05 原形状，客户端按 absent-means-complete
 规则把缺失当作 complete 处理。
+
+**`ttlMs` / `cacheScope`（2026-07-28）**：`ListToolsResult` 与
+`DiscoverResult` 继承 `CacheableResult`，modern 时代的这两个结果除
+`resultType` 外还必须带 `ttlMs`（客户端可缓存的毫秒数，语义类比 HTTP
+`Cache-Control: max-age`；tools/list 取 5 分钟，discover 取 1 小时）和
+`cacheScope: "public"`（结果不含用户特定数据，可跨授权上下文缓存）；
+legacy 响应保持原形状，不带这两个字段。
 
 其他安全与兼容规则：带 `Origin` 且非 localhost 来源的请求一律 403（防 DNS
 rebinding）；`Mcp-Method` / `Mcp-Name` 镜像头存在时校验与请求体一致，非 ASCII

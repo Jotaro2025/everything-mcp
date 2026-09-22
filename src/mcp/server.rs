@@ -12,7 +12,8 @@
 //! `MCP-Protocol-Version` 请求头里带同一个值。时代判定：
 //!   - 声明 modern 版本 → modern 语义：server/discover 可用、未知方法 404、
 //!     通知 202 空体、头/体不一致 -32020、版本不支持 400 + -32022、
-//!     每个 result 带 resultType（2026-07-28 MUST）；
+//!     每个 result 带 resultType（2026-07-28 MUST），tools/list 与
+//!     server/discover 的结果另带 ttlMs / cacheScope（CacheableResult 必填）；
 //!   - 声明 legacy 版本或什么都没带 → legacy 语义：initialize 握手、
 //!     200 + JSON-RPC 错误体，老客户端完全不受影响。
 //!
@@ -412,10 +413,13 @@ pub fn dispatch_rpc_http(body: &str, head: &RequestHead) -> (u16, String) {
             &id,
             protocol::with_result_type(serde_json::json!({}), modern),
         ),
-        "tools/list" => protocol::ok_response(
-            &id,
-            protocol::with_result_type(protocol::make_tools_list(), modern),
-        ),
+        "tools/list" => {
+            // ListToolsResult 继承 CacheableResult：modern 时代除 resultType 外
+            // 还必须带 ttlMs / cacheScope，缺失会被客户端判为无效结果。
+            let result = protocol::with_result_type(protocol::make_tools_list(), modern);
+            let result = protocol::with_cache_control(result, modern, protocol::TOOLS_LIST_TTL_MS);
+            protocol::ok_response(&id, result)
+        }
         "tools/call" => {
             let name = params
                 .get("name")

@@ -483,6 +483,55 @@ fn with_result_type_only_decorates_modern_era() {
 }
 
 // ====================================================================
+// 双时代协议：CacheableResult 缓存提示（ttlMs / cacheScope）
+// ====================================================================
+
+#[test]
+fn modern_tools_list_result_carries_cache_control() {
+    // 2026-07-28 起 ListToolsResult 继承 CacheableResult：ttlMs（number）与
+    // cacheScope（"public" | "private"）是必填字段，缺失即无效结果。
+    let (status, resp) = dispatch_http(
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}}"#,
+        &modern_head(),
+    );
+    assert_eq!(status, 200);
+    assert_eq!(resp["result"]["ttlMs"], json!(protocol::TOOLS_LIST_TTL_MS));
+    assert_eq!(resp["result"]["cacheScope"], "public");
+    // resultType 照旧带上，两个字段互不替代。
+    assert_eq!(resp["result"]["resultType"], "complete");
+}
+
+#[test]
+fn legacy_tools_list_has_no_cache_control() {
+    // legacy 规范没有 ttlMs / cacheScope —— 响应保持 2024-11-05 原形状。
+    let resp = dispatch(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#);
+    assert!(resp["result"].get("ttlMs").is_none());
+    assert!(resp["result"].get("cacheScope").is_none());
+}
+
+#[test]
+fn discover_result_carries_cache_control() {
+    // DiscoverResult 同样继承 CacheableResult —— discover 是 modern 独有方法，
+    // 结果整体按 modern 形状构造，缓存字段必填。
+    let r = protocol::make_discover_result();
+    assert_eq!(r["ttlMs"], json!(protocol::DISCOVER_TTL_MS));
+    assert_eq!(r["cacheScope"], "public");
+}
+
+#[test]
+fn with_cache_control_only_decorates_modern_era() {
+    // modern：补 ttlMs + cacheScope；legacy：原样返回；非对象结果原样透传。
+    let v = protocol::with_cache_control(json!({"tools": []}), true, 1000);
+    assert_eq!(v["ttlMs"], json!(1000));
+    assert_eq!(v["cacheScope"], "public");
+    let v = protocol::with_cache_control(json!({"tools": []}), false, 1000);
+    assert!(v.get("ttlMs").is_none());
+    assert!(v.get("cacheScope").is_none());
+    let v = protocol::with_cache_control(json!("not-an-object"), true, 1000);
+    assert_eq!(v, json!("not-an-object"));
+}
+
+// ====================================================================
 // server：Origin 校验（防 DNS rebinding）
 // ====================================================================
 
@@ -653,8 +702,10 @@ fn end_to_end_over_real_tcp() {
     assert!(head.starts_with("HTTP/1.1 200"), "{}", head);
     let resp: Value = serde_json::from_str(&body).unwrap();
     assert_eq!(resp["result"]["supportedVersions"][1], "2026-07-28");
+    assert_eq!(resp["result"]["cacheScope"], "public");
 
-    // modern tools/list：镜像头 + _meta 同版本，result 必须带 resultType。
+    // modern tools/list：镜像头 + _meta 同版本，result 必须带 resultType 与
+    // CacheableResult 的 ttlMs / cacheScope。
     let (head, body) = http_post(
         port,
         r#"{"jsonrpc":"2.0","id":6,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}}"#,
@@ -663,6 +714,8 @@ fn end_to_end_over_real_tcp() {
     assert!(head.starts_with("HTTP/1.1 200"), "{}", head);
     let resp: Value = serde_json::from_str(&body).unwrap();
     assert_eq!(resp["result"]["resultType"], "complete");
+    assert_eq!(resp["result"]["ttlMs"], json!(protocol::TOOLS_LIST_TTL_MS));
+    assert_eq!(resp["result"]["cacheScope"], "public");
     assert_eq!(resp["result"]["tools"].as_array().unwrap().len(), 3);
 
     // modern 未知方法 → 404。

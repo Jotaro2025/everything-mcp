@@ -279,7 +279,7 @@ curl -X POST http://127.0.0.1:8285/ -H "Content-Type: application/json" -d "{\"j
 # modern: no handshake, straight to server/discover (version in both the header and _meta)
 curl -X POST http://127.0.0.1:8285/ -H "Content-Type: application/json" -H "MCP-Protocol-Version: 2026-07-28" -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"server/discover\",\"params\":{\"_meta\":{\"io.modelcontextprotocol/protocolVersion\":\"2026-07-28\"}}}"
 
-# modern: tools/list (the response result carries "resultType": "complete")
+# modern: tools/list (the response result carries "resultType": "complete" plus the ttlMs / cacheScope cache hints)
 curl -X POST http://127.0.0.1:8285/ -H "Content-Type: application/json" -H "MCP-Protocol-Version: 2026-07-28" -d "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\",\"params\":{\"_meta\":{\"io.modelcontextprotocol/protocolVersion\":\"2026-07-28\"}}}"
 ```
 
@@ -317,6 +317,14 @@ request declares, so both client generations work:
 treated by clients as an invalid result and flagged). Legacy responses keep the
 2024-11-05 shape, where clients apply the absent-means-complete rule and treat a
 missing `resultType` as `"complete"`.
+
+**`ttlMs` / `cacheScope` (2026-07-28):** `ListToolsResult` and `DiscoverResult`
+extend `CacheableResult`, so in the modern era these two results must also carry
+`ttlMs` (how long the client may cache the response, in milliseconds, analogous
+to HTTP `Cache-Control: max-age`; 5 minutes for tools/list, 1 hour for discover)
+and `cacheScope: "public"` (the results hold no user-specific data, so they may
+be cached across authorization contexts). Legacy responses keep the original
+shape without these fields.
 
 Other security and compatibility rules: requests carrying an `Origin` header
 from anywhere but localhost are rejected with 403 (DNS rebinding protection);

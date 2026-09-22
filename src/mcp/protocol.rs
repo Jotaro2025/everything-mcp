@@ -17,6 +17,11 @@
 //! legacy 响应保持 2024-11-05 原形状，客户端按 absent-means-complete
 //! 桥接规则把缺失当作 complete。
 //!
+//! 缓存提示（2026-07-28）：`ListToolsResult` / `DiscoverResult` 继承
+//! `CacheableResult`，`ttlMs` 与 `cacheScope` 同为必填字段（语义类比 HTTP
+//! `Cache-Control: max-age` 与 public/private），modern 时代的这两个结果
+//! 必须带上，缺失同样会被客户端判为无效结果。
+//!
 //! 传输层：单 POST / 单 GET 长连接（我们只支持单次 POST → 响应模式，
 //! 因为 LLM 客户端轮询发起工具调用足够使用）。
 
@@ -95,6 +100,19 @@ pub const META_PROTOCOL_VERSION_KEY: &str = "io.modelcontextprotocol/protocolVer
 /// （不支持分页，也不发 MRTR 的 input_required），统一用 "complete"。
 pub const RESULT_TYPE_COMPLETE: &str = "complete";
 
+/// tools/list 结果的缓存提示（`CacheableResult.ttlMs`，单位毫秒，语义类比
+/// HTTP `Cache-Control: max-age`）。工具清单基本不变（`listChanged: false`），
+/// 但插件升级会增减工具，取 5 分钟的保守值 —— 与规范示例一致。
+pub const TOOLS_LIST_TTL_MS: u64 = 300_000;
+
+/// server/discover 结果的缓存提示。支持的协议版本与能力很少变，取 1 小时。
+pub const DISCOVER_TTL_MS: u64 = 3_600_000;
+
+/// 缓存范围（`CacheableResult.cacheScope`）。本服务端无鉴权，结果里没有
+/// 用户特定数据，任何客户端或中间代理都可以缓存并跨授权上下文复用，
+/// 因此一律 "public"。
+pub const CACHE_SCOPE_PUBLIC: &str = "public";
+
 /// 是否是 modern 时代的版本声明（决定逐请求语义）。
 pub fn is_modern_version(version: &str) -> bool {
     version == PROTOCOL_VERSION_MODERN
@@ -128,6 +146,29 @@ pub fn with_result_type(result: Value, modern: bool) -> Value {
             map.insert(
                 "resultType".to_string(),
                 Value::String(RESULT_TYPE_COMPLETE.to_string()),
+            );
+            Value::Object(map)
+        }
+        other => other,
+    }
+}
+
+/// 按时代给 result 补上 `CacheableResult` 的缓存提示字段。
+///
+/// 2026-07-28 起 `ListToolsResult` / `DiscoverResult` 继承 `CacheableResult`，
+/// `ttlMs`（number）与 `cacheScope`（"public" | "private"）是必填字段，
+/// modern 客户端缺失即判为无效结果。legacy 规范没有这两个字段，响应保持
+/// 原形状。非对象结果（理论上是非法的 MCP result）原样透传。
+pub fn with_cache_control(result: Value, modern: bool, ttl_ms: u64) -> Value {
+    if !modern {
+        return result;
+    }
+    match result {
+        Value::Object(mut map) => {
+            map.insert("ttlMs".to_string(), Value::from(ttl_ms));
+            map.insert(
+                "cacheScope".to_string(),
+                Value::String(CACHE_SCOPE_PUBLIC.to_string()),
             );
             Value::Object(map)
         }
@@ -169,6 +210,7 @@ pub fn make_initialize_result(params: &Value) -> Value {
 ///
 /// 一次性给出支持的协议版本、能力与服务器身份，让客户端在发任何业务请求
 /// 之前完成时代判定与版本选择。注意 serverInfo 放在 `_meta` 里（规范如此）。
+/// DiscoverResult 继承 CacheableResult，ttlMs / cacheScope 必填。
 pub fn make_discover_result() -> Value {
     serde_json::json!({
         "resultType": "complete",
@@ -184,11 +226,17 @@ pub fn make_discover_result() -> Value {
                 "version": "1.0.0"
             }
         },
-        "instructions": "Folder-scoped Everything file search. Use search_in_folder with an absolute folder path plus Everything search syntax; list_folder for immediate children; count for totals only."
+        "instructions": "Folder-scoped Everything file search. Use search_in_folder with an absolute folder path plus Everything search syntax; list_folder for immediate children; count for totals only.",
+        "ttlMs": DISCOVER_TTL_MS,
+        "cacheScope": CACHE_SCOPE_PUBLIC
     })
 }
 
 /// tools/list 响应：列出我们暴露的全部工具。
+///
+/// 结果按 era 中性构造（2024-11-05 原形状）；modern 时代的必填字段
+/// （resultType、CacheableResult 的 ttlMs / cacheScope）由调用方过
+/// [`with_result_type`] 与 [`with_cache_control`] 补齐。
 pub fn make_tools_list() -> Value {
     serde_json::json!({
         "tools": [
