@@ -17,7 +17,9 @@
 
 #![allow(non_snake_case)]
 
-mod mcp;
+// mcp 模块设为 pub：DLL 导出表由 everything_mcp.def 控制（仅导出
+// everything_plugin_proc），pub 只为让 tests/ 下的集成测试能链接 rlib。
+pub mod mcp;
 mod options;
 mod plugin;
 

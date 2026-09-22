@@ -20,6 +20,8 @@ Context Protocol）接口暴露给 LLM（如 Claude Desktop、Cursor 等）使�
   全部静态链接（CRT 也静态链接，见 `.cargo/config.toml`）。
 - **文件夹优先** —— LLM 通常在指定项目目录下工作，本插件提供的工具以「按文件夹
   搜索」为主，避免全局扫描带来的噪声。
+- **图形设置页** —— Everything 选项对话框内直接配置启用开关、绑定地址、端口，
+  改动点「应用」即时生效，无需重启 Everything。
 - **MCP Streamable HTTP** —— 默认监听 `127.0.0.1:8285`，单条 JSON-RPC over HTTP。
 - **可打包安装** —— 提供 NSIS 脚本，一键生成 setup.exe。
 
@@ -34,8 +36,10 @@ everything-mcp/
 ├── .cargo/config.toml          target-feature=+crt-static（零第三方 DLL 的关键）
 ├── src/
 │   ├── lib.rs                  插件入口 everything_plugin_proc 与 PM_* 分发
+│   ├── options.rs              Everything 选项页（启用开关/绑定地址/端口/恢复默认）与设置状态机
 │   ├── plugin/
 │   │   ├── mod.rs              子模块汇总 + PM_* 常量
+│   │   ├── diag.rs             磁盘诊断日志（%LOCALAPPDATA%\everything-mcp\plugin.log）
 │   │   ├── ffi_types.rs        #[repr(C)] 类型（Utf8Buf/DbHandle/FileInfoFd...）
 │   │   ├── host.rs             host 函数指针表 + HOST/HOST_LOCK
 │   │   ├── search.rs           异步搜索 → 同步等待的高层封装（主线程 marshaling）
@@ -49,6 +53,8 @@ everything-mcp/
 ├── installer/
 │   ├── everything-mcp.nsi      NSIS 安装脚本
 │   └── client-config-example.json  MCP 客户端接入示例
+├── tests/
+│   └── mcp.rs                  MCP 协议层集成测试（cargo test）
 ├── docs/
 │   └── PLUGIN_SDK_API_CN.md    插件 SDK 中文 API 参考（含实战踩坑记录）
 ├── reference/                  第三方参考材料（voidtools 官方 C 插件与 SDK，
@@ -68,6 +74,9 @@ Invoke-WebRequest https://win.rustup.com/x86_64 -OutFile rustup-init.exe
 
 # 在仓库根目录编译
 cargo build --release
+
+# 运行测试（MCP 协议层集成测试，不依赖 Everything 主程序）
+cargo test
 
 # 产物位置
 ls target\release\everything_mcp.dll
@@ -117,12 +126,13 @@ makensis everything-mcp.nsi
 
 | 配置项        | 类型   | 默认值        | 说明                          |
 | ------------- | ------ | ------------- | ----------------------------- |
-| `mcp_enabled` | int    | `1`           | 0 关闭 MCP 服务               |
+| `mcp_enabled` | int    | `0`           | 0 关闭 MCP 服务（默认不启用，需勾选） |
 | `mcp_port`    | int    | `8285`        | HTTP 监听端口                 |
 | `mcp_bind`    | string | `127.0.0.1`   | 绑定地址（仅本机访问）        |
 
 设置存放于 Everything 自带的 `Settings.ini`，与 http_server 等官方插件同节。
-若主程序未来提供选项页 API 再补 UI。
+也可以直接在 Everything 选项对话框的「插件 → MCP」页修改（启用开关、绑定地址、
+端口、恢复默认），点「应用」后立即生效，无需重启 Everything。
 
 ### MCP 客户端接入
 
@@ -242,6 +252,9 @@ an **MCP (Model Context Protocol)** server for LLMs (Claude Desktop, Cursor, …
   the CRT (see `.cargo/config.toml`).
 - **Folder-first** — LLMs usually work inside a specific project directory, so
   the tools are folder-scoped by design instead of scanning the whole disk.
+- **Settings page** — enable switch, bind address and port are configurable in
+  Everything's own options dialog; clicking Apply takes effect immediately,
+  without restarting Everything.
 - **MCP Streamable HTTP** — listens on `127.0.0.1:8285` by default, one
   JSON-RPC message over HTTP per request.
 - **Installable** — ships an NSIS script that produces a setup.exe in one step.
@@ -257,8 +270,11 @@ everything-mcp/
 ├── .cargo/config.toml          target-feature=+crt-static (key to zero third-party DLLs)
 ├── src/
 │   ├── lib.rs                   Plugin entry everything_plugin_proc + PM_* dispatch
+│   ├── options.rs              Settings page in Everything's options dialog
+│   │                            (enable/bind/port/restore defaults) + settings state
 │   ├── plugin/
 │   │   ├── mod.rs               Submodule summary + PM_* constants
+│   │   ├── diag.rs              Disk diagnostic log (%LOCALAPPDATA%\everything-mcp\plugin.log)
 │   │   ├── ffi_types.rs         #[repr(C)] types (Utf8Buf/DbHandle/FileInfoFd...)
 │   │   ├── host.rs              Host function pointer table + HOST/HOST_LOCK
 │   │   ├── search.rs            Async search → sync wait wrapper (main-thread marshaling)
@@ -272,6 +288,8 @@ everything-mcp/
 ├── installer/
 │   ├── everything-mcp.nsi      NSIS setup script
 │   └── client-config-example.json  MCP client configuration example
+├── tests/
+│   └── mcp.rs                  MCP protocol integration tests (cargo test)
 ├── docs/
 │   └── PLUGIN_SDK_API_CN.md     Chinese plugin SDK API reference (with field notes)
 ├── reference/                  Third-party reference material (official voidtools C
@@ -293,6 +311,9 @@ Invoke-WebRequest https://win.rustup.com/x86_64 -OutFile rustup-init.exe
 
 # Build from the repository root
 cargo build --release
+
+# Run the tests (MCP protocol integration tests; no Everything host needed)
+cargo test
 
 # Output
 ls target\release\everything_mcp.dll
@@ -345,13 +366,15 @@ when absent):
 
 | Setting        | Type   | Default       | Description                    |
 | -------------- | ------ | ------------- | ------------------------------ |
-| `mcp_enabled`  | int    | `1`           | 0 disables the MCP server      |
+| `mcp_enabled`  | int    | `0`           | 0 disables the MCP server (off until you opt in) |
 | `mcp_port`     | int    | `8285`        | HTTP listen port               |
 | `mcp_bind`     | string | `127.0.0.1`   | Bind address (localhost only)  |
 
 Settings live in Everything's own `Settings.ini`, in the same section as the
-official http_server plugin. A UI options page can be added once the host
-exposes that API.
+official http_server plugin. They can also be edited in Everything's options
+dialog under Plugins → MCP (enable switch, bind address, port, restore
+defaults); clicking Apply takes effect immediately — no Everything restart
+needed.
 
 ### Connecting an MCP client
 
