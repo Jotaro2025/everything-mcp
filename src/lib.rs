@@ -30,9 +30,8 @@ use std::ffi::CStr;
 use plugin::host::Host;
 
 // ============================================================
-// 插件元数据 —— 主程序通过 PM_GET_NAME / PM_GET_VERSION /
-// PM_GET_DESCRIPTION / PM_GET_AUTHOR / PM_GET_LINK /
-// PM_GET_PLUGIN_VERSION 读取。
+// 插件元数据 —— 主程序通过 PM_GET_PLUGIN_VERSION / PM_GET_NAME /
+// PM_GET_DESCRIPTION / PM_GET_AUTHOR / PM_GET_VERSION / PM_GET_LINK 读取。
 // 全部是 UTF-8 静态字符串，末尾必须带 \0。
 // ============================================================
 

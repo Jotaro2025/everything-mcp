@@ -14,18 +14,20 @@ pub mod main_thread;
 pub mod search;
 pub mod state;
 
-// PM_* 消息常量 —— 来自 everything_plugin.h。
+// PM_* 消息常量 —— 按 everything_plugin.h 的顺序原样抄录，勿凭直觉调整：
+// 官方 GET_* 的顺序是 NAME(3) / DESCRIPTION(4) / AUTHOR(5) / VERSION(6) /
+// LINK(7)，PLUGIN_VERSION(2) 排在 NAME 之前，11 是 UNINSTALL 而不是版本号。
 pub const PM_INIT: u32 = 1;
-pub const PM_QUIT: u32 = 2;
+pub const PM_GET_PLUGIN_VERSION: u32 = 2;
 pub const PM_GET_NAME: u32 = 3;
-pub const PM_GET_VERSION: u32 = 4;
-pub const PM_GET_DESCRIPTION: u32 = 5;
-pub const PM_GET_AUTHOR: u32 = 6;
+pub const PM_GET_DESCRIPTION: u32 = 4;
+pub const PM_GET_AUTHOR: u32 = 5;
+pub const PM_GET_VERSION: u32 = 6;
 pub const PM_GET_LINK: u32 = 7;
 pub const PM_START: u32 = 8;
 pub const PM_STOP: u32 = 9;
 pub const PM_KILL: u32 = 10;
-pub const PM_GET_PLUGIN_VERSION: u32 = 11;
+pub const PM_UNINSTALL: u32 = 11;
 /// 注册选项页：data 是 everything_plugin_ui_options_add_custom_page_s*。
 pub const PM_ADD_OPTIONS_PAGES: u32 = 12;
 /// 加载选项页：data 是 everything_plugin_load_options_page_t*。
