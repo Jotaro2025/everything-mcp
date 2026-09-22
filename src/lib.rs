@@ -171,12 +171,15 @@ unsafe fn everything_plugin_proc_impl(msg: u32, data: *mut c_void) -> *mut c_voi
         }
 
         // ============================================================
-        // PM_STOP：优雅关闭 —— 停 HTTP 服务、释放 db 引用。
+        // PM_STOP：优雅关闭 —— 停 HTTP 服务、释放 db 引用、销毁主线程窗口。
+        // state::destroy 与 destroy_main_window 都是幂等的 —— 主程序在
+        // 关闭插件时常常先 PM_STOP 再 PM_KILL，不会造成双重释放。
         // ============================================================
         plugin::PM_STOP => {
             Host::debug("everything_mcp: PM_STOP");
             mcp::server::stop();
             options::mark_stopped();
+            plugin::main_thread::destroy_main_window();
             unsafe { plugin::state::destroy() };
             1 as *mut c_void
         }
@@ -185,6 +188,7 @@ unsafe fn everything_plugin_proc_impl(msg: u32, data: *mut c_void) -> *mut c_voi
             Host::debug("everything_mcp: PM_KILL");
             mcp::server::stop();
             options::mark_stopped();
+            plugin::main_thread::destroy_main_window();
             unsafe { plugin::state::destroy() };
             1 as *mut c_void
         }
@@ -249,7 +253,7 @@ unsafe fn read_setting_int(data: *mut c_void, name: &'static str, default: i32) 
 /// 调用主程序 get_setting_string，读取字符串设置。
 /// 返回时把主程序返回的 UTF-8 指针拷成 String。
 ///
-/// `name` 和 `default` 必须是末尾带 `\0` 的字面量。
+/// `name` 必须是末尾带 `\0` 的字面量；`default` 仅在 host 未导出该函数时使用。
 ///
 /// # Safety
 /// `data` 必须是 PM_START 时的设置上下文。
@@ -261,16 +265,24 @@ unsafe fn read_setting_string(
     let host = Host::get();
     match host.get_setting_string {
         Some(f) => {
-            // 主程序签名：返回 char*（一个静态或新分配的字符串），
-            // 它的 lifetime 由主程序管理 —— 我们立即复制。
-            let p = unsafe { f(data, name.as_ptr(), default.as_ptr() as *mut u8) };
+            // 主程序签名：返回 char*，所有权转移给插件，用完必须 mem_free
+            // （http_server.c 正是在 PM_KILL 里逐项 mem_free 这些缓冲）。
+            //
+            // 第三个参数 current_string 传 NULL 而不是 default：主程序可能
+            // 直接持有或 free 这个指针，而 default 是 .rdata 里的静态字面量，
+            // 交给主程序去 free 会崩溃。host 在没有已存值时忽略该参数。
+            let p = unsafe { f(data, name.as_ptr(), core::ptr::null_mut()) };
             if p.is_null() {
                 return default.trim_end_matches('\0').to_string();
             }
             // host 返回的是 *mut u8（即 everything_plugin_utf8_t*），
-            // 按 UTF-8 null 结尾读取。
+            // 按 UTF-8 null 结尾读取，复制后立刻归还主程序分配器。
             let cs = unsafe { CStr::from_ptr(p as *const core::ffi::c_char) };
-            cs.to_string_lossy().into_owned()
+            let out = cs.to_string_lossy().into_owned();
+            if let Some(free) = host.mem_free {
+                unsafe { free(p as *mut c_void) };
+            }
+            out
         }
         None => default.trim_end_matches('\0').to_string(),
     }

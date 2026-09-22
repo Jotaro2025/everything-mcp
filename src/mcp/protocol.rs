@@ -226,7 +226,7 @@ pub fn make_discover_result() -> Value {
                 "version": "1.0.0"
             }
         },
-        "instructions": "Folder-scoped Everything file search. Use search_in_folder with an absolute folder path plus Everything search syntax; list_folder for immediate children; count for totals only.",
+        "instructions": "Folder-scoped Everything file search. Use search_in_folder with an absolute folder path plus Everything search syntax; list_folder for immediate children; count for totals only. Search results are truncated by max_results and carry a separate 'total' count of all matches found.",
         "ttlMs": DISCOVER_TTL_MS,
         "cacheScope": CACHE_SCOPE_PUBLIC
     })
@@ -242,7 +242,7 @@ pub fn make_tools_list() -> Value {
         "tools": [
             {
                 "name": "search_in_folder",
-                "description": "Search files/folders under a specific folder using Everything search syntax. Prefer this over global search when working within a project directory.",
+                "description": "Search files/folders recursively under a specific folder using Everything search syntax. Prefer this over global search when working within a project directory. This is not shell glob: use '*.rs', not '**/*.rs'; exclude matches with a '!' prefix (e.g. 'ext:rs !test'); 'content:\"fn main\"' searches file contents. The response reports both 'count' (entries returned, capped by max_results) and 'total' (all matches found) — when they differ, the results are truncated.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -252,7 +252,7 @@ pub fn make_tools_list() -> Value {
                         },
                         "pattern": {
                             "type": "string",
-                            "description": "Everything search pattern. Examples: '*.rs' (extension), 'readme' (substring), 'ext:md;txt' (multiple extensions), '\"exact phrase\"'. Empty pattern lists all files."
+                            "description": "Everything search pattern. Examples: '*.rs' (extension), 'readme' (substring), 'ext:md;txt' (multiple extensions), '\"exact phrase\"', 'content:\"fn main\"' (content search), 'ext:rs !test' (the '!' prefix excludes matches). Empty pattern lists all files. Shell globs like '**/*.rs' are not supported — the folder scope already restricts the tree."
                         },
                         "max_results": {
                             "type": "integer",
@@ -270,7 +270,7 @@ pub fn make_tools_list() -> Value {
             },
             {
                 "name": "list_folder",
-                "description": "List immediate children of a folder (non-recursive). Returns both files and sub-folders with sizes.",
+                "description": "List immediate children of a folder (non-recursive). Returns both files and sub-folders; folder entries always report size 0 (Everything does not compute directory sizes). Use search_in_folder when you need the whole tree.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -281,7 +281,7 @@ pub fn make_tools_list() -> Value {
             },
             {
                 "name": "count",
-                "description": "Count files matching a pattern within a folder, without fetching names. Useful for quick metrics.",
+                "description": "Count files/folders matching a pattern within a folder (recursive), without fetching names. Fast path over search_in_folder — no per-entry names or paths are materialized.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {

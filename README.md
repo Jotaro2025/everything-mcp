@@ -176,7 +176,9 @@ Everything 官方插件页：<https://www.voidtools.com/support/everything/plugi
 | `mcp_port`    | int    | `8285`        | HTTP 监听端口                 |
 | `mcp_bind`    | string | `127.0.0.1`   | 绑定地址（仅本机访问）        |
 
-设置存放于 Everything 自带的 `Settings.ini`，与 http_server 等官方插件同节。
+设置存放于 `%APPDATA%\Everything\Plugins.ini` 的本插件专属小节
+`[everything_mcp64.dll]`（32 位系统上是 `[everything_mcp32.dll]`）——
+不是 Everything 的 `Settings.ini`，也不与 http_server 等官方插件共用小节。
 也可以直接在 Everything 选项对话框的「插件 → MCP」页修改（启用开关、绑定地址、
 端口、恢复默认），点「应用」后立即生效，无需重启 Everything。
 
@@ -198,13 +200,14 @@ Everything 官方插件页：<https://www.voidtools.com/support/everything/plugi
 **只需要一个 URL。** 插件端点是双时代的：老的 MCP 客户端走 `initialize` 握手，
 2026-07-28 起的客户端跳过握手、直接发请求，两者都能正常接入，无需在客户端侧
 指定协议版本。前提是插件已启用（Everything 选项对话框「插件 → MCP」页勾选，
-或 `Settings.ini` 里 `mcp_enabled=1`）。
+或 `%APPDATA%\Everything\Plugins.ini` 的 `[everything_mcp64.dll]` 小节里
+`mcp_enabled=1`）。
 
 接入后 LLM 会自动发现以下三个工具：
 
 #### 1. `search_in_folder`
 
-在指定文件夹下按 Everything 搜索语法查找文件 / 文件夹。
+递归搜索指定文件夹下的文件 / 文件夹（Everything 搜索语法）。
 
 ```json
 {
@@ -216,9 +219,14 @@ Everything 官方插件页：<https://www.voidtools.com/support/everything/plugi
 ```
 
 - `pattern` 支持完整 Everything 语法：`*.rs`、`"readme"`、`ext:md;txt`、
-  `dm:lastweek`、`size:>1mb` 等。
+  `dm:lastweek`、`size:>1mb`、`content:"fn main"` 等。
+- **不是 shell glob**：写 `*.rs`，不要写 `**/*.rs` —— 文件夹范围本身
+  已经限定了目录树。排除项用 `!` 前缀，如 `ext:rs !test`。
 - 空字符串 `""` 表示列出该文件夹下所有文件。
 - `max_results = 0` 表示无上限（大目录慎用）。
+- 响应里 `count` 是实际返回的条数（受 `max_results` 截断），`total` 是
+  命中的总条数 —— 两者不等即说明结果被截断了，可以据此调大
+  `max_results` 或用 `count` 先摸底。
 
 #### 2. `list_folder`
 
@@ -228,9 +236,13 @@ Everything 官方插件页：<https://www.voidtools.com/support/everything/plugi
 { "folder": "D:\\source\\repos\\my-project" }
 ```
 
+- 文件夹条目的 `size` 恒为 0 —— Everything 不计算目录大小，这是口径
+  而非缺失。要整个目录树的内容，用 `search_in_folder` 递归搜索。
+- 响应同样带 `total`（该目录直接子项总数）。
+
 #### 3. `count`
 
-统计匹配文件数量，不返回名字列表。
+统计匹配文件数量，不返回名字列表。只取命中计数，不逐条读名字和路径。
 
 ```json
 { "folder": "D:\\source\\repos\\my-project", "pattern": "ext:rs" }

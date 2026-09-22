@@ -21,12 +21,13 @@
 //! 调用路径与 etp_server.c 完全一致。
 
 use core::ffi::c_void;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
-use windows_sys::Win32::System::Threading::GetCurrentThreadId;
-use windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW;
+use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::System::Threading::{GetCurrentThreadId, Sleep};
+use windows_sys::Win32::UI::WindowsAndMessaging::{DestroyWindow, IsWindow, PostMessageW};
 
 use super::host::{Host, HCURSOR, HICON, HINSTANCE, HMENU, HWND as HostHwnd};
 
@@ -35,11 +36,18 @@ use super::host::{Host, HCURSOR, HICON, HINSTANCE, HMENU, HWND as HostHwnd};
 pub const WM_INVOKE: u32 = 0x0400 + 4; // WM_USER+4
 
 /// 进程级主线程窗口句柄 —— 一旦 PM_START 注册成功就有效。
-static MAIN_HWND: OnceLock<isize> = OnceLock::new();
+/// 0 表示未安装。用原子值而非 OnceLock：stop/start 周期里要能销毁并重建。
+static MAIN_HWND: AtomicIsize = AtomicIsize::new(0);
 
 /// install_on_main_thread 调用时的线程 ID —— 用于诊断 wnd_proc 是否真的
 /// 在主线程上被调度（PostMessage 投递的消息由创建窗口的线程的消息泵处理）。
-static INSTALL_TID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static INSTALL_TID: AtomicU32 = AtomicU32::new(0);
+
+/// invoke_c 等待主线程完成的超时（毫秒）。
+///
+/// 超时不等于可以释放 ctx —— 主线程可能正拿着它执行。能否安全返回错误
+/// 由 try_reclaim 判断（见其文档）；超时值本身只是把卡死变成可诊断的错误。
+const INVOKE_TIMEOUT_MS: u32 = 30_000;
 
 /// 我们注册的窗口类名（UTF-8，null 结尾的字节串）。
 const CLASS_NAME: &[u8] = b"EverythingMcpMain\0";
@@ -68,7 +76,48 @@ static PENDING_TASK: Mutex<Option<PendingTask>> = Mutex::new(None);
 
 /// 取主窗口句柄；注册成功后才有，否则返回 None。
 pub fn main_hwnd() -> Option<isize> {
-    MAIN_HWND.get().copied()
+    let h = MAIN_HWND.load(Ordering::Acquire);
+    if h == 0 {
+        None
+    } else {
+        Some(h)
+    }
+}
+
+/// 尝试取回槽位里的任务。
+///
+/// 只有当能**证明**主线程不会（再）执行我们的任务时，才取回并清空槽位：
+///
+///  1. 槽位里仍然是我们这次提交的任务 —— 主线程还没取走它，取回即安全；
+///  2. 槽位已空、且 `hwnd` 指向的窗口已经销毁 —— 消息永远到不了主线程，
+///     任务不可能再被执行（销毁窗口发生在主线程，因此主线程不可能正卡在
+///     某个 wndproc 里执行我们的任务）。
+///
+/// 其余情况（槽位空但窗口仍在）表示主线程已经取走任务、正在执行，此时
+/// 返回 None：调用方必须继续等 `done`，绝不能就地释放 ctx。
+///
+/// 返回 Some(()) 表示调用方已重新独占该任务，可以安全释放自己的 ctx。
+fn try_reclaim(done: &Arc<AtomicBool>, hwnd: isize) -> Option<()> {
+    let mut slot = PENDING_TASK.lock().unwrap_or_else(|p| p.into_inner());
+    match slot.as_ref() {
+        // 还在槽位里 —— 主线程尚未取走。
+        Some(t) if Arc::ptr_eq(&t.done, done) => {
+            *slot = None;
+            Some(())
+        }
+        // 槽位里是别的任务 —— 说明我们那次已经被取走在执行。
+        Some(_) => None,
+        // 槽位为空。只在我们自己的窗口已销毁时才能断定任务已被丢弃；
+        // 窗口还活着就意味着主线程刚 take() 完、正在跑。
+        None => {
+            let alive = unsafe { IsWindow(hwnd as HWND) } != 0;
+            if alive {
+                None
+            } else {
+                Some(())
+            }
+        }
+    }
 }
 
 /// 在主线程上执行一次 C 风格任务，阻塞直到完成。
@@ -77,8 +126,18 @@ pub fn main_hwnd() -> Option<isize> {
 /// 在本函数返回前保持有效（调用方持有）。
 pub fn invoke_c(func: TaskFn, ctx: *mut c_void) -> Result<(), String> {
     let caller_tid = unsafe { GetCurrentThreadId() };
-    let hwnd = main_hwnd().ok_or_else(|| "main window not ready".to_string())?;
     let done = Arc::new(AtomicBool::new(false));
+
+    // 已经在主线程上：直接执行。否则 PostMessage 到自己的窗口要等消息泵
+    // 取走这条消息才返回 —— 而消息泵此刻正卡在本调用里，必死锁。
+    // （PM_START 期间注册窗口就是在主线程上跑的，这条路径可达。）
+    if caller_tid == INSTALL_TID.load(Ordering::Acquire) {
+        super::diag::write("invoke_c: already on main thread — running inline");
+        unsafe { func(ctx) };
+        return Ok(());
+    }
+
+    let hwnd = main_hwnd().ok_or_else(|| "main window not ready".to_string())?;
 
     {
         let mut slot = PENDING_TASK.lock().unwrap_or_else(|p| p.into_inner());
@@ -108,13 +167,39 @@ pub fn invoke_c(func: TaskFn, ctx: *mut c_void) -> Result<(), String> {
 
     // 忙等主线程完成。db_query_search2 是异步提交（很快返回），
     // read_results 读取本地内存也很快；给足上界防死锁。
+    // 每轮自旋后让出一次 CPU —— 纯自旋会把主线程饿死（本线程与主线程
+    // 可能同优先级），反而更容易撞上超时。
+    let start = std::time::Instant::now();
+    let deadline = std::time::Duration::from_millis(INVOKE_TIMEOUT_MS as u64);
     let mut spins: u64 = 0;
     while !done.load(Ordering::SeqCst) {
-        spins += 1;
-        if spins > 2_000_000_000 {
-            return Err("invoke_c timeout".to_string());
+        if start.elapsed() >= deadline {
+            // 超时。关键：不能直接返回让调用方释放 ctx —— 主线程可能已经
+            // 取走任务、此刻正在解引用 ctx。只有确认槽位里还是我们的任务
+            // （主线程尚未取走）时才清槽位并返回错误。
+            if try_reclaim(&done, hwnd).is_some() {
+                super::diag::write("invoke_c: timeout, task reclaimed");
+                return Err("invoke_c timeout".to_string());
+            }
+            // 主线程已经接手 —— 只能继续等它置位 done。此时返回会让调用方
+            // 释放正在被执行的 ctx，比多等一会儿危险得多。
+            super::diag::write("invoke_c: timeout but task may be running — waiting");
+            while !done.load(Ordering::SeqCst) {
+                // 槽位空 + 窗口已销毁 ⇒ 任务被丢弃、永远不会执行，
+                // 这时才可以安全返回错误让调用方回收 ctx。
+                if try_reclaim(&done, hwnd).is_some() {
+                    super::diag::write("invoke_c: window gone, task discarded");
+                    return Err("invoke_c aborted — main window destroyed".to_string());
+                }
+                unsafe { Sleep(1) };
+            }
+            return Ok(());
         }
+        spins += 1;
         std::hint::spin_loop();
+        if spins % 4096 == 0 {
+            unsafe { Sleep(0) };
+        }
     }
     Ok(())
 }
@@ -168,9 +253,17 @@ pub unsafe extern "system" fn wnd_proc(
 ///
 /// 通过主程序提供的 `os_register_class` + `os_create_window` 注册窗口类并
 /// 创建窗口。主消息泵只会处理它自己创建过的窗口的消息。
+///
+/// **幂等**：已安装过就直接返回 Ok，不会重复注册窗口类 / 重复建窗口
+/// （选项对话框里停用再启用插件会走到这里两次）。
 pub fn install_on_main_thread() -> Result<(), String> {
+    if main_hwnd().is_some() {
+        super::diag::write("install_on_main_thread: already installed");
+        return Ok(());
+    }
+
     let install_tid = unsafe { GetCurrentThreadId() };
-    INSTALL_TID.store(install_tid, Ordering::SeqCst);
+    INSTALL_TID.store(install_tid, Ordering::Release);
 
     let host = Host::get();
 
@@ -199,6 +292,11 @@ pub fn install_on_main_thread() -> Result<(), String> {
     // 创建隐藏窗口。
     // dwStyle=0, hWndParent=0 创建一个不可见窗口（不指定 WS_OVERLAPPED 等
     // 可见样式即可）。etp_server.c 行 2824-2828 用的也是相同模式。
+    //
+    // hInstance 传 GetModuleHandle(0)（本 DLL 实例），与 etp_server.c:2828 /
+    // http_server.c:3830 完全一致 —— 传 NULL 会让主程序在窗口类实例匹配时
+    // 拿不到模块基址。
+    let hinstance: HINSTANCE = unsafe { GetModuleHandleW(core::ptr::null()) as HINSTANCE };
     let hwnd: HostHwnd = unsafe {
         create_window(
             0, // dwExStyle
@@ -211,17 +309,37 @@ pub fn install_on_main_thread() -> Result<(), String> {
             0,              // nHeight
             0 as HostHwnd,  // hWndParent
             0 as HMENU,     // hMenu
-            0 as HINSTANCE, // hInstance
+            hinstance,      // hInstance
             core::ptr::null_mut(), // lpParam
         )
     };
     if hwnd.is_null() {
         return Err("os_create_window returned NULL".to_string());
     }
-    let _ = MAIN_HWND.set(hwnd as isize);
+    MAIN_HWND.store(hwnd as isize, Ordering::Release);
     super::diag::write(&format!(
         "main_thread: host-window installed hwnd=0x{:x} tid={}",
         hwnd as usize, install_tid
     ));
     Ok(())
+}
+
+/// 在 PM_STOP/PM_KILL 时调用：销毁主线程窗口并清空句柄。
+///
+/// 与 etp_server.c:1171 / http_server.c:3944 一致 —— 官方插件在关闭时
+/// 直接对本插件创建的窗口调 DestroyWindow。销毁后 invoke_c 会以
+/// 「main window not ready」失败，直到下一次 PM_START 重建。
+///
+/// 幂等：句柄已为 0 时直接返回。
+///
+/// **刻意不清空 PENDING_TASK**：可能有 MCP 工作线程正带着任务在等。
+/// 抢清槽位会让它误以为「任务已被主线程取走」而永久等 done。留着不动，
+/// 它的 invoke_c 超时后会发现窗口已销毁、自行回收（见 try_reclaim）。
+pub fn destroy_main_window() {
+    let h = MAIN_HWND.swap(0, Ordering::AcqRel);
+    if h == 0 {
+        return;
+    }
+    super::diag::write(&format!("main_thread: destroying hwnd=0x{:x}", h));
+    unsafe { DestroyWindow(h as HWND) };
 }

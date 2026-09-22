@@ -195,11 +195,12 @@ when absent):
 | `mcp_port`     | int    | `8285`        | HTTP listen port               |
 | `mcp_bind`     | string | `127.0.0.1`   | Bind address (localhost only)  |
 
-Settings live in Everything's own `Settings.ini`, in the same section as the
-official http_server plugin. They can also be edited in Everything's options
-dialog under Plugins → MCP (enable switch, bind address, port, restore
-defaults); clicking Apply takes effect immediately — no Everything restart
-needed.
+Settings live in `%APPDATA%\Everything\Plugins.ini`, in this plugin's own
+section `[everything_mcp64.dll]` (`[everything_mcp32.dll]` on 32-bit) — not in
+Everything's `Settings.ini`, and not shared with the official http_server
+plugin's section. They can also be edited in Everything's options dialog under
+Plugins → MCP (enable switch, bind address, port, restore defaults); clicking
+Apply takes effect immediately — no Everything restart needed.
 
 ### Connecting an MCP client
 
@@ -221,13 +222,14 @@ through the `initialize` handshake, while 2026-07-28-and-newer clients skip the
 handshake and send requests directly — both connect fine, with no protocol
 version to configure on the client side. The only prerequisite is that the
 plugin is enabled (the Plugins → MCP page in Everything's options dialog, or
-`mcp_enabled=1` in `Settings.ini`).
+`mcp_enabled=1` under `[everything_mcp64.dll]` in
+`%APPDATA%\Everything\Plugins.ini`).
 
 Once connected, the LLM discovers three tools automatically:
 
 #### 1. `search_in_folder`
 
-Find files/folders under a given folder using Everything search syntax.
+Recursively find files/folders under a given folder using Everything search syntax.
 
 ```json
 {
@@ -239,9 +241,15 @@ Find files/folders under a given folder using Everything search syntax.
 ```
 
 - `pattern` supports the full Everything syntax: `*.rs`, `"readme"`,
-  `ext:md;txt`, `dm:lastweek`, `size:>1mb`, …
-- An empty string `""` lists everything directly under the folder.
+  `ext:md;txt`, `dm:lastweek`, `size:>1mb`, `content:"fn main"`, …
+- **Not shell glob**: write `*.rs`, not `**/*.rs` — the folder scope
+  already restricts the tree. Exclude matches with a `!` prefix, e.g.
+  `ext:rs !test`.
+- An empty string `""` lists everything under the folder.
 - `max_results = 0` means unlimited (careful with huge folders).
+- The response reports `count` (entries returned, capped by `max_results`)
+  and `total` (all matches found) — when they differ, results were
+  truncated: raise `max_results` or use `count` to scope the folder first.
 
 #### 2. `list_folder`
 
@@ -251,9 +259,15 @@ List the direct children (non-recursive) of a folder: name, kind, size.
 { "folder": "D:\\source\\repos\\my-project" }
 ```
 
+- Folder entries always report `size` 0 — Everything does not compute
+  directory sizes; that is the convention, not missing data. Use
+  `search_in_folder` for the whole tree.
+- The response also carries `total` (number of direct children).
+
 #### 3. `count`
 
-Count matching files without returning the name list.
+Count matching files without returning the name list. Only the hit count
+is taken — no per-entry names or paths are materialized.
 
 ```json
 { "folder": "D:\\source\\repos\\my-project", "pattern": "ext:rs" }

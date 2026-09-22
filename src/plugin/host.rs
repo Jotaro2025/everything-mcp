@@ -318,7 +318,7 @@ pub struct Host {
     pub db_release: Option<DbReleaseFn>,
     pub db_query_create: Option<DbQueryCreateFn>,
     pub db_query_destroy: Option<DbQueryDestroyFn>,
-    pub db_cancel_query: Option<DbCancelQueryFn>,
+    pub db_query_cancel: Option<DbCancelQueryFn>,
     pub db_query_search: Option<DbQuerySearchFn>,
     pub db_query_get_result_count: Option<DbQueryGetResultCountFn>,
     pub db_query_get_result_name: Option<DbQueryGetResultNameFn>,
@@ -418,10 +418,11 @@ impl Host {
         opt!(os_event_set, "os_event_set");
 
         // 设置 —— 可选（PM_START 时使用，缺失则全部使用编译期默认值）。
-        // 实测 Everything 1.5.0.1422b 没有暴露 get_setting_int —— 只能通过
-        // get_setting_string 读字符串再自行解析。把两者都设为可选最稳。
-        opt!(get_setting_int, "get_setting_int");
-        opt!(get_setting_string, "get_setting_string");
+        // 真实导出名是 plugin_get_setting_int / plugin_get_setting_string
+        // （已对 Everything 1.5.0.1422b 的字符串表核对：裸名 get_setting_*
+        // 在该可执行文件里根本不存在）。
+        opt!(get_setting_int, "plugin_get_setting_int");
+        opt!(get_setting_string, "plugin_get_setting_string");
         // 设置写回（PM_SAVE_SETTINGS / 选项页持久化）。同样按可选处理：
         // 缺失时设置页仍可即时应用，只是无法写进 Everything.ini。
         opt!(set_setting_int, "plugin_set_setting_int");
@@ -434,11 +435,12 @@ impl Host {
         req!(db_release, "db_release");
         req!(db_query_create, "db_query_create");
         req!(db_query_destroy, "db_query_destroy");
-        // 数据库查询 —— 全部可选。1.5.0.1422b 上实测某些函数（例如
-        // db_cancel_query）尚未对外暴露；具体哪个可用属于版本差异。
+        // 数据库查询 —— 全部可选。1.5.0.1422b 上实测某些函数尚未对外暴露；
+        // 具体哪个可用属于版本差异。
         // 调用方（search.rs）一律使用 .ok_or(...)？ —— 任一缺失会在用户实际
         // 触发对应搜索时给出明确错误，而不会阻断插件加载。
-        opt!(db_cancel_query, "db_cancel_query");
+        // 真实导出名是 db_query_cancel（不是 db_cancel_query）。
+        opt!(db_query_cancel, "db_query_cancel");
         // 真实函数名是 db_query_search2 —— 不是 db_query_search。
         // 参数表与 etp_server.c 中的 everything_plugin_db_query_search2 字节一致。
         opt!(db_query_search, "db_query_search2");

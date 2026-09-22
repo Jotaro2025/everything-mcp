@@ -56,22 +56,25 @@ pub fn dispatch(name: &str, args: &Value) -> Result<ToolOutput, (i32, String)> {
                 timeout_ms,
                 plugin::search::SearchScope::Recursive,
             ) {
-                Ok(results) => {
-                    let total = results.len();
-                    let mut entries = Vec::with_capacity(total);
-                    for r in &results {
-                        let kind = if r.is_folder { "folder" } else { "file" };
-                        entries.push(json!({
-                            "name": r.name,
-                            "path": r.path,
-                            "kind": kind,
-                            "size": r.size,
-                        }));
-                    }
+                Ok(outcome) => {
+                    let entries: Vec<Value> = outcome
+                        .results
+                        .iter()
+                        .map(|r| {
+                            let kind = if r.is_folder { "folder" } else { "file" };
+                            json!({
+                                "name": r.name,
+                                "path": r.path,
+                                "kind": kind,
+                                "size": r.size,
+                            })
+                        })
+                        .collect();
                     let text = serde_json::to_string_pretty(&json!({
                         "folder": folder,
                         "pattern": pattern,
-                        "count": total,
+                        "count": entries.len(),
+                        "total": outcome.total,
                         "results": entries,
                     }))
                     .unwrap_or_else(|_| "{\"error\":\"serialization failed\"}".into());
@@ -93,8 +96,9 @@ pub fn dispatch(name: &str, args: &Value) -> Result<ToolOutput, (i32, String)> {
                 10_000,
                 plugin::search::SearchScope::Children,
             ) {
-                Ok(results) => {
-                    let entries: Vec<Value> = results
+                Ok(outcome) => {
+                    let entries: Vec<Value> = outcome
+                        .results
                         .iter()
                         .map(|r| {
                             json!({
@@ -107,6 +111,7 @@ pub fn dispatch(name: &str, args: &Value) -> Result<ToolOutput, (i32, String)> {
                     let text = serde_json::to_string_pretty(&json!({
                         "folder": folder,
                         "count": entries.len(),
+                        "total": outcome.total,
                         "items": entries,
                     }))
                     .unwrap_or_else(|_| "{}".into());
@@ -119,21 +124,14 @@ pub fn dispatch(name: &str, args: &Value) -> Result<ToolOutput, (i32, String)> {
         "count" => {
             let folder = require_folder(args)?;
             let pattern = pattern_arg(args)?;
-            // 我们用 search_in_folder 但只取总数（max_results=0 + 读 count）。
-            // 优化：当前 search_in_folder 仍然会读出全部结果填到 Vec，
-            // 对于纯计数来说有额外开销，但单次查询本身的耗时主要在搜索而不是读取，
-            // 所以暂不专门优化。计数与 search_in_folder 同范围（递归子树）。
-            match plugin::search::search_in_folder(
-                &folder,
-                &pattern,
-                0,
-                10_000,
-                plugin::search::SearchScope::Recursive,
-            ) {
-                Ok(results) => {
+            // 快速路径：只取 db_query_get_result_count 的计数值，
+            // 不为每条结果拼 name/path 字符串。计数与 search_in_folder
+            // 同范围（递归子树）。
+            match plugin::search::count_in_folder(&folder, &pattern, 10_000) {
+                Ok(n) => {
                     let text = format!(
                         "{{\"folder\":{:?},\"pattern\":{:?},\"count\":{}}}",
-                        folder, pattern, results.len()
+                        folder, pattern, n
                     );
                     Ok((content_text(&text), false))
                 }

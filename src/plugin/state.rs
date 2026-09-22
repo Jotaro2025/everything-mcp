@@ -14,6 +14,7 @@
 //! 这些资源跨多个 MCP 请求共享，因此放在全局单例里，并与 `host::HOST_LOCK`
 //! 一起保证主程序接口的串行访问。
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::OnceLock;
 
 use super::ffi_types::*;
@@ -33,10 +34,33 @@ pub static STATE: OnceLock<PluginState> = OnceLock::new();
 
 /// 懒创建的数据库引用 —— 首次搜索时在主线程上创建。
 /// 以 usize 存储指针位模式：裸指针不是 Sync，不能直接放进 static。
-pub static DB_HANDLE: OnceLock<usize> = OnceLock::new();
+/// 0 表示「尚未创建」。PM_STOP/PM_KILL 的 destroy 会把它清零，
+/// 因此 stop 后再 kill 不会二次释放，stop 后再 start 也能重建。
+static DB_HANDLE: AtomicUsize = AtomicUsize::new(0);
 
 /// 懒创建的查询对象 —— 首次搜索时在主线程上创建，之后复用。
-pub static QUERY_HANDLE: OnceLock<usize> = OnceLock::new();
+/// 同样可被 destroy 清零，下一次 ensure_query 重新创建。
+static QUERY_HANDLE: AtomicUsize = AtomicUsize::new(0);
+
+/// 读当前 db 引用（未创建时为 NULL）。
+pub fn load_db() -> Option<DbHandle> {
+    let v = DB_HANDLE.load(Ordering::Acquire);
+    if v == 0 {
+        None
+    } else {
+        Some(v as DbHandle)
+    }
+}
+
+/// 读当前 query 对象（未创建时为 NULL）。
+pub fn load_query() -> Option<DbQueryHandle> {
+    let v = QUERY_HANDLE.load(Ordering::Acquire);
+    if v == 0 {
+        None
+    } else {
+        Some(v as DbQueryHandle)
+    }
+}
 
 /// 确保 db 引用与 query 对象已创建；返回 query 句柄。
 ///
@@ -46,22 +70,22 @@ pub static QUERY_HANDLE: OnceLock<usize> = OnceLock::new();
 /// # Safety
 /// 调用者必须持有 `host::HOST_LOCK` 且运行在 Everything 主线程上。
 pub unsafe fn ensure_query() -> Result<DbQueryHandle, String> {
-    if let Some(q) = QUERY_HANDLE.get() {
-        return Ok(*q as DbQueryHandle);
+    if let Some(q) = load_query() {
+        return Ok(q);
     }
 
     let host = Host::get();
 
-    let db = if let Some(d) = DB_HANDLE.get() {
-        *d as DbHandle
+    let db = if let Some(d) = load_db() {
+        d
     } else {
         let add_ref = host.db_add_local_ref.ok_or("db_add_local_ref null")?;
         let d = add_ref();
         if d.is_null() {
             return Err("db_add_local_ref returned NULL".to_string());
         }
-        // 竞争无害：多线程同时 set 时只有一个成功，两个都拿到有效句柄。
-        let _ = DB_HANDLE.set(d as usize);
+        // 竞争无害：多线程同时创建时后一个覆盖前一个，两个都拿到有效句柄。
+        DB_HANDLE.store(d as usize, Ordering::Release);
         d
     };
 
@@ -70,7 +94,7 @@ pub unsafe fn ensure_query() -> Result<DbQueryHandle, String> {
     if query.is_null() {
         return Err("db_query_create returned NULL".to_string());
     }
-    let _ = QUERY_HANDLE.set(query as usize);
+    QUERY_HANDLE.store(query as usize, Ordering::Release);
 
     super::diag::write(&format!("ensure_query: db={:p} query={:p}", db, query));
     Ok(query)
@@ -91,6 +115,11 @@ pub fn create() -> PluginState {
 
 /// 在 PM_STOP/PM_KILL 时调用：销毁 query、释放 db 引用（若已懒创建）。
 ///
+/// **幂等**：用 swap(0) 原子取走句柄，第二次调用（PM_STOP 之后又来
+/// PM_KILL）只会拿到 0 直接返回，不会对同一指针释放两次。这也让
+/// stop → start → search 的流程能重新创建句柄（etp_server.c 同样在
+/// PM_KILL 里把 `_etp_server` 清零）。
+///
 /// # Safety
 /// 调用者必须保证此时没有其他线程正在调用主程序数据库接口。
 pub unsafe fn destroy() {
@@ -100,14 +129,19 @@ pub unsafe fn destroy() {
     }
 
     let host = Host::get();
-    if let Some(q) = QUERY_HANDLE.get() {
+
+    // swap 取走即清空：即使 db_query_destroy 缺失，句柄也不再被后续
+    // 搜索复用（那是已随插件停止而失效的指针）。
+    let q = QUERY_HANDLE.swap(0, Ordering::AcqRel);
+    if q != 0 {
         if let Some(destroy) = host.db_query_destroy {
-            destroy(*q as DbQueryHandle);
+            destroy(q as DbQueryHandle);
         }
     }
-    if let Some(d) = DB_HANDLE.get() {
+    let d = DB_HANDLE.swap(0, Ordering::AcqRel);
+    if d != 0 {
         if let Some(release) = host.db_release {
-            release(*d as DbHandle);
+            release(d as DbHandle);
         }
     }
 }

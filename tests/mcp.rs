@@ -73,6 +73,41 @@ fn tools_list_contains_three_tools_with_required_params() {
 }
 
 #[test]
+fn search_description_warns_against_shell_glob_and_documents_truncation() {
+    let list = protocol::make_tools_list();
+    let search = &list["tools"][0];
+
+    // 描述里必须点明三件评测中被踩过的坑：不是 glob、排除语法、截断可见。
+    let desc = search["description"].as_str().unwrap();
+    assert!(desc.contains("**/*.rs"), "desc should reject shell glob");
+    assert!(desc.contains('!'), "desc should document the '!' exclusion prefix");
+    assert!(desc.contains("total"), "desc should document the total/count pair");
+    assert!(desc.contains("content:"), "desc should mention content search");
+
+    // pattern 的参数说明同样带 glob 警告与排除范例。
+    let pattern_desc = search["inputSchema"]["properties"]["pattern"]["description"]
+        .as_str()
+        .unwrap();
+    assert!(pattern_desc.contains("**/*.rs"));
+    assert!(pattern_desc.contains("ext:rs !test"));
+}
+
+#[test]
+fn list_folder_description_documents_zero_folder_size() {
+    let list = protocol::make_tools_list();
+    let desc = list["tools"][1]["description"].as_str().unwrap();
+    assert!(desc.contains("size 0"), "desc: {desc}");
+    assert!(desc.contains("recursive"));
+}
+
+#[test]
+fn count_description_documents_fast_path() {
+    let list = protocol::make_tools_list();
+    let desc = list["tools"][2]["description"].as_str().unwrap();
+    assert!(desc.contains("without fetching names"), "desc: {desc}");
+}
+
+#[test]
 fn ok_response_carries_id_and_result_only() {
     let resp = protocol::ok_response(&Some(json!(7)), json!({"ok": true}));
     assert_eq!(resp.id, Some(json!(7)));
