@@ -64,9 +64,10 @@ Section "Install" SecInstall
   ; 复制 DLL
   File "bin\${DLL_NAME}"
 
-  ; 复制配置示例与说明
+  ; 复制配置示例与说明（中英文双 README）
   File "client-config-example.json"
   File "..\README.md"
+  File "..\README.en.md"
 
   ; 写注册表项（用于卸载与升级查找）
   WriteRegStr HKLM "Software\${APP_PUBLISHER}\${APP_NAME}" "InstallDir" "$INSTDIR"
@@ -90,6 +91,7 @@ Section "Uninstall"
   Delete "$INSTDIR\${DLL_NAME}"
   Delete "$INSTDIR\client-config-example.json"
   Delete "$INSTDIR\README.md"
+  Delete "$INSTDIR\README.en.md"
   Delete "$INSTDIR\uninstall.exe"
 
   DeleteRegKey HKLM "Software\${APP_PUBLISHER}\${APP_NAME}"

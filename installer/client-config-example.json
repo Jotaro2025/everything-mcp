@@ -7,6 +7,7 @@
       "_comment": "MCP 协议要求本地进程或 HTTP 端点。",
       "_comment_2": "Everything MCP 插件以 Streamable HTTP 方式暴露服务。",
       "_comment_3": "默认监听 127.0.0.1:8285 —— 与 Everything 主进程同机部署。",
+      "_comment_4": "端点双时代：老客户端走 initialize 握手，2026-07-28 客户端免握手直接发请求，无需在客户端配置协议版本。",
 
       "url": "http://127.0.0.1:8285/",
 
@@ -16,6 +17,13 @@
         "search_in_folder  在指定文件夹下按 Everything 语法搜索",
         "list_folder       列出某个目录的直接子项（文件/文件夹）",
         "count             统计匹配文件数量"
+      ],
+
+      "_argument_rules": [
+        "folder 必须是绝对路径（C:\\… 或 \\\\server\\share\\…）",
+        "带引号、正斜杠、重复反斜杠、尾斜杠的写法会被自动规范化",
+        "通配符（* ?）属于 pattern，不属于 folder",
+        "非法路径返回带范例的 -32602 INVALID_PARAMS，按消息提示修正即可"
       ],
 
       "_example_call": {

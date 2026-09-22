@@ -1,12 +1,8 @@
 # everything-mcp
 
-[中文](#中文) | [English](#english)
+[English](README.en.md)
 
 ---
-
-<a id="中文"></a>
-
-## 中文
 
 一个 Everything 1.5 的进程内插件，把 Everything 的文件搜索能力以 **MCP**（Model
 Context Protocol）接口暴露给 LLM（如 Claude Desktop、Cursor 等）使用。
@@ -23,6 +19,12 @@ Context Protocol）接口暴露给 LLM（如 Claude Desktop、Cursor 等）使�
 - **图形设置页** —— Everything 选项对话框内直接配置启用开关、绑定地址、端口，
   改动点「应用」即时生效，无需重启 Everything。
 - **MCP Streamable HTTP** —— 默认监听 `127.0.0.1:8285`，单条 JSON-RPC over HTTP。
+- **双时代 MCP 协议** —— 同一端点同时服务两代客户端：2024-11-05（`initialize`
+  握手）与 2026-07-28（逐请求 `_meta` 版本声明 + `server/discover`）。版本不支持
+  时返回 `-32022` 并附可用版本列表，老客户端行为完全不变。
+- **入参校验与路径规范化** —— `folder` 在触达 Everything 之前统一去包裹引号、
+  正斜杠转反斜杠、折叠重复反斜杠、去尾斜杠；非法路径返回带范例的
+  `INVALID_PARAMS`，而不是静默返回 0 结果。
 - **可打包安装** —— 提供 NSIS 脚本，一键生成 setup.exe。
 
 ### 仓库结构
@@ -47,9 +49,10 @@ everything-mcp/
 │   │   └── state.rs            运行期状态（懒创建的 db/query、关闭标志）
 │   └── mcp/
 │       ├── mod.rs
-│       ├── protocol.rs         JSON-RPC 2.0 + MCP 类型
-│       ├── server.rs           基于 std::net 的 HTTP 服务
-│       └── tools.rs            工具实现（search_in_folder/list_folder/count）
+│       ├── protocol.rs         JSON-RPC 2.0 + MCP 双时代类型（2024-11-05 / 2026-07-28）
+│       ├── server.rs           基于 std::net 的 HTTP 服务，按请求协商协议版本、校验 Origin
+│       ├── tools.rs            工具实现（search_in_folder/list_folder/count）
+│       └── validate.rs         入参校验与路径规范化（folder 规范化、pattern 校验）
 ├── installer/
 │   ├── everything-mcp.nsi      NSIS 安装脚本
 │   └── client-config-example.json  MCP 客户端接入示例
@@ -149,6 +152,11 @@ makensis everything-mcp.nsi
 }
 ```
 
+**只需要一个 URL。** 插件端点是双时代的：老的 MCP 客户端走 `initialize` 握手，
+2026-07-28 起的客户端跳过握手、直接发请求，两者都能正常接入，无需在客户端侧
+指定协议版本。前提是插件已启用（Everything 选项对话框「插件 → MCP」页勾选，
+或 `Settings.ini` 里 `mcp_enabled=1`）。
+
 接入后 LLM 会自动发现以下三个工具：
 
 #### 1. `search_in_folder`
@@ -184,6 +192,54 @@ makensis everything-mcp.nsi
 ```json
 { "folder": "D:\\source\\repos\\my-project", "pattern": "ext:rs" }
 ```
+
+三个工具共用的入参规则：`folder` 必须是绝对路径（`C:\…` 或 `\\server\share\…`）。
+带引号、正斜杠、重复反斜杠、尾斜杠的写法会被自动规范化；通配符属于 `pattern`
+而不属于 `folder`。规范化失败时返回 `-32602 INVALID_PARAMS`，消息里带期望格式
+的范例与收到的原值 —— LLM 据此一次改对，不会带着坏参数反复重试。
+
+#### 手动验证（curl）
+
+不接客户端，先用 curl 确认服务活着。两种时代的请求各发一次：
+
+```powershell
+# legacy：initialize 握手（老客户端流程）
+curl -X POST http://127.0.0.1:8285/ -H "Content-Type: application/json" -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}"
+
+# modern：不握手，直接 server/discover（版本同时写在请求头和 _meta 里）
+curl -X POST http://127.0.0.1:8285/ -H "Content-Type: application/json" -H "MCP-Protocol-Version: 2026-07-28" -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"server/discover\",\"params\":{\"_meta\":{\"io.modelcontextprotocol/protocolVersion\":\"2026-07-28\"}}}"
+```
+
+第二条返回的 `supportedVersions` 就是本端点支持的协议版本列表。
+
+#### 接入排错
+
+| HTTP 状态 | JSON-RPC 错误码 | 含义与处理 |
+| --- | --- | --- |
+| 200 | — | 正常响应 |
+| 202 | — | modern 通知已接受（规范要求空响应体） |
+| 400 | `-32020` | `MCP-Protocol-Version` 头与 `_meta` 里的版本不一致 —— 两侧改成同值 |
+| 400 | `-32022` | 请求的协议版本不支持 —— 按 `data.supported` 列出的版本重试 |
+| 403 | `-32600` | 请求带了非 localhost 的 `Origin` 头（浏览器页面被挡）—— 改用本机客户端访问 |
+| 404 | `-32601` | modern 时代未知方法 —— 检查方法名拼写 |
+| 200 | `-32602` | 工具参数不合法 —— 消息里带期望格式范例与收到的原值，按提示修正后重试 |
+| 400/405 | — | 见「调试」一节：请求行不是 POST 到 `/` 或 `/mcp` 时返回 405 |
+
+服务完全无响应时，先确认 `mcp_enabled=1` 且端口没被占用（见「调试」）。
+
+### 协议版本（双时代）
+
+同一个端点按请求声明的协议版本走两套语义，两代客户端都能用：
+
+| 客户端形态             | 版本声明方式                                                       | 行为                                                                 |
+| ---------------------- | ------------------------------------------------------------------ | -------------------------------------------------------------------- |
+| legacy（2024-11-05）   | `initialize` 握手，或不带任何版本信息                              | 200 + JSON-RPC 响应；未知方法 200 + `-32601`；通知回 `id: null` 空响应 |
+| modern（2026-07-28）   | `MCP-Protocol-Version` 请求头 + `_meta` 里的 `io.modelcontextprotocol/protocolVersion` | `server/discover` 可用；未知方法 404；通知 202 空体；头/体不一致 `-32020`；版本不支持 400 + `-32022`（`data.supported` 列出可用版本） |
+
+其他安全与兼容规则：带 `Origin` 且非 localhost 来源的请求一律 403（防 DNS
+rebinding）；`Mcp-Method` / `Mcp-Name` 镜像头存在时校验与请求体一致，非 ASCII
+值走 `=?base64?…?=` sentinel；`tools/call` 的参数校验（路径规范化）发生在触达
+Everything 主程序之前，因此非法入参绝不会变成一次真实搜索。
 
 ### 调试
 
@@ -232,252 +288,3 @@ curl -X POST http://127.0.0.1:8285/ -H "Content-Type: application/json" -d "{\"j
 ### 许可证
 
 MIT，见 [LICENSE](LICENSE)。
-
----
-
-<a id="english"></a>
-
-## English
-
-An in-process plugin for Everything 1.5 that exposes Everything's file search as
-an **MCP (Model Context Protocol)** server for LLMs (Claude Desktop, Cursor, …).
-
-### Features
-
-- **In-process plugin** — builds to a single `everything_mcp.dll` that
-  Everything 1.5 loads directly via `LoadLibrary`; no external process overhead.
-- **Zero third-party DLL dependencies** — apart from Windows system libraries
-  (`kernel32` / `ws2_32` / `advapi32`, …), nothing else is imported. Rust std,
-  `serde` / `serde_json` and `windows-sys` are all statically linked, and so is
-  the CRT (see `.cargo/config.toml`).
-- **Folder-first** — LLMs usually work inside a specific project directory, so
-  the tools are folder-scoped by design instead of scanning the whole disk.
-- **Settings page** — enable switch, bind address and port are configurable in
-  Everything's own options dialog; clicking Apply takes effect immediately,
-  without restarting Everything.
-- **MCP Streamable HTTP** — listens on `127.0.0.1:8285` by default, one
-  JSON-RPC message over HTTP per request.
-- **Installable** — ships an NSIS script that produces a setup.exe in one step.
-
-### Repository layout
-
-```
-everything-mcp/
-├── Cargo.toml                  Rust package manifest (cdylib + rlib, static CRT)
-├── Cargo.lock                   Locked dependency versions (binary output: keep it)
-├── everything_mcp.def          DLL module definition, exports only everything_plugin_proc
-├── build.rs                     Passes the .def to the MSVC linker
-├── .cargo/config.toml          target-feature=+crt-static (key to zero third-party DLLs)
-├── src/
-│   ├── lib.rs                   Plugin entry everything_plugin_proc + PM_* dispatch
-│   ├── options.rs              Settings page in Everything's options dialog
-│   │                            (enable/bind/port/restore defaults) + settings state
-│   ├── plugin/
-│   │   ├── mod.rs               Submodule summary + PM_* constants
-│   │   ├── diag.rs              Disk diagnostic log (%LOCALAPPDATA%\everything-mcp\plugin.log)
-│   │   ├── ffi_types.rs         #[repr(C)] types (Utf8Buf/DbHandle/FileInfoFd...)
-│   │   ├── host.rs              Host function pointer table + HOST/HOST_LOCK
-│   │   ├── search.rs            Async search → sync wait wrapper (main-thread marshaling)
-│   │   ├── main_thread.rs       Main-thread window + PostMessage task dispatch
-│   │   └── state.rs             Runtime state (lazily created db/query, shutdown flag)
-│   └── mcp/
-│       ├── mod.rs
-│       ├── protocol.rs          JSON-RPC 2.0 + MCP types
-│       ├── server.rs            HTTP server on std::net
-│       └── tools.rs             Tool implementations (search_in_folder/list_folder/count)
-├── installer/
-│   ├── everything-mcp.nsi      NSIS setup script
-│   └── client-config-example.json  MCP client configuration example
-├── tests/
-│   └── mcp.rs                  MCP protocol integration tests (cargo test)
-├── docs/
-│   └── PLUGIN_SDK_API_CN.md     Chinese plugin SDK API reference (with field notes)
-├── reference/                  Third-party reference material (official voidtools C
-│                               plugins + Everything 3.0 SDK; not compiled into this
-│                               crate — see reference/README.md)
-└── LICENSE
-```
-
-### Prerequisites
-
-Only a Rust toolchain is required — no Visual Studio (the rustup MSVC toolchain
-is enough):
-
-```powershell
-# Install Rust (once)
-Invoke-WebRequest https://win.rustup.com/x86_64 -OutFile rustup-init.exe
-.\rustup-init.exe -y
-# Installs the stable-x86_64-pc-windows-msvc target by default.
-
-# Build from the repository root
-cargo build --release
-
-# Run the tests (MCP protocol integration tests; no Everything host needed)
-cargo test
-
-# Output
-ls target\release\everything_mcp.dll
-```
-
-**About "zero third-party DLLs":**
-
-| Dependency        | Origin        | Adds a DLL? |
-| ----------------- | ------------- | ----------- |
-| `serde` / `serde_json` | Pure Rust | ❌ statically linked |
-| `windows-sys`     | FFI bindings only | ❌ binds system DLLs via `#[link]` |
-| Rust std (incl. alloc) | Ships with Rust | ❌ statically linked |
-| MSVC CRT          | `/MT` + `libcmt.lib` (`crt-static`) | ❌ statically linked |
-
-`panic = "abort"` and `lto = true` further guarantee the output contains nothing
-but the single export Everything needs.
-
-### Deployment
-
-Copy the built `everything_mcp.dll` to **`everything_mcp64.dll`** and place it in:
-
-```
-C:\Program Files\Everything\Plugins\everything_mcp64.dll
-```
-
-Everything 1.5 loads 64-bit plugins from the root of `Plugins\` following the
-`<name>64.dll` convention (same as the official `etp_server64.dll` /
-`http_server64.dll`). It is picked up on the next start — no registry entries or
-extra configuration.
-
-#### Deploying via the installer
-
-```powershell
-cd installer
-mkdir bin
-copy ..\target\release\everything_mcp.dll bin\everything_mcp64.dll
-# Requires NSIS: https://nsis.sourceforge.io/
-makensis everything-mcp.nsi
-# Produces everything-mcp-1.0.0-setup.exe
-```
-
-The installer targets `C:\Program Files\Everything\Plugins\` and places only
-`everything_mcp64.dll` plus the accompanying documentation; uninstalling removes
-just those files (never the Plugins directory itself).
-
-### Configuration
-
-The plugin reads the following items from Everything's settings (defaults apply
-when absent):
-
-| Setting        | Type   | Default       | Description                    |
-| -------------- | ------ | ------------- | ------------------------------ |
-| `mcp_enabled`  | int    | `0`           | 0 disables the MCP server (off until you opt in) |
-| `mcp_port`     | int    | `8285`        | HTTP listen port               |
-| `mcp_bind`     | string | `127.0.0.1`   | Bind address (localhost only)  |
-
-Settings live in Everything's own `Settings.ini`, in the same section as the
-official http_server plugin. They can also be edited in Everything's options
-dialog under Plugins → MCP (enable switch, bind address, port, restore
-defaults); clicking Apply takes effect immediately — no Everything restart
-needed.
-
-### Connecting an MCP client
-
-Merge the following `mcpServers` block into Claude Desktop's
-`claude_desktop_config.json` or an equivalent configuration file:
-
-```json
-{
-  "mcpServers": {
-    "everything": {
-      "url": "http://127.0.0.1:8285/"
-    }
-  }
-}
-```
-
-Once connected, the LLM discovers three tools automatically:
-
-#### 1. `search_in_folder`
-
-Find files/folders under a given folder using Everything search syntax.
-
-```json
-{
-  "folder": "D:\\source\\repos\\my-project",
-  "pattern": "ext:rs;toml",
-  "max_results": 30,
-  "timeout_ms": 10000
-}
-```
-
-- `pattern` supports the full Everything syntax: `*.rs`, `"readme"`,
-  `ext:md;txt`, `dm:lastweek`, `size:>1mb`, …
-- An empty string `""` lists everything directly under the folder.
-- `max_results = 0` means unlimited (careful with huge folders).
-
-#### 2. `list_folder`
-
-List the direct children (non-recursive) of a folder: name, kind, size.
-
-```json
-{ "folder": "D:\\source\\repos\\my-project" }
-```
-
-#### 3. `count`
-
-Count matching files without returning the name list.
-
-```json
-{ "folder": "D:\\source\\repos\\my-project", "pattern": "ext:rs" }
-```
-
-### Debugging
-
-Diagnostics go to two places:
-
-1. **Host debug output** — via the host's `debug_printf`, viewable live with
-   [DebugView](https://learn.microsoft.com/sysinternals/downloads/debugview).
-2. **Disk log** — `%LOCALAPPDATA%\everything-mcp\plugin.log`, recording the PM_*
-   lifecycle, host function resolution details, and the submit/wait/read steps
-   of every search. This file is the fastest route when chasing crashes.
-
-If the MCP server stops responding, verify with curl first:
-
-```powershell
-curl -X POST http://127.0.0.1:8285/ -H "Content-Type: application/json" -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}"
-```
-
-### Threading model and concurrency
-
-- The Everything host assumes **single-threaded** access to its database API,
-  and `db_query_search2` has **main-thread affinity** — calling it from a plugin
-  worker thread crashes inside the host (`0xc0000005`); a mutex is not enough.
-- The plugin therefore uses the same main-thread marshaling scheme as the
-  official `etp_server`:
-  1. On PM_START, create a message window via the host's `os_register_class` +
-     `os_create_window` (host functions are mandatory — a self-created Win32
-     window never receives the host's message pump);
-  2. The background HTTP thread posts `db_query_search2` and the result reads
-     to that window's procedure via `PostMessage`, and uses a Win32 event to
-     hand completion back to the worker.
-- `HOST_LOCK` (a process-wide `Mutex`) serializes all host calls.
-- The db reference and query object are created **lazily on the first search**
-  (by then the host is fully up) — creating them during PM_START crashes
-  Everything about a second after startup.
-- The primary sort key of `db_query_search2` must be the return value of
-  `property_get_builtin_type(NAME)`; passing NULL crashes as well. See section
-  19 of `docs/PLUGIN_SDK_API_CN.md`.
-
-### Protocol references
-
-- Plugin SDK: `docs/PLUGIN_SDK_API_CN.md` (complete annotated Chinese API reference)
-- MCP: https://spec.modelcontextprotocol.io/
-- Everything 1.5: https://www.voidtools.com/
-
-### Reference material
-
-The `reference/` directory holds the official voidtools C plugin sources and the
-Everything 3.0 SDK (none of it is compiled into this crate). The main-thread
-marshaling scheme and the `db_query_search2` parameter list used here were
-derived from `reference/etp_server-1.0.2.5`. Licenses for each item are listed in
-[`reference/README.md`](reference/README.md).
-
-### License
-
-MIT, see [LICENSE](LICENSE).
