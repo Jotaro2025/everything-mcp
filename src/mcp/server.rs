@@ -199,27 +199,9 @@ fn read_http_request(stream: &mut TcpStream) -> std::io::Result<HttpRequest> {
     }
 
     let header_str = String::from_utf8_lossy(&buf);
-    let mut lines = header_str.split("\r\n");
-    let request_line = lines.next().ok_or_else(|| {
+    let (method, path, content_length) = parse_header(&header_str).ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidData, "no request line")
     })?;
-    let mut parts = request_line.split_whitespace();
-    let method = parts.next().unwrap_or("").to_string();
-    let path = parts.next().unwrap_or("").to_string();
-
-    // 解析 Content-Length（不区分大小写）。
-    let mut content_length: usize = 0;
-    for line in lines {
-        if line.is_empty() {
-            break;
-        }
-        let lower = line.to_ascii_lowercase();
-        if let Some(v) = lower.strip_prefix("content-length:") {
-            if let Ok(n) = v.trim().parse::<usize>() {
-                content_length = n;
-            }
-        }
-    }
 
     // 读取 body。
     let mut body = String::new();
@@ -240,11 +222,39 @@ fn read_http_request(stream: &mut TcpStream) -> std::io::Result<HttpRequest> {
     Ok(HttpRequest { method, path, body })
 }
 
+/// 解析已读完的 HTTP 头部文本，取出 method、path 与 Content-Length。
+///
+/// `header` 是到（含）`\r\n\r\n` 为止的全部字节；首行必须是
+/// `METHOD SP PATH SP VERSION`，否则返回 None。Content-Length 缺失或非法时
+/// 按 0 处理（无 body 的请求）。
+pub fn parse_header(header: &str) -> Option<(String, String, usize)> {
+    let mut lines = header.split("\r\n");
+    let request_line = lines.next()?;
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next()?.to_string();
+    let path = parts.next()?.to_string();
+
+    let mut content_length: usize = 0;
+    for line in lines {
+        if line.is_empty() {
+            break;
+        }
+        // 头部字段名不区分大小写。
+        let lower = line.to_ascii_lowercase();
+        if let Some(v) = lower.strip_prefix("content-length:") {
+            if let Ok(n) = v.trim().parse::<usize>() {
+                content_length = n;
+            }
+        }
+    }
+    Some((method, path, content_length))
+}
+
 // ====================================================================
 // JSON-RPC 分发
 // ====================================================================
 
-fn dispatch_rpc(body: &str) -> String {
+pub fn dispatch_rpc(body: &str) -> String {
     // 可能有批量和单条两种；MCP 客户端实际只发单条，这里也只处理单条。
     let parsed: JsonRpcMessage = match serde_json::from_str(body) {
         Ok(m) => m,
@@ -298,7 +308,7 @@ fn dispatch_rpc(body: &str) -> String {
 // HTTP 响应构造
 // ====================================================================
 
-fn ok_http_response(body: &str) -> String {
+pub fn ok_http_response(body: &str) -> String {
     let mut s = String::with_capacity(body.len() + 256);
     s.push_str("HTTP/1.1 200 OK\r\n");
     s.push_str("Content-Type: application/json\r\n");
@@ -312,7 +322,7 @@ fn ok_http_response(body: &str) -> String {
     s
 }
 
-fn bad_request(reason: &str) -> String {
+pub fn bad_request(reason: &str) -> String {
     let body = format!("{{\"error\":\"{}\"}}", reason.replace('"', "\\\""));
     format!(
         "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -321,6 +331,6 @@ fn bad_request(reason: &str) -> String {
     )
 }
 
-fn not_allowed() -> String {
+pub fn not_allowed() -> String {
     "HTTP/1.1 405 Method Not Allowed\r\nAllow: POST\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into()
 }
