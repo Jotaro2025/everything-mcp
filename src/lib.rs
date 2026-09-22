@@ -10,7 +10,8 @@
 //!     （db 引用与 query 懒创建于第一次搜索，见 plugin::state）
 //!   - PM_ADD_OPTIONS_PAGES..PM_KILL_OPTIONS_PAGE：Everything 选项对话框里
 //!     的插件设置页（启用开关、绑定地址、端口），见 options 模块
-//!   - PM_SAVE_SETTINGS：把设置写回 Everything.ini
+//!   - PM_SAVE_SETTINGS：把设置写回 Plugins.ini（下次启动 PM_START 时
+//!     经 plugin::ini_settings 兜底读回，原因见该模块文档）
 //!   - PM_STOP / PM_KILL：关闭服务、释放引用
 //!
 //! 详见 `docs/PLUGIN_SDK_API_CN.md` 与 `README.md`。
@@ -116,14 +117,30 @@ unsafe fn everything_plugin_proc_impl(msg: u32, data: *mut c_void) -> *mut c_voi
             //     用户在 Everything 选项 → 插件 → MCP 设置页勾选启用）
             //   - mcp_port：HTTP 监听端口（默认 8285）
             //   - mcp_bind：监听地址（默认 127.0.0.1）
-            let enabled = read_setting_int(data, "mcp_enabled\0", 0) != 0;
-            let port_raw = read_setting_int(data, "mcp_port\0", 8285);
+            let mut enabled = read_setting_int(data, "mcp_enabled\0", 0) != 0;
+            let mut port_raw = read_setting_int(data, "mcp_port\0", 8285);
+            let mut bind = read_setting_string(data, "mcp_bind\0", "127.0.0.1\0");
+
+            // host 在 PM_START 读不到插件自己的设置（返回默认值，原因见
+            // plugin::ini_settings 文档）。host 说未启用时，用自己解析的
+            // Plugins.ini 兜底 —— 否则选项对话框启用后一重启就失效。
+            if !enabled {
+                if let Some(p) = plugin::ini_settings::read_persisted() {
+                    enabled = p.enabled;
+                    if let Some(port) = p.port {
+                        port_raw = port as i32;
+                    }
+                    if let Some(b) = p.bind {
+                        bind = b;
+                    }
+                }
+            }
+
             let port = if (1..=65535).contains(&port_raw) {
                 port_raw as u16
             } else {
                 options::DEFAULT_PORT
             };
-            let bind = read_setting_string(data, "mcp_bind\0", "127.0.0.1\0");
             plugin::diag::write(&format!("PM_START: enabled={} port={} bind={}", enabled, port, bind));
 
             Host::debug("everything_mcp: PM_START");

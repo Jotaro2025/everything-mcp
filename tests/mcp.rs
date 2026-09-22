@@ -18,6 +18,25 @@ fn dispatch(body: &str) -> Value {
     serde_json::from_str(&server::dispatch_rpc(body)).expect("response must be valid JSON")
 }
 
+/// 构造一个 modern 时代的请求头（声明 2026-07-28）。
+fn modern_head() -> server::RequestHead {
+    server::RequestHead {
+        protocol_version: Some(protocol::PROTOCOL_VERSION_MODERN.into()),
+        ..Default::default()
+    }
+}
+
+/// 调一次 dispatch_rpc_http：空体（202 通知）解析成 Value::Null。
+fn dispatch_http(body: &str, head: &server::RequestHead) -> (u16, Value) {
+    let (status, out) = server::dispatch_rpc_http(body, head);
+    let json = if out.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_str(&out).expect("response must be valid JSON")
+    };
+    (status, json)
+}
+
 // ====================================================================
 // protocol：initialize / tools/list / 响应构造
 // ====================================================================
@@ -97,19 +116,27 @@ fn message_round_trips_through_json() {
 
 #[test]
 fn parse_header_extracts_method_path_and_length() {
-    let (method, path, len) =
+    let head =
         server::parse_header("POST /mcp HTTP/1.1\r\nHost: x\r\ncontent-length: 42\r\n\r\n").unwrap();
-    assert_eq!(method, "POST");
-    assert_eq!(path, "/mcp");
-    assert_eq!(len, 42);
+    assert_eq!(head.method, "POST");
+    assert_eq!(head.path, "/mcp");
+    assert_eq!(head.content_length, 42);
+    // legacy 请求不带 MCP 镜像头与 Origin。
+    assert!(head.protocol_version.is_none());
+    assert!(head.origin.is_none());
 }
 
 #[test]
-fn parse_header_without_content_length_is_zero() {
-    let (method, path, len) = server::parse_header("GET / HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
-    assert_eq!(method, "GET");
-    assert_eq!(path, "/");
-    assert_eq!(len, 0);
+fn parse_header_reads_mcp_and_origin_headers() {
+    // modern 客户端的镜像头与安全头都要能解析出来（字段名不区分大小写）。
+    let head = server::parse_header(
+        "POST / HTTP/1.1\r\nMCP-Protocol-Version: 2026-07-28\r\nOrigin: http://localhost:3000\r\nmcp-method: ping\r\nMcp-Name: count\r\n\r\n",
+    )
+    .unwrap();
+    assert_eq!(head.protocol_version.as_deref(), Some("2026-07-28"));
+    assert_eq!(head.origin.as_deref(), Some("http://localhost:3000"));
+    assert_eq!(head.mcp_method.as_deref(), Some("ping"));
+    assert_eq!(head.mcp_name.as_deref(), Some("count"));
 }
 
 #[test]
@@ -117,6 +144,14 @@ fn parse_header_rejects_garbage_first_line() {
     // 只有方法没有路径 —— 不是合法请求行。
     assert!(server::parse_header("POST\r\n\r\n").is_none());
     assert!(server::parse_header("\r\n\r\n").is_none());
+}
+
+#[test]
+fn parse_header_without_content_length_is_zero() {
+    let head = server::parse_header("GET / HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+    assert_eq!(head.method, "GET");
+    assert_eq!(head.path, "/");
+    assert_eq!(head.content_length, 0);
 }
 
 // ====================================================================
@@ -238,4 +273,353 @@ fn unknown_tool_is_method_not_found() {
     let err = tools::dispatch("delete_everything", &json!({"folder": "C:\\"})).unwrap_err();
     assert_eq!(err.0, protocol::METHOD_NOT_FOUND);
     assert!(err.1.contains("delete_everything"));
+}
+
+// ====================================================================
+// 双时代协议：版本协商（2024-11-05 legacy / 2026-07-28 modern）
+// ====================================================================
+
+#[test]
+fn initialize_echoes_supported_client_version() {
+    // legacy 握手：客户端请求我们支持的版本 → 原样回显。
+    let r = protocol::make_initialize_result(&json!({"protocolVersion": "2026-07-28"}));
+    assert_eq!(r["protocolVersion"], "2026-07-28");
+    // 请求我们不认识的版本 → 退回 legacy，由客户端决定是否断开。
+    let r = protocol::make_initialize_result(&json!({"protocolVersion": "2030-01-01"}));
+    assert_eq!(r["protocolVersion"], "2024-11-05");
+}
+
+#[test]
+fn discover_result_lists_both_supported_versions() {
+    let r = protocol::make_discover_result();
+    assert_eq!(r["resultType"], "complete");
+    let versions: Vec<&str> = r["supportedVersions"]
+        .as_array()
+        .expect("supportedVersions must be an array")
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert!(versions.contains(&"2024-11-05"), "{:?}", versions);
+    assert!(versions.contains(&"2026-07-28"), "{:?}", versions);
+    // serverInfo 按规范放在 _meta 里。
+    assert_eq!(
+        r["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],
+        "everything-mcp"
+    );
+    assert_eq!(r["capabilities"]["tools"]["listChanged"], false);
+}
+
+#[test]
+fn modern_discover_works_without_handshake() {
+    // modern 客户端不握手，直接带 _meta 版本发 discover。
+    let (status, resp) = dispatch_http(
+        r#"{"jsonrpc":"2.0","id":1,"method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}}"#,
+        &modern_head(),
+    );
+    assert_eq!(status, 200);
+    assert_eq!(resp["result"]["supportedVersions"][0], "2024-11-05");
+    assert_eq!(resp["result"]["supportedVersions"][1], "2026-07-28");
+}
+
+#[test]
+fn modern_unsupported_version_is_400_with_supported_list() {
+    let head = server::RequestHead {
+        protocol_version: Some("2030-01-01".into()),
+        ..Default::default()
+    };
+    let (status, resp) = dispatch_http(r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#, &head);
+    assert_eq!(status, 400);
+    assert_eq!(
+        resp["error"]["code"],
+        protocol::UNSUPPORTED_PROTOCOL_VERSION
+    );
+    assert_eq!(resp["error"]["data"]["requested"], "2030-01-01");
+    // data.supported 让客户端知道该退到哪个版本重试。
+    assert_eq!(
+        resp["error"]["data"]["supported"],
+        json!(["2024-11-05", "2026-07-28"])
+    );
+}
+
+#[test]
+fn modern_header_meta_mismatch_is_32020() {
+    // 头说 modern、_meta 说 legacy —— 两者矛盾，拒绝。
+    let (status, resp) = dispatch_http(
+        r#"{"jsonrpc":"2.0","id":1,"method":"ping","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2024-11-05"}}}"#,
+        &modern_head(),
+    );
+    assert_eq!(status, 400);
+    assert_eq!(resp["error"]["code"], protocol::HEADER_MISMATCH);
+}
+
+#[test]
+fn modern_unknown_method_is_404() {
+    let (status, resp) = dispatch_http(
+        r#"{"jsonrpc":"2.0","id":1,"method":"resources/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}}"#,
+        &modern_head(),
+    );
+    assert_eq!(status, 404);
+    assert_eq!(resp["error"]["code"], protocol::METHOD_NOT_FOUND);
+    // legacy 客户端同一个请求仍走 200 + JSON-RPC 错误体的老路。
+    let resp = dispatch(r#"{"jsonrpc":"2.0","id":1,"method":"resources/list"}"#);
+    assert_eq!(resp["error"]["code"], protocol::METHOD_NOT_FOUND);
+}
+
+#[test]
+fn modern_notification_is_202_with_empty_body() {
+    let out = server::dispatch_rpc_http(
+        r#"{"jsonrpc":"2.0","method":"notifications/initialized","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}}"#,
+        &modern_head(),
+    );
+    // modern：接受通知不得返回响应体。
+    assert_eq!(out, (202, String::new()));
+}
+
+#[test]
+fn modern_mcp_method_header_mismatch_is_32020() {
+    let head = server::RequestHead {
+        protocol_version: Some("2026-07-28".into()),
+        mcp_method: Some("tools/list".into()),
+        ..Default::default()
+    };
+    let (status, resp) = dispatch_http(
+        r#"{"jsonrpc":"2.0","id":1,"method":"ping","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}}"#,
+        &head,
+    );
+    assert_eq!(status, 400);
+    assert_eq!(resp["error"]["code"], protocol::HEADER_MISMATCH);
+}
+
+#[test]
+fn modern_mcp_name_header_accepts_base64_sentinel() {
+    // "search_in_folder" 的 base64 形式（非 ASCII 头部值的 sentinel 编码）。
+    let head = server::RequestHead {
+        protocol_version: Some("2026-07-28".into()),
+        mcp_name: Some("=?base64?c2VhcmNoX2luX2ZvbGRlcg==?=".into()),
+        ..Default::default()
+    };
+    let (status, resp) = dispatch_http(
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"search_in_folder","arguments":{},"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}}"#,
+        &head,
+    );
+    // 头/体一致 → 放行进入工具分发；缺 folder 的 INVALID_PARAMS 证明走到了 tools 层。
+    assert_eq!(status, 200);
+    assert_eq!(resp["error"]["code"], protocol::INVALID_PARAMS);
+}
+
+#[test]
+fn modern_mcp_name_header_mismatch_is_32020() {
+    let head = server::RequestHead {
+        protocol_version: Some("2026-07-28".into()),
+        mcp_name: Some("count".into()),
+        ..Default::default()
+    };
+    let (status, resp) = dispatch_http(
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"search_in_folder","arguments":{},"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}}"#,
+        &head,
+    );
+    assert_eq!(status, 400);
+    assert_eq!(resp["error"]["code"], protocol::HEADER_MISMATCH);
+}
+
+// ====================================================================
+// server：Origin 校验（防 DNS rebinding）
+// ====================================================================
+
+#[test]
+fn origin_error_allows_localhost_and_rejects_remote() {
+    // 放行：缺失（非浏览器客户端）、空、null（不透明来源）、本机来源。
+    assert!(server::origin_error(None).is_none());
+    assert!(server::origin_error(Some("")).is_none());
+    assert!(server::origin_error(Some("null")).is_none());
+    assert!(server::origin_error(Some("http://localhost:8285")).is_none());
+    assert!(server::origin_error(Some("http://127.0.0.1:8285")).is_none());
+    assert!(server::origin_error(Some("http://[::1]:8285")).is_none());
+    assert!(server::origin_error(Some("https://localhost")).is_none());
+    // 拒绝：远程网站经 DNS rebinding 打到本机端点的场景。
+    let err = server::origin_error(Some("https://evil.example.com")).expect("must reject");
+    let v: Value = serde_json::from_str(&err).unwrap();
+    assert_eq!(v["error"]["code"], protocol::INVALID_REQUEST);
+}
+
+// ====================================================================
+// validate：folder 路径规范化
+// ====================================================================
+
+#[test]
+fn normalize_folder_fixes_llm_path_quirks() {
+    use everything_mcp::mcp::validate;
+    // 包裹引号、正斜杠、双反斜杠、尾斜杠一次收拾干净 —— parent:"…" 按字面匹配，
+    // 这些「人类书写」痕迹不规范化就会静默返回 0 结果。
+    assert_eq!(
+        validate::normalize_folder(r#""D:\source\repos\everything-mcp""#).unwrap(),
+        r"D:\source\repos\everything-mcp"
+    );
+    assert_eq!(
+        validate::normalize_folder("D:/source/repos").unwrap(),
+        r"D:\source\repos"
+    );
+    assert_eq!(
+        validate::normalize_folder(r"D:\\source\\repos\\").unwrap(),
+        r"D:\source\repos"
+    );
+    assert_eq!(
+        validate::normalize_folder("  C:\\Users\\me\\project  ").unwrap(),
+        r"C:\Users\me\project"
+    );
+    // 盘符根保留尾斜杠；裸盘号补全。
+    assert_eq!(validate::normalize_folder(r"C:\").unwrap(), r"C:\");
+    assert_eq!(validate::normalize_folder("C:").unwrap(), r"C:\");
+    // UNC：折叠多余反斜杠、去尾斜杠但保留两段。
+    assert_eq!(
+        validate::normalize_folder(r"\\server\share\docs\").unwrap(),
+        r"\\server\share\docs"
+    );
+    assert_eq!(
+        validate::normalize_folder("//server/share").unwrap(),
+        r"\\server\share"
+    );
+}
+
+#[test]
+fn normalize_folder_rejects_bad_paths_with_examples() {
+    use everything_mcp::mcp::validate;
+    for bad in [
+        "",           // 空
+        "   ",        // 只有空白
+        "src\\mcp",   // 相对路径
+        "C:src",      // 盘符后无反斜杠
+        "C:src\\mcp", // 相对盘符路径
+        r"C:\Users\*", // 通配符不属于路径
+        r"\\server",  // UNC 只有一段
+        r#"D:\a"b"#,  // 内部引号会破坏搜索语法
+    ] {
+        let err = validate::normalize_folder(bad)
+            .unwrap_err();
+        assert!(err.contains("folder"), "错误消息要点名参数: {}", err);
+    }
+    // 绝对路径类错误的消息里带范例，LLM 拿到就能一次改对。
+    let err = validate::normalize_folder("src\\mcp").unwrap_err();
+    assert!(err.contains(r"C:\Users\me\project"), "{}", err);
+}
+
+#[test]
+fn validate_pattern_trims_and_rejects_control_chars() {
+    use everything_mcp::mcp::validate;
+    // 空 pattern 合法 —— 表示列出全部条目。
+    assert_eq!(validate::validate_pattern("").unwrap(), "");
+    assert_eq!(validate::validate_pattern("  *.rs  ").unwrap(), "*.rs");
+    assert!(validate::validate_pattern("a\nb").is_err());
+}
+
+// ====================================================================
+// tools：入参校验（不触达 host 的路径）
+// ====================================================================
+
+#[test]
+fn non_numeric_max_results_is_invalid_params() {
+    // 负数/小数/字符串都会在 as_u64 上败下阵来 —— 明确报错而不是静默取默认值。
+    let err = tools::dispatch(
+        "search_in_folder",
+        &json!({"folder": "C:\\", "max_results": "many"}),
+    )
+    .unwrap_err();
+    assert_eq!(err.0, protocol::INVALID_PARAMS);
+    assert!(err.1.contains("max_results"));
+}
+
+#[test]
+fn wildcard_in_folder_is_rejected_with_guidance() {
+    let err =
+        tools::dispatch("search_in_folder", &json!({"folder": "C:\\Users\\*"})).unwrap_err();
+    assert_eq!(err.0, protocol::INVALID_PARAMS);
+    assert!(err.1.contains("wildcards"), "{}", err.1);
+}
+
+// ====================================================================
+// 端到端：真实 TCP 连接（只发不触达 Everything host 的请求，
+// 因此没有主程序环境的 CI 上也能跑）
+// ====================================================================
+
+/// 向本地服务发一个 POST，返回 (状态行, 响应体)。
+fn http_post(port: u16, body: &str, extra_headers: &[(&str, &str)]) -> (String, String) {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+
+    let mut req = format!(
+        "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\n",
+        body.len()
+    );
+    for (k, v) in extra_headers {
+        req.push_str(&format!("{}: {}\r\n", k, v));
+    }
+    req.push_str(&format!("\r\n{}", body));
+
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect to test server");
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+        .unwrap();
+    stream.write_all(req.as_bytes()).unwrap();
+    stream.flush().unwrap();
+
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).unwrap();
+    let text = String::from_utf8_lossy(&buf).to_string();
+    let (head, payload) = text.split_once("\r\n\r\n").unwrap_or((text.as_str(), ""));
+    (head.to_string(), payload.to_string())
+}
+
+#[test]
+fn end_to_end_over_real_tcp() {
+    let port = 18285;
+    server::start("127.0.0.1", port).expect("test server must start");
+
+    // legacy initialize 握手照旧。
+    let (head, body) = http_post(
+        port,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+        &[],
+    );
+    assert!(head.starts_with("HTTP/1.1 200"), "{}", head);
+    let resp: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(resp["result"]["protocolVersion"], "2024-11-05");
+
+    // modern discover：不握手，_meta 带版本。
+    let (head, body) = http_post(
+        port,
+        r#"{"jsonrpc":"2.0","id":2,"method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}}"#,
+        &[],
+    );
+    assert!(head.starts_with("HTTP/1.1 200"), "{}", head);
+    let resp: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(resp["result"]["supportedVersions"][1], "2026-07-28");
+
+    // modern 未知方法 → 404。
+    let (head, _) = http_post(
+        port,
+        r#"{"jsonrpc":"2.0","id":3,"method":"resources/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}}"#,
+        &[],
+    );
+    assert!(head.starts_with("HTTP/1.1 404"), "{}", head);
+
+    // 非 localhost Origin → 403（DNS rebinding 防护在真实连接上生效）。
+    let (head, _) = http_post(
+        port,
+        r#"{"jsonrpc":"2.0","id":4,"method":"ping"}"#,
+        &[("Origin", "https://evil.example.com")],
+    );
+    assert!(head.starts_with("HTTP/1.1 403"), "{}", head);
+
+    // 参数校验在触达 host 之前返回带范例的 INVALID_PARAMS。
+    let (head, body) = http_post(
+        port,
+        r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"count","arguments":{"folder":"D:src"}}}"#,
+        &[],
+    );
+    assert!(head.starts_with("HTTP/1.1 200"), "{}", head);
+    let resp: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(resp["error"]["code"], protocol::INVALID_PARAMS);
+    assert!(resp["error"]["message"].as_str().unwrap().contains("folder"));
+
+    server::stop();
 }

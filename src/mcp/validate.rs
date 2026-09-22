@@ -1,0 +1,128 @@
+//! validate.rs — 工具入参校验与路径规范化
+//!
+//! MCP 客户端是 LLM，传来的参数常带「人类书写」的痕迹：包裹引号、正斜杠、
+//! 双反斜杠、尾部分隔符。Everything 的搜索语法按字面匹配路径，
+//! 这些差异会直接导致 0 结果且无从诊断。这里在触达主程序之前统一收拾干净，
+//! 收拾不了的给出带范例的错误消息 —— 让 LLM 一次改对，而不是盲目重试。
+
+/// 缺 folder 参数时的错误消息（顺便告诉调用方期望的格式）。
+pub const MISSING_FOLDER_MSG: &str = "missing 'folder': expected an absolute path like 'C:\\Users\\me\\project' or a UNC path like '\\\\server\\share'";
+
+/// 规范化并校验 folder 参数。
+///
+/// 依次处理：去首尾空白与成对包裹引号 → 拒空/控制字符/内部引号/通配符 →
+/// 正斜杠转反斜杠 → UNC 与普通路径分别折叠连续反斜杠 → 去尾斜杠
+/// （保留 `C:\` 盘符根与 `\\server\share` 形态）→ 校验盘符绝对路径。
+///
+/// 返回值即可直接拼进 Everything 搜索语法的字面路径。
+pub fn normalize_folder(input: &str) -> Result<String, String> {
+    let mut s = input.trim();
+    // LLM 常把路径带引号传来 —— 去掉成对的包裹引号。
+    if s.len() >= 2 && s.starts_with('"') && s.ends_with('"') {
+        s = s[1..s.len() - 1].trim();
+    }
+    if s.is_empty() {
+        return Err(MISSING_FOLDER_MSG.to_string());
+    }
+    if s.chars().any(|c| c.is_control()) {
+        return Err(format!(
+            "folder must not contain control characters; received {:?}",
+            input
+        ));
+    }
+    if s.contains('"') {
+        return Err(format!(
+            "folder must not contain double quotes (they would break the search syntax); received {:?}",
+            input
+        ));
+    }
+    if s.contains('*') || s.contains('?') {
+        return Err(format!(
+            "folder must be a literal path without wildcards (* or ?); put wildcards in 'pattern' instead; received {:?}",
+            input
+        ));
+    }
+
+    // 统一分隔符：Windows 接受正斜杠，Everything 的路径语法用反斜杠。
+    let unified = s.replace('/', "\\");
+
+    if unified.starts_with("\\\\") {
+        // UNC：保留前导双反斜杠，折叠其余连续反斜杠。
+        let mut out = String::from("\\\\");
+        let mut prev_bs = true;
+        for c in unified[2..].chars() {
+            if c == '\\' {
+                if !prev_bs {
+                    out.push('\\');
+                }
+                prev_bs = true;
+            } else {
+                out.push(c);
+                prev_bs = false;
+            }
+        }
+        // 去尾斜杠，但至少保留 \\server\share 两段。
+        while out.ends_with('\\') && out.len() > 2 {
+            out.pop();
+        }
+        if out.matches('\\').count() < 3 {
+            return Err(format!(
+                "folder must be a full UNC path like '\\\\server\\share'; received {:?}",
+                input
+            ));
+        }
+        return Ok(out);
+    }
+
+    // 普通路径：折叠连续反斜杠（LLM 常见的转义失误）。
+    let mut out = String::with_capacity(unified.len());
+    let mut prev_bs = false;
+    for c in unified.chars() {
+        if c == '\\' {
+            if !prev_bs {
+                out.push('\\');
+            }
+            prev_bs = true;
+        } else {
+            out.push(c);
+            prev_bs = false;
+        }
+    }
+    // 盘符校验：X: 开头。
+    let bytes = out.as_bytes();
+    if bytes.len() < 2 || !bytes[0].is_ascii_alphabetic() || bytes[1] != b':' {
+        return Err(format!(
+            "folder must be an absolute path like 'C:\\Users\\me\\project' or a UNC path like '\\\\server\\share'; received {:?}",
+            input
+        ));
+    }
+    if out.len() == 2 {
+        out.push('\\'); // "C:" → "C:\"
+    }
+    // X: 后必须紧跟反斜杠 —— 拒绝 "C:foo" 这类相对盘符路径。
+    if out.as_bytes().get(2) != Some(&b'\\') {
+        return Err(format!(
+            "folder must start with a drive letter and backslash like 'C:\\Users\\me\\project'; received {:?}",
+            input
+        ));
+    }
+    // 去尾斜杠，但保留盘符根 C:\。
+    while out.ends_with('\\') && out.len() > 3 {
+        out.pop();
+    }
+    Ok(out)
+}
+
+/// 校验 pattern（Everything 搜索语法）并去掉首尾空白。
+///
+/// 空 pattern 合法 —— 表示列出文件夹下全部条目。这里只挡控制字符。
+pub fn validate_pattern(input: &str) -> Result<String, String> {
+    let p = input.trim();
+    if p.chars().any(|c| c.is_control()) {
+        return Err(format!(
+            "pattern must not contain control characters; received {:?}",
+            input
+        ));
+    }
+    Ok(p.to_string())
+}

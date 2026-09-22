@@ -92,15 +92,59 @@ pub struct SearchResult {
     pub size: u64,
 }
 
+/// 搜索范围。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchScope {
+    /// 只搜直接子项 —— Everything 的 `parent:"<folder>"` 语义。
+    /// list_folder 用这个。
+    Children,
+    /// 递归搜整棵子树 —— 路径前缀 `"<folder>\"` 语义。
+    /// search_in_folder / count 用这个。
+    Recursive,
+}
+
+/// 拼 Everything 搜索字符串。纯函数，单独单测。
+///
+/// Children：`parent:"<folder>" <pattern>` —— 只命中直接父文件夹。
+/// Recursive：`"<folder>\" <pattern>` —— 引号内路径尾部带反斜杠：
+///   - 反斜杠让匹配递归进子目录（Everything 对完整路径做子串匹配）；
+///   - 同时避免误伤同前缀的兄弟目录 —— `everything-mcp` 不会命中
+///     `everything-mcp-old` 里的文件；
+///   - 文件夹自身的路径没有尾反斜杠，因此不会把文件夹本身搜出来。
+fn build_search_string(folder: &str, pattern: &str, scope: SearchScope) -> String {
+    // Everything 路径里几乎不会有双引号，但安全起见去掉，避免破坏引号包裹。
+    let folder = folder.replace('"', "");
+    let mut s = String::new();
+    match scope {
+        SearchScope::Children => {
+            s.push_str("parent:\"");
+            s.push_str(&folder);
+            s.push_str("\" ");
+        }
+        SearchScope::Recursive => {
+            let mut f = folder;
+            if !f.ends_with('\\') {
+                f.push('\\');
+            }
+            s.push('"');
+            s.push_str(&f);
+            s.push_str("\" ");
+        }
+    }
+    s.push_str(pattern);
+    s
+}
+
 /// 在指定文件夹下执行搜索。
 ///
 /// `folder` 必须是绝对路径（如 `D:\source\repos\Everything-Plugin`）；
-/// `pattern` 是 Everything 搜索语法（如 `*.rs`、`"readme"`、`ext:md;txt`）。
+/// `pattern` 是 Everything 搜索语法（如 `*.rs`、`"readme"`、`ext:md;txt`）；
+/// `scope` 决定搜直接子项（Children）还是递归整棵子树（Recursive）。
 /// `max_results` 限制返回条数（0 表示无上限，但会读取全部结果可能耗时）。
 /// `timeout_ms` 是异步等待查询完成的最大时间（建议 5000–30000）。
 ///
 /// 实现细节：
-///   - 在 Everything 搜索字符串前缀 `parent:"<folder>" ` 来限定文件夹；
+///   - 按 scope 拼 Everything 搜索字符串限定文件夹（见 build_search_string）；
 ///   - 主程序异步执行查询，我们用 Win32 事件等待 QUERY_COMPLETE 回调；
 ///   - 完成后从 query 结果接口逐条读取名字、路径、文件信息。
 pub fn search_in_folder(
@@ -108,6 +152,7 @@ pub fn search_in_folder(
     pattern: &str,
     max_results: usize,
     timeout_ms: u32,
+    scope: SearchScope,
 ) -> Result<Vec<SearchResult>, String> {
     let host = Host::get();
 
@@ -116,15 +161,8 @@ pub fn search_in_folder(
         return Err("folder must not be empty".into());
     }
 
-    // 1. 拼接 Everything 搜索语法：
-    //    parent:"C:\Some Folder" pattern
-    // 注意：路径里有空格时必须用引号包裹；尾部加分隔空格。
-    let mut search_string = String::new();
-    search_string.push_str("parent:\"");
-    // 替换内部双引号 —— Everything 路径里几乎不会有，但安全起见去掉
-    search_string.push_str(&folder.replace('"', ""));
-    search_string.push_str("\" ");
-    search_string.push_str(pattern);
+    // 1. 拼接 Everything 搜索字符串（限定范围 + 用户 pattern）。
+    let search_string = build_search_string(folder, pattern, scope);
 
     // 2. 加锁、创建事件、设置槽位、提交查询、等待、读取结果。
     let _guard = Host::lock_host();
@@ -396,7 +434,7 @@ fn read_results(query: DbQueryHandle, max_results: usize) -> Result<Vec<SearchRe
             (host.db_query_get_result_name.ok_or("get_result_name null")?)(query, i, &mut name_buf);
             name_buf.to_string()
         };
-        let path = unsafe {
+        let parent = unsafe {
             (host.db_query_get_result_path.ok_or("get_result_path null")?)(query, i, &mut path_buf);
             path_buf.to_string()
         };
@@ -407,6 +445,14 @@ fn read_results(query: DbQueryHandle, max_results: usize) -> Result<Vec<SearchRe
             (host.db_query_get_result_indexed_fd.ok_or("get_indexed_fd null")?)(query, i, &mut fd);
             if is_folder { 0 } else { fd.file_size() }
         };
+
+        // db_query_get_result_path 只返回父路径（SDK 语义：不含文件名），
+        // 完整路径要自己拼；盘符根（C:\）结尾时不再补分隔符。
+        let mut path = parent;
+        if !path.ends_with('\\') {
+            path.push('\\');
+        }
+        path.push_str(&name);
 
         out.push(SearchResult { name, path, is_folder, size });
     }
@@ -428,5 +474,50 @@ impl Host {
         super::host::HOST_LOCK
             .lock()
             .unwrap_or_else(|p| p.into_inner())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn children_scope_uses_parent_syntax() {
+        assert_eq!(
+            build_search_string(r"D:\proj", "ext:rs", SearchScope::Children),
+            r#"parent:"D:\proj" ext:rs"#
+        );
+    }
+
+    #[test]
+    fn recursive_scope_appends_trailing_backslash() {
+        assert_eq!(
+            build_search_string(r"D:\proj", "ext:rs", SearchScope::Recursive),
+            r#""D:\proj\" ext:rs"#
+        );
+    }
+
+    #[test]
+    fn recursive_scope_keeps_single_trailing_backslash() {
+        assert_eq!(
+            build_search_string(r"D:\proj\", "", SearchScope::Recursive),
+            r#""D:\proj\" "#
+        );
+    }
+
+    #[test]
+    fn recursive_scope_drive_root_stays_root() {
+        assert_eq!(
+            build_search_string(r"D:\", "ext:rs", SearchScope::Recursive),
+            r#""D:\" ext:rs"#
+        );
+    }
+
+    #[test]
+    fn inner_quotes_are_stripped() {
+        assert_eq!(
+            build_search_string("D:\\pr\"oj", "x", SearchScope::Recursive),
+            r#""D:\proj\" x"#
+        );
     }
 }

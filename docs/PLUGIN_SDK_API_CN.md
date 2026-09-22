@@ -1603,8 +1603,24 @@ Everything 1.5 从 `<安装目录>\Plugins\` 根目录按 **`<插件名>64.dll`*
 - 用 `get_proc_address(name)` 按 UTF-8 名字解析，失败要记录缺哪个。
 - `property_get_builtin_type` 建议按强制项解析（没有它就不能安全搜索）。
 - `os_register_class` / `os_create_window` 是主线程 marshaling 的前提，同样应按强制项对待。
-- 实测 `get_setting_int` 在 1.5.0.1422b 上不存在，读配置走 `get_setting_string`。
+- `get_setting_int` / `get_setting_string` 都按可选解析（opt! 不记日志，缺失时静默用默认值）。二者即使存在，PM_START 上下文也读不到本插件自己的设置 —— 见 19.9。
 
 ### 19.8 编译产物零第三方 DLL
 
 Rust cdylib + 静态链接 CRT（`+crt-static`）+ 纯 Rust 依赖（serde/serde_json 静态链接）+ windows-sys 仅绑定系统 DLL，产物只有一个 `everything_mcp.dll`，直接丢进 Plugins 目录即可运行。
+
+### 19.9 PM_START 读不到插件自己的设置 —— 自己解析 Plugins.ini 兜底
+
+PM_SAVE_SETTINGS 的**写入**是可靠的：主程序按 DLL 文件名把设置写进 `%APPDATA%\Everything\Plugins.ini`，段名就是 `[everything_mcp64.dll]`，键名原样（插件写什么就存什么，如 `mcp_enabled=1`、`mcp_port=8285`、`mcp_bind=127.0.0.1`），与其它插件的段按字母序共处一处。
+
+但 PM_START 时同一个 data 上下文**读不回来**：无论 `get_setting_int` 还是 `get_setting_string`，拿到的都是默认值。实测以下来源全部无效：Plugins.ini 里放着显眼的异值端口（9999）仍读到默认 8285；Everything.ini 里加 `[everything_mcp64.dll]` 同名段；Everything.ini 的 `[Everything]` 段里加裸键。后果是「选项对话框启用 → 重启 Everything 又变回未启用」的真缺陷（对话框内即时应用是好的，坏的是持久化）。
+
+修复（`src/plugin/ini_settings.rs`）：PM_START 读到 `enabled=false` 时，自己按主程序的格式解析 Plugins.ini —— 先 `%APPDATA%\Everything\Plugins.ini`，再 Everything.exe 同级目录的 `Plugins.ini`（app_data=0 的便携安装），取 `[everything_mcp64.dll]` 段里的 `mcp_enabled` / `mcp_port` / `mcp_bind`。只读不写，不与主程序抢文件。语义上区分两种状态：段存在但没有 `mcp_enabled` 键视为「无设置」（None），`mcp_enabled=0` 是「显式停用」，两者不能混淆。
+
+### 19.10 `parent:` 只搜直接子项；递归要用带尾反斜杠的路径项
+
+Everything 搜索语法里 `parent:"<folder>"` **只匹配直接父文件夹**，不进子目录 —— 空 pattern 时等价于 list_folder 的直接子项列表（实测 19 条），`ext:rs` 也只搜得到根目录下的 build.rs。附录 A 的示例用的就是这种形式，别当成递归语义用。
+
+递归搜整棵子树要用**引号路径项 + 尾反斜杠**：`"<folder>\" <pattern>`（对完整路径做子串匹配）。尾反斜杠有两个作用：让匹配进入子目录；同时避免误伤同前缀的兄弟目录 —— `everything-mcp` 不会命中 `everything-mcp-old` 里的文件。文件夹自身的路径没有尾反斜杠，因此不会把文件夹本身搜出来。盘符根（`D:\`）本身就是尾反斜杠形态，直接搜全盘。
+
+`search_in_folder` / `count` 用递归形式，`list_folder` 用 `parent:`（见 `plugin::search::SearchScope`）。

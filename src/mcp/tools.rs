@@ -1,40 +1,61 @@
 //! tools.rs — 工具实现
 //!
 //! 把 JSON-RPC 调用分发到具体逻辑，调用插件搜索层。
+//! 入参先过 `validate` 规范化/校验：错误消息带范例，LLM 客户端拿到
+//! INVALID_PARAMS 就能一次改对，不会带着坏参数盲目重试。
 
 use serde_json::{json, Value};
 
-use crate::mcp::protocol::INVALID_PARAMS;
+use crate::mcp::protocol::{INVALID_PARAMS, METHOD_NOT_FOUND};
+use crate::mcp::validate;
 use crate::plugin;
 
 /// 工具调用返回：（content 数组, is_error）
 /// MCP 协议要求工具调用结果以 `content` 数组返回，每项是 `{type, text}`。
 pub type ToolOutput = (Value, bool);
 
+/// 取 folder 参数：必须存在，且规范化后是合法绝对路径。
+fn require_folder(args: &Value) -> Result<String, (i32, String)> {
+    let raw = args
+        .get("folder")
+        .and_then(Value::as_str)
+        .ok_or((INVALID_PARAMS, validate::MISSING_FOLDER_MSG.to_string()))?;
+    validate::normalize_folder(raw).map_err(|e| (INVALID_PARAMS, e))
+}
+
+/// 取 pattern 参数：可缺省（空 = 列出全部），但不能含控制字符。
+fn pattern_arg(args: &Value) -> Result<String, (i32, String)> {
+    let raw = args.get("pattern").and_then(Value::as_str).unwrap_or("");
+    validate::validate_pattern(raw).map_err(|e| (INVALID_PARAMS, e))
+}
+
+/// 取非负整数参数：缺省用默认值；类型不符（负数/小数/字符串）报 INVALID_PARAMS。
+fn u64_arg(args: &Value, key: &str, default: u64) -> Result<u64, (i32, String)> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(default),
+        Some(v) => v.as_u64().ok_or((
+            INVALID_PARAMS,
+            format!("'{}' must be a non-negative integer; received {}", key, v),
+        )),
+    }
+}
+
 /// 分发工具调用。`name` 是工具名，`args` 是参数对象。
 pub fn dispatch(name: &str, args: &Value) -> Result<ToolOutput, (i32, String)> {
     match name {
         "search_in_folder" => {
-            let folder = args
-                .get("folder")
-                .and_then(Value::as_str)
-                .ok_or((INVALID_PARAMS, "missing 'folder'".into()))?;
-            let pattern = args
-                .get("pattern")
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            let max_results = args
-                .get("max_results")
-                .and_then(Value::as_u64)
-                .map(|n| n as usize)
-                .unwrap_or(50);
-            let timeout_ms = args
-                .get("timeout_ms")
-                .and_then(Value::as_u64)
-                .map(|n| n as u32)
-                .unwrap_or(10_000);
+            let folder = require_folder(args)?;
+            let pattern = pattern_arg(args)?;
+            let max_results = u64_arg(args, "max_results", 50)? as usize;
+            let timeout_ms = u64_arg(args, "timeout_ms", 10_000)? as u32;
 
-            match plugin::search::search_in_folder(folder, pattern, max_results, timeout_ms) {
+            match plugin::search::search_in_folder(
+                &folder,
+                &pattern,
+                max_results,
+                timeout_ms,
+                plugin::search::SearchScope::Recursive,
+            ) {
                 Ok(results) => {
                     let total = results.len();
                     let mut entries = Vec::with_capacity(total);
@@ -62,13 +83,16 @@ pub fn dispatch(name: &str, args: &Value) -> Result<ToolOutput, (i32, String)> {
         }
 
         "list_folder" => {
-            let folder = args
-                .get("folder")
-                .and_then(Value::as_str)
-                .ok_or((INVALID_PARAMS, "missing 'folder'".into()))?;
-            // 用 Everything 的「直接子项」语法：parent:"<folder>"
-            // 给一个空 pattern 等价于列出该目录全部直接子项。
-            match plugin::search::search_in_folder(folder, "", 500, 10_000) {
+            let folder = require_folder(args)?;
+            // 用「直接子项」范围（SearchScope::Children → parent:"<folder>"）：
+            // 空 pattern 等价于列出该目录全部直接子项，不递归。
+            match plugin::search::search_in_folder(
+                &folder,
+                "",
+                500,
+                10_000,
+                plugin::search::SearchScope::Children,
+            ) {
                 Ok(results) => {
                     let entries: Vec<Value> = results
                         .iter()
@@ -93,19 +117,19 @@ pub fn dispatch(name: &str, args: &Value) -> Result<ToolOutput, (i32, String)> {
         }
 
         "count" => {
-            let folder = args
-                .get("folder")
-                .and_then(Value::as_str)
-                .ok_or((INVALID_PARAMS, "missing 'folder'".into()))?;
-            let pattern = args
-                .get("pattern")
-                .and_then(Value::as_str)
-                .unwrap_or("");
+            let folder = require_folder(args)?;
+            let pattern = pattern_arg(args)?;
             // 我们用 search_in_folder 但只取总数（max_results=0 + 读 count）。
             // 优化：当前 search_in_folder 仍然会读出全部结果填到 Vec，
             // 对于纯计数来说有额外开销，但单次查询本身的耗时主要在搜索而不是读取，
-            // 所以暂不专门优化。
-            match plugin::search::search_in_folder(folder, pattern, 0, 10_000) {
+            // 所以暂不专门优化。计数与 search_in_folder 同范围（递归子树）。
+            match plugin::search::search_in_folder(
+                &folder,
+                &pattern,
+                0,
+                10_000,
+                plugin::search::SearchScope::Recursive,
+            ) {
                 Ok(results) => {
                     let text = format!(
                         "{{\"folder\":{:?},\"pattern\":{:?},\"count\":{}}}",
@@ -117,10 +141,7 @@ pub fn dispatch(name: &str, args: &Value) -> Result<ToolOutput, (i32, String)> {
             }
         }
 
-        other => Err((
-            crate::mcp::protocol::METHOD_NOT_FOUND,
-            format!("unknown tool: {}", other),
-        )),
+        other => Err((METHOD_NOT_FOUND, format!("unknown tool: {}", other))),
     }
 }
 
