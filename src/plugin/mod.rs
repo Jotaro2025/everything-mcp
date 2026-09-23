@@ -10,6 +10,7 @@ pub mod diag;
 pub mod ffi_types;
 pub mod host;
 pub mod ini_settings;
+pub mod journal;
 pub mod main_thread;
 pub mod search;
 pub mod state;

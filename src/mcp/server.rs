@@ -50,8 +50,7 @@ pub fn start(bind: &str, port: u16) -> Result<(), String> {
     }
 
     let addr = format!("{}:{}", bind, port);
-    let listener =
-        TcpListener::bind(&addr).map_err(|e| format!("bind {} failed: {}", addr, e))?;
+    let listener = TcpListener::bind(&addr).map_err(|e| format!("bind {} failed: {}", addr, e))?;
     // Windows 上 TCPListener::bind 默认已开启 SO_EXCLUSIVEADDRUSE/SO_REUSEADDR，
     // 服务退出后立即重启不会因为 TIME_WAIT 失败。
 
@@ -106,9 +105,7 @@ fn run_listener(listener: TcpListener, shutdown: std::sync::Arc<AtomicBool>) {
                         let _ = handle_connection(stream, s_clone);
                     });
             }
-            Err(ref e)
-                if e.kind() == std::io::ErrorKind::WouldBlock =>
-            {
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 // 没有新连接 —— 短暂休眠再试。
                 thread::sleep(Duration::from_millis(50));
             }
@@ -230,9 +227,8 @@ fn read_http_request(stream: &mut TcpStream) -> std::io::Result<HttpRequest> {
     }
 
     let header_str = String::from_utf8_lossy(&buf);
-    let head = parse_header(&header_str).ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::InvalidData, "no request line")
-    })?;
+    let head = parse_header(&header_str)
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "no request line"))?;
 
     // 读取 body。
     let mut body = String::new();
@@ -325,7 +321,11 @@ pub fn dispatch_rpc_http(body: &str, head: &RequestHead) -> (u16, String) {
         Err(_) => {
             let resp = protocol::error_response(&None, protocol::PARSE_ERROR, "parse error");
             // modern 语义：请求没进 JSON-RPC 层，按 400 拒绝；legacy 保持 200。
-            let status = if head.protocol_version.is_some() { 400 } else { 200 };
+            let status = if head.protocol_version.is_some() {
+                400
+            } else {
+                200
+            };
             return (status, encode(&resp));
         }
     };
@@ -421,10 +421,7 @@ pub fn dispatch_rpc_http(body: &str, head: &RequestHead) -> (u16, String) {
             protocol::ok_response(&id, result)
         }
         "tools/call" => {
-            let name = params
-                .get("name")
-                .and_then(Value::as_str)
-                .unwrap_or("");
+            let name = params.get("name").and_then(Value::as_str).unwrap_or("");
             let args = params.get("arguments").cloned().unwrap_or(Value::Null);
             match tools::dispatch(name, &args) {
                 Ok((content, is_error)) => {

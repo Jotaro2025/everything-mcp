@@ -430,19 +430,46 @@ unsafe extern "system" fn run_search_on_main(ctx: *mut core::ffi::c_void) {
     unsafe {
         (c.search_fn)(
             c.query,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 10 个 match_* / ignore_* 开关
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0, // 10 个 match_* / ignore_* 开关
             1, // clear_selection
             1, // clear_item_refs
             c.search_bytes,
             0, // filter_flags
-            null_str, null_str, // filter / filter_columns
-            core::ptr::null(), 0, -1, 1, // filter_sort / asc / view / fast_sort_only
-            sort_property, 1, // sort_property_type = NAME / ascending（不能是 NULL）
-            core::ptr::null(), 0, // sort 2 —— etp 同样传 NULL
-            core::ptr::null(), 0, // sort 3 —— etp 同样传 NULL
-            0, 0, 0, 0, 0, // folders_first / dialog_center_x / y / track_size / track_folder
-            0, 1, 1, 1, // force / allow_query / allow_read / allow_disk
-            0, SIZE_STANDARD_JEDEC, 0, 1, 0,
+            null_str,
+            null_str, // filter / filter_columns
+            core::ptr::null(),
+            0,
+            -1,
+            1, // filter_sort / asc / view / fast_sort_only
+            sort_property,
+            1, // sort_property_type = NAME / ascending（不能是 NULL）
+            core::ptr::null(),
+            0, // sort 2 —— etp 同样传 NULL
+            core::ptr::null(),
+            0, // sort 3 —— etp 同样传 NULL
+            0,
+            0,
+            0,
+            0,
+            0, // folders_first / dialog_center_x / y / track_size / track_folder
+            0,
+            1,
+            1,
+            1, // force / allow_query / allow_read / allow_disk
+            0,
+            SIZE_STANDARD_JEDEC,
+            0,
+            1,
+            0,
         );
     }
     super::diag::write_flush("run_search_on_main: db_query_search2 returned");
@@ -569,7 +596,9 @@ fn count_results(query: DbQueryHandle) -> Result<usize, String> {
 unsafe fn read_result_count(query: DbQueryHandle) -> Result<usize, String> {
     let host = Host::get();
     let total = unsafe {
-        (host.db_query_get_result_count.ok_or("get_result_count null")?)(query)
+        (host
+            .db_query_get_result_count
+            .ok_or("get_result_count null")?)(query)
     };
     Ok(total)
 }
@@ -582,7 +611,10 @@ unsafe fn read_all(
 ) -> Result<(Vec<SearchResult>, usize), String> {
     let host = Host::get();
     let total = unsafe { read_result_count(query)? };
-    super::diag::write(&format!("read_all: total={} take<=max={}", total, max_results));
+    super::diag::write(&format!(
+        "read_all: total={} take<=max={}",
+        total, max_results
+    ));
     let take = if max_results == 0 {
         total
     } else {
@@ -604,19 +636,32 @@ unsafe fn read_all(
     let read = || -> Result<(), String> {
         for i in 0..take {
             let name = unsafe {
-                (host.db_query_get_result_name.ok_or("get_result_name null")?)(query, i, &mut name_buf);
+                (host
+                    .db_query_get_result_name
+                    .ok_or("get_result_name null")?)(query, i, &mut name_buf);
                 name_buf.to_string()
             };
             let parent = unsafe {
-                (host.db_query_get_result_path.ok_or("get_result_path null")?)(query, i, &mut path_buf);
+                (host
+                    .db_query_get_result_path
+                    .ok_or("get_result_path null")?)(query, i, &mut path_buf);
                 path_buf.to_string()
             };
             let is_folder = unsafe {
-                (host.db_query_is_folder_result.ok_or("is_folder_result null")?)(query, i) != 0
+                (host
+                    .db_query_is_folder_result
+                    .ok_or("is_folder_result null")?)(query, i)
+                    != 0
             };
             let size = unsafe {
-                (host.db_query_get_result_indexed_fd.ok_or("get_indexed_fd null")?)(query, i, &mut fd);
-                if is_folder { 0 } else { fd.file_size() }
+                (host
+                    .db_query_get_result_indexed_fd
+                    .ok_or("get_indexed_fd null")?)(query, i, &mut fd);
+                if is_folder {
+                    0
+                } else {
+                    fd.file_size()
+                }
             };
 
             // db_query_get_result_path 只返回父路径（SDK 语义：不含文件名），
@@ -627,7 +672,12 @@ unsafe fn read_all(
             }
             path.push_str(&name);
 
-            out.push(SearchResult { name, path, is_folder, size });
+            out.push(SearchResult {
+                name,
+                path,
+                is_folder,
+                size,
+            });
         }
         Ok(())
     }();

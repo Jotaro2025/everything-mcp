@@ -20,7 +20,7 @@
 7. [查询（db_query_*）](#7-查询db_query_)
 8. [文件夹列举（db_find_*）](#8-文件夹列举db_find_)
 9. [数据库快照（db_snapshot_*）](#9-数据库快照db_snapshot_)
-10. [索引变更日志（db_journal_*）](#10-索引变更日志db_journal_)
+10. [索引变更日志（db_journal_* 与 journal_log 文本日志）](#10-索引变更日志db_journal_-与-journal_log-文本日志)
 11. [属性系统（property_*）](#11-属性系统property_)
 12. [UTF-8 字符串（utf8_* / utf8_buf_*）](#12-utf-8-字符串utf8_--utf8_buf_)
 13. [ANSI / 宽字符缓冲（ansi_* / wchar_*）](#13-ansi--宽字符缓冲ansi_--wchar_)
@@ -725,18 +725,141 @@ db_release(db);
 
 ---
 
-## 10. 索引变更日志（`db_journal_*`）
+## 10. 索引变更日志（`db_journal_*` 与 `journal_log` 文本日志）
 
-索引变化的事件流（增量更新）。用于实现"文件变更通知"。⚠️ 签名未验证，是流式回调，**不适合 MCP 请求/响应工具**，更适合做成 MCP 资源订阅。
+索引变化的事件流（增量更新）。Everything 的 Index Journal（索引日志）是索引变更的
+审计记录，字段与 UI 的索引日志窗口一致：条目 ID、日期、动作、名称、路径、新名称、
+新路径、大小、各日期、属性。保留为环形缓冲（上限 = INI 的 `journal_max_size`，KB）。
 
-| 函数 | 签名 | 来源 | 说明 |
-|---|---|---|---|
-| `db_journal_file_open` | ⚠️ 推断 `db_journal_file_t* (...)` | ❓ | 打开 journal。 |
-| `db_journal_file_close` | ⚠️ 推断 `void (db_journal_file_t *j)` | ❓ | 关闭。 |
-| `db_journal_file_read` | ⚠️ 推断 `int (db_journal_file_t *j, ...)` | ❓ | 读取变更记录。 |
-| `db_journal_file_would_block` | ⚠️ 推断 `int (db_journal_file_t *j)` | ❓ | 是否会阻塞（无新变更）。 |
-| `db_journal_notification_register` | ⚠️ 推断 `db_journal_notification_t* (callback, user_data)` | ❓ | 注册变更通知回调。 |
-| `db_journal_notification_unregister` | ⚠️ 推断 `void (db_journal_notification_t *n)` | ❓ | 取消注册。 |
+有两条读取路径，本项目（MCP 工具 `index_changes`）走第二条：
+
+| 路径 | 形态 | 本项目 |
+|---|---|---|
+| `db_journal_*` 插件接口（见 10.1） | 通知驱动，读二进制记录流 | ❌ 不用 |
+| `journal_log` 文本日志（见 10.3） | Everything 自己按天落盘的文本 | ✅ 用 |
+
+### 10.1 `db_journal_*` 签名（已核实）
+
+**签名来源**：官方论坛「Everything 1.5 Plugin SDK」帖（`viewtopic.php?t=16535`，
+p=75489，void 2025-05-27 发布）——`everything_plugin.h` 只给 opaque typedef，
+函数原型以该帖为准。全部**从主线程调用**（通知回调本就在主线程）。
+
+```c
+// 打开 journal 读取流。journal_id / first_item_index 被环形保留区淘汰时返回 NULL。
+everything_plugin_db_journal_file_t *db_journal_file_open(
+    everything_plugin_db_t *db,
+    const everything_plugin_db_remap_array_t *remap_array,
+    EVERYTHING_PLUGIN_QWORD journal_id,
+    EVERYTHING_PLUGIN_QWORD first_item_index);
+
+// 读一段**原始字节流**，实际字节数写回 pnumread。
+// 返回 1 = 成功；0 = journal 或当前读位置已被压缩删除（应关闭重开）。
+int db_journal_file_read(everything_plugin_db_journal_file_t *journal_file,
+                        void *buf, uintptr_t len, uintptr_t *pnumread);
+
+int  db_journal_file_would_block(everything_plugin_db_journal_file_t *journal_file); // 1=会阻塞
+void db_journal_file_close(everything_plugin_db_journal_file_t *journal_file);
+
+// 注册变更通知。callback 在主线程触发，只带 user_data（无事件载荷）。
+// 返回 NULL 仅内存不足；用 unregister 释放（官方帖此处笔误写成 register）。
+everything_plugin_db_journal_notification_t *db_journal_notification_register(
+    everything_plugin_db_t *db, void *user_data,
+    void (*callback_proc)(void *user_data));
+void db_journal_notification_unregister(everything_plugin_db_journal_notification_t *n);
+```
+
+配套的路径重映射构建（open 的 `remap_array` 参数；本地 NTFS 卷传空 array 即可，
+filelist / 网络索引用显式 path→mount）：
+
+```c
+everything_plugin_db_remap_list_t *db_remap_list_create(void);
+void db_remap_list_add(everything_plugin_db_remap_list_t *remap_list,
+    const everything_plugin_utf8_t *path, uintptr_t path_len,
+    const everything_plugin_utf8_t *mount, uintptr_t mount_len);
+void db_remap_list_destroy(everything_plugin_db_remap_list_t *remap_list);
+everything_plugin_db_remap_array_t *db_remap_array_create(everything_plugin_db_remap_list_t *remap_list);
+void db_remap_array_destroy(everything_plugin_db_remap_array_t *remap_array);
+```
+
+**函数解析方式**：Everything.exe **没有 PE 导出表**（2026-09-23 实证：数据目录里
+Export Directory 的 RVA 为 0），host 函数一律经 1.3 节的
+`get_proc_address` 按名字解析。Everything.exe 的字符串表里 journal 相关名字共
+11 个，其中 6 个是官方帖公开过原型的（下表），另外 5 个
+`db_journal_apply_settings` / `db_journal_enum_changes` / `db_journal_get_info` /
+`db_journal_list_get_copy` / `db_journal_list_update` 没有任何公开原型，**本项目不调**。
+
+**IMPORTANT**:
+1. `db_journal_file_read` 读的是**未文档化的二进制记录流**：官方只说了"往 buf 里
+   灌字节、返回实际长度"，既没有记录结构定义，也没有字段顺序/大小/解析循环。
+2. **`journal_id` 的来源无公开文档**——通知回调只透传 `user_data`，不给出
+   journal id。2026-09-23 在本机 1.5.0.1422b 上做过探测（建/改名/删一个测试文件，
+   从 `db_journal_file_open` 拿到原始字节做 hex dump）：**binary 格式无法与已知
+   动作/路径可靠对齐**，记录边界与字段语义都定不下来。因此本项目改用 10.3 的
+   文本日志，二进制路径的解析工作就此搁置。
+3. 环形保留有上限，超过 `journal_max_size` 的旧记录被静默淘汰；`open` 的
+   `first_item_index` 指向已淘汰条目时返回 NULL。
+4. 主程序另有 INI 级「落盘日志」开关 `journal_log`（+`journal_log_directory` /
+   `journal_log_format`），开启后按天写 `index-journal-YYYY-MM-DD` 文本文件
+   ——本项目读的就是它，格式见 10.3。
+5. 可用 `config_get_int_value("journal")` 判断索引日志是否开启；落盘日志的开关是
+   `config_get_int_value("journal_log")`。本项目没用它，而是自己解析 Everything.ini
+   （`journal_log` / `journal_log_directory`）—— 这样"没开日志"和"开了但今天没变更"
+   能分开报，且不需要额外索取 host 函数。
+
+### 10.2 为什么本项目读文本日志
+
+`db_journal_*` 看着更正统（实时、无格式猜测），但第 1、2 条那两个缺口无法从任何
+公开资料补齐，硬上就是在猜二进制格式——猜错的后果不是报错，而是**静默给出错的
+变更历史**，比不提供这个工具更糟。
+
+`journal_log` 文本日志是 Everything 自己写给人看的，格式在该版本上实证过（见 10.3
+与 `src/plugin/journal.rs` 的 fixture），零格式风险。代价是要用户在 Everything 里
+开日志开关；`index_changes` 检测到没开时返回带确切开关位置的报错，而不是静默返回
+空结果。
+
+顺带的两个好处：解析器是纯函数 + 文件读，可在任意线程跑，不占 Everything 主线程；
+回溯深度只受日志保留策略限制，不受环形缓冲 `journal_max_size` 限制。
+
+### 10.3 `journal_log` 文本日志格式（实证于 1.5.0.1422b）
+
+`journal_log=1` 时 Everything 每天写一个文件：
+
+```
+<日志目录>\index-journal-YYYY-MM-DD.txt
+```
+
+默认日志目录 `%LOCALAPPDATA%\Everything\Logs`（可被 INI 的 `journal_log_directory`
+改写）。每行一条变更，UTF-8 无 BOM、LF 行尾、制表符分列，共 6 列：
+
+```
+<journal_id>\t<change_id>\t<YYYY-MM-DD HH:MM:SS>\t"<动作>"\t"<路径>"\t"<新路径>"
+```
+
+前三列不带引号，后三列带成对双引号。真实样本（中文界面）：
+
+```
+134345291781008867	352520	2026-09-23 11:18:44	"文件创建"	"D:\a\ZZCREATE-7f3a1c.txt"	""
+134345291781008867	352531	2026-09-23 11:18:46	"文件重命名"	"D:\a\ZZCREATE-7f3a1c.txt"	"D:\a\ZZRENAME-7f3a1c.txt"
+134345291781008867	352536	2026-09-23 11:18:47	"文件夹创建"	"D:\a\ZZFOLDER-7f3a1c\"	""
+```
+
+要点：
+
+1. **文件夹条目的路径列以 `\` 结尾**——这是区分文件/文件夹的主判据（动作串只作
+   兜底，因为不是所有语言的动作词都带"文件夹"）。
+2. **重命名/移动条目两个路径列都有值**，创建/修改/删除的"新路径"列是空串 `""`。
+   Everything 自己区分"重命名"（同文件夹）与"移动"（换文件夹），是两条不同的
+   动作串。
+3. **时间列是本机本地时间**，不带时区信息，Everything 按本地时区（含夏令时规则）
+   格式化。要换算成 Unix 秒必须走 `SystemTimeToTzSpecificLocalTime` 一类的时区
+   API，不能手写固定偏移量。
+4. **动作列是本地化字符串**，随界面语言变。本项目按关键词表归类成稳定枚举，顺序
+   有讲究：必须先判重命名再判修改——日语「名前の変更」、韩语「이름 변경」都含有
+   表示"修改"的「変更/변경」。归不上的记 `other` 并保留原始串，不丢事件。
+5. `journal_id` 是"世代 id"，同一段日志期间不变，可用来分辨 Everything 重启/重索引；
+   `change_id` 单调递增，天然按时间排序。
+6. 日志是追加写的，最后一行可能只写了一半——解析失败的行要计数跳过，不能当成
+   格式错误的信号。
 
 ---
 
@@ -1180,12 +1303,12 @@ db_find_next_file                        ✅
 db_folder_exists                         ✅
 db_get_indexed_fd                        ✅
 db_is_index_folder_size                  ✅
-db_journal_file_close                    ⚠️
-db_journal_file_open                     ⚠️
-db_journal_file_read                     ⚠️
-db_journal_file_would_block              ⚠️
-db_journal_notification_register         ⚠️
-db_journal_notification_unregister       ⚠️
+db_journal_file_close                    ✅
+db_journal_file_open                     ✅
+db_journal_file_read                     ✅ (记录格式未文档化)
+db_journal_file_would_block              ✅
+db_journal_notification_register         ✅
+db_journal_notification_unregister       ✅
 db_onready_add                           ⚠️
 db_onready_remove                        ⚠️
 db_query_cancel                          ✅
@@ -1203,12 +1326,12 @@ db_query_search                          ✅
 db_query_search2                         ✅
 db_query_sort                            ✅
 db_release                               ✅
-db_remap_array_create                    ⚠️
-db_remap_array_destroy                   ⚠️
+db_remap_array_create                    ✅
+db_remap_array_destroy                   ✅
 db_remap_array_get_hashcode              ⚠️
-db_remap_list_add                        ⚠️
-db_remap_list_create                     ⚠️
-db_remap_list_destroy                    ⚠️
+db_remap_list_add                        ✅
+db_remap_list_create                     ✅
+db_remap_list_destroy                    ⚠️ 签名见论坛帖;未被 remap_create 文档显式列原型
 db_snapshot_create                       ⚠️
 db_snapshot_destroy                      ⚠️
 db_snapshot_file_close                   ⚠️

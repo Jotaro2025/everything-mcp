@@ -29,7 +29,9 @@ use core::ffi::c_void;
 use std::sync::{Mutex, OnceLock};
 
 use windows_sys::Win32::Foundation::{HWND, RECT};
-use windows_sys::Win32::UI::Controls::{BST_CHECKED, BST_UNCHECKED, CheckDlgButton, IsDlgButtonChecked};
+use windows_sys::Win32::UI::Controls::{
+    CheckDlgButton, IsDlgButtonChecked, BST_CHECKED, BST_UNCHECKED,
+};
 use windows_sys::Win32::UI::WindowsAndMessaging::{GetClientRect, GetDlgItemInt, SetDlgItemInt};
 
 use crate::mcp;
@@ -390,7 +392,14 @@ pub fn size_page(data: *mut c_void) -> *mut c_void {
     set_rect(page_hwnd, ID_ENABLED, x, y, wide, DLG_CHECKBOX_HIGH);
     y += DLG_CHECKBOX_HIGH + DLG_SEPARATOR;
 
-    set_rect(page_hwnd, ID_BIND_STATIC, x, y + 3, static_wide, DLG_STATIC_HIGH);
+    set_rect(
+        page_hwnd,
+        ID_BIND_STATIC,
+        x,
+        y + 3,
+        static_wide,
+        DLG_STATIC_HIGH,
+    );
     set_rect(
         page_hwnd,
         ID_BIND_EDIT,
@@ -401,8 +410,22 @@ pub fn size_page(data: *mut c_void) -> *mut c_void {
     );
     y += DLG_EDIT_HIGH + DLG_SEPARATOR;
 
-    set_rect(page_hwnd, ID_PORT_STATIC, x, y + 3, static_wide, DLG_STATIC_HIGH);
-    set_rect(page_hwnd, ID_PORT_EDIT, x + static_wide, y, 75, DLG_EDIT_HIGH);
+    set_rect(
+        page_hwnd,
+        ID_PORT_STATIC,
+        x,
+        y + 3,
+        static_wide,
+        DLG_STATIC_HIGH,
+    );
+    set_rect(
+        page_hwnd,
+        ID_PORT_EDIT,
+        x + static_wide,
+        y,
+        75,
+        DLG_EDIT_HIGH,
+    );
 
     // 恢复默认按钮贴在页面底部右角。
     let button_wide = expand_min_wide(page_hwnd, labels.restore, 75 - 24) + 24;

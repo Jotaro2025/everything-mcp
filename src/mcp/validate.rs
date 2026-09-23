@@ -140,10 +140,7 @@ pub fn validate_pattern(input: &str) -> Result<String, String> {
 pub fn translate_globstar(pattern: &str) -> String {
     let mut p = pattern.trim();
     loop {
-        if let Some(rest) = p
-            .strip_prefix("**/")
-            .or_else(|| p.strip_prefix("**\\"))
-        {
+        if let Some(rest) = p.strip_prefix("**/").or_else(|| p.strip_prefix("**\\")) {
             p = rest.trim_start();
             continue;
         }

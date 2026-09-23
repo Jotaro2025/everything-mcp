@@ -243,9 +243,7 @@ pub unsafe extern "system" fn wnd_proc(
     }
     // 其它消息交给 DefWindowProcW。我们只关心 WM_INVOKE。
     unsafe {
-        windows_sys::Win32::UI::WindowsAndMessaging::DefWindowProcW(
-            hwnd, msg, wparam, lparam,
-        )
+        windows_sys::Win32::UI::WindowsAndMessaging::DefWindowProcW(hwnd, msg, wparam, lparam)
     }
 }
 
@@ -282,10 +280,10 @@ pub fn install_on_main_thread() -> Result<(), String> {
             CLASS_NAME.as_ptr(),
             // host 的 WNDPROC 类型与我们的 wnd_proc 函数签名一致 —— 直接传 Some。
             Some(wnd_proc),
-            0,                  // window_extra
-            0 as HICON,         // hIcon
-            0 as HICON,         // hIconSm
-            0 as HCURSOR,       // hcursor
+            0,            // window_extra
+            0 as HICON,   // hIcon
+            0 as HICON,   // hIconSm
+            0 as HCURSOR, // hcursor
         );
     }
 
@@ -301,15 +299,15 @@ pub fn install_on_main_thread() -> Result<(), String> {
         create_window(
             0, // dwExStyle
             CLASS_NAME.as_ptr(),
-            b"\0".as_ptr(), // lpWindowName —— 空字符串
-            0,              // dwStyle
-            0,              // x
-            0,              // y
-            0,              // nWidth
-            0,              // nHeight
-            0 as HostHwnd,  // hWndParent
-            0 as HMENU,     // hMenu
-            hinstance,      // hInstance
+            b"\0".as_ptr(),        // lpWindowName —— 空字符串
+            0,                     // dwStyle
+            0,                     // x
+            0,                     // y
+            0,                     // nWidth
+            0,                     // nHeight
+            0 as HostHwnd,         // hWndParent
+            0 as HMENU,            // hMenu
+            hinstance,             // hInstance
             core::ptr::null_mut(), // lpParam
         )
     };

@@ -46,7 +46,11 @@ pub fn read_persisted() -> Option<PersistedSettings> {
 fn candidate_paths() -> Vec<PathBuf> {
     let mut paths = Vec::new();
     if let Ok(appdata) = std::env::var("APPDATA") {
-        paths.push(PathBuf::from(appdata).join("Everything").join("Plugins.ini"));
+        paths.push(
+            PathBuf::from(appdata)
+                .join("Everything")
+                .join("Plugins.ini"),
+        );
     }
     // current_exe() 是宿主进程的 Everything.exe；便携安装时 Plugins.ini 在它旁边。
     if let Ok(exe) = std::env::current_exe() {
@@ -84,9 +88,7 @@ fn parse_section(content: &str) -> Option<PersistedSettings> {
         };
         let (key, value) = (key.trim(), value.trim());
         match key {
-            "mcp_enabled" => {
-                enabled = Some(value.parse::<i64>().map(|v| v != 0).unwrap_or(false))
-            }
+            "mcp_enabled" => enabled = Some(value.parse::<i64>().map(|v| v != 0).unwrap_or(false)),
             "mcp_port" => port = value.parse::<u16>().ok().filter(|p| *p != 0),
             "mcp_bind" => {
                 if !value.is_empty() {
@@ -98,7 +100,11 @@ fn parse_section(content: &str) -> Option<PersistedSettings> {
     }
 
     let enabled = enabled?;
-    Some(PersistedSettings { enabled, port, bind })
+    Some(PersistedSettings {
+        enabled,
+        port,
+        bind,
+    })
 }
 
 #[cfg(test)]

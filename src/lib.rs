@@ -39,7 +39,7 @@ use plugin::host::Host;
 const PLUGIN_NAME: &[u8] = b"Everything MCP\0";
 
 /// 插件版本号。
-const PLUGIN_VERSION: &[u8] = b"1.0.0\0";
+const PLUGIN_VERSION: &[u8] = b"1.1.0\0";
 
 /// 插件描述 —— 说明这个插件做什么。
 const PLUGIN_DESCRIPTION: &[u8] =

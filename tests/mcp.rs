@@ -47,29 +47,76 @@ fn initialize_result_announces_protocol_version_and_tools_capability() {
     assert_eq!(r["protocolVersion"], "2024-11-05");
     assert_eq!(r["capabilities"]["tools"]["listChanged"], false);
     assert_eq!(r["serverInfo"]["name"], "everything-mcp");
-    assert_eq!(r["serverInfo"]["version"], "1.0.0");
+    assert_eq!(r["serverInfo"]["version"], "1.1.0");
 }
 
 #[test]
-fn tools_list_contains_three_tools_with_required_params() {
+fn tools_list_contains_four_tools_with_required_params() {
     let list = protocol::make_tools_list();
     let tools = list["tools"].as_array().expect("tools must be an array");
     let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
-    assert_eq!(names, vec!["search_in_folder", "list_folder", "count"]);
+    assert_eq!(
+        names,
+        vec!["search_in_folder", "list_folder", "count", "index_changes"]
+    );
 
     // search_in_folder 的 folder / pattern 必填，其余可带默认值。
     let search = &tools[0];
     let required = search["inputSchema"]["required"].as_array().unwrap();
     assert_eq!(required.len(), 2);
-    assert_eq!(search["inputSchema"]["properties"]["max_results"]["default"], 50);
+    assert_eq!(
+        search["inputSchema"]["properties"]["max_results"]["default"],
+        50
+    );
     assert_eq!(
         search["inputSchema"]["properties"]["timeout_ms"]["default"],
         10_000
     );
 
-    // list_folder / count 只要求 folder。
+    // list_folder / count 只要求 folder；index_changes 一个参数都不必带。
     assert_eq!(tools[1]["inputSchema"]["required"], json!(["folder"]));
     assert_eq!(tools[2]["inputSchema"]["required"], json!(["folder"]));
+    // index_changes 的入参全都不必填：不带参数就是「列出最近的变更」。
+    assert!(
+        tools[3]["inputSchema"].get("required").is_none(),
+        "index_changes 应当全可选（列出最近的变更即可）"
+    );
+    assert_eq!(
+        tools[3]["inputSchema"]["properties"]["max_results"]["default"],
+        50
+    );
+}
+
+#[test]
+fn index_changes_description_and_schema_document_the_gotchas() {
+    let list = protocol::make_tools_list();
+    let tool = &list["tools"][3];
+    let desc = tool["description"].as_str().unwrap();
+
+    // 三个必须说清的点：它答的是「什么变了」而非「现在有什么」；要开 journal_log；
+    // 结果可能被 max_results 截断。
+    assert!(desc.contains("journal_log"), "desc should name the INI key");
+    assert!(desc.contains("truncated"), "desc should expose truncation");
+    assert!(
+        desc.contains("search_in_folder"),
+        "desc should point at the state-query tool"
+    );
+    assert!(
+        desc.contains("Log changes"),
+        "desc should name the Options menu path"
+    );
+
+    // action 用封闭枚举，避免 LLM 乱自创动作名。
+    let action = &tool["inputSchema"]["properties"]["action"];
+    assert_eq!(
+        action["enum"],
+        json!(["created", "modified", "deleted", "renamed", "moved", "any"])
+    );
+    // 描述里必须给出时间参数的形状范例，否则 LLM 会乱写。
+    let since = tool["inputSchema"]["properties"]["since"]["description"]
+        .as_str()
+        .unwrap();
+    assert!(since.contains("2026-09-23 11:18"), "since 应带范例");
 }
 
 #[test]
@@ -210,10 +257,10 @@ fn dispatch_ping_returns_empty_result() {
 }
 
 #[test]
-fn dispatch_tools_list_returns_three_tools() {
+fn dispatch_tools_list_returns_four_tools() {
     let resp = dispatch(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#);
     let list = resp["result"]["tools"].as_array().unwrap();
-    assert_eq!(list.len(), 3);
+    assert_eq!(list.len(), 4);
 }
 
 #[test]
@@ -485,7 +532,7 @@ fn modern_tools_list_result_carries_result_type() {
     );
     assert_eq!(status, 200);
     assert_eq!(resp["result"]["resultType"], "complete");
-    assert_eq!(resp["result"]["tools"].as_array().unwrap().len(), 3);
+    assert_eq!(resp["result"]["tools"].as_array().unwrap().len(), 4);
 }
 
 #[test]
@@ -494,7 +541,7 @@ fn legacy_tools_list_has_no_result_type() {
     // 客户端按桥接规则把缺失当作 complete。
     let resp = dispatch(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#);
     assert!(resp["result"].get("resultType").is_none());
-    assert_eq!(resp["result"]["tools"].as_array().unwrap().len(), 3);
+    assert_eq!(resp["result"]["tools"].as_array().unwrap().len(), 4);
 }
 
 #[test]
@@ -714,6 +761,138 @@ fn wildcard_in_folder_is_rejected_with_guidance() {
     assert!(err.1.contains("wildcards"), "{}", err.1);
 }
 
+#[test]
+fn index_changes_rejects_bad_params_before_touching_the_log() {
+    // 全都要在触达文件系统之前就返回 INVALID_PARAMS —— CI 上没有 Everything
+    // 配置也能跑，且结果确定。
+    let err = tools::dispatch("index_changes", &json!({ "action": "destoryed" })).unwrap_err();
+    assert_eq!(err.0, protocol::INVALID_PARAMS);
+    assert!(err.1.contains("action"), "{}", err.1);
+    assert!(err.1.contains("created"), "消息应列出合法值 {}", err.1);
+
+    let err = tools::dispatch("index_changes", &json!({ "action": 1 })).unwrap_err();
+    assert_eq!(err.0, protocol::INVALID_PARAMS);
+
+    // 时间格式坏：消息里必须带范例，LLM 才能一次改对。
+    for bad in [
+        "昨天",
+        "2026-13-45",
+        "2026-09-23 25:00",
+        "2026-09-23T11:18:31:00",
+    ] {
+        for key in ["since", "until"] {
+            let err = tools::dispatch("index_changes", &json!({ key: bad })).unwrap_err();
+            assert_eq!(err.0, protocol::INVALID_PARAMS, "{} = {:?}", key, bad);
+            assert!(err.1.contains(key), "{} = {:?} -> {}", key, bad, err.1);
+        }
+    }
+
+    // 非字符串的时间参数（数字会被当 unix 秒收下，所以这里用小数）。
+    let err = tools::dispatch("index_changes", &json!({ "since": 3.5 })).unwrap_err();
+    assert_eq!(err.0, protocol::INVALID_PARAMS);
+    // 控制字符不进 path / name。
+    let err = tools::dispatch("index_changes", &json!({ "name": "a\tb" })).unwrap_err();
+    assert_eq!(err.0, protocol::INVALID_PARAMS);
+    let err = tools::dispatch("index_changes", &json!({ "path": 7 })).unwrap_err();
+    assert_eq!(err.0, protocol::INVALID_PARAMS);
+
+    // max_results 为 0 与超上限都不行，且消息写清边界。
+    let err = tools::dispatch("index_changes", &json!({ "max_results": 0 })).unwrap_err();
+    assert_eq!(err.0, protocol::INVALID_PARAMS);
+    assert!(err.1.contains("at least 1"), "{}", err.1);
+    let err = tools::dispatch("index_changes", &json!({ "max_results": 99_999 })).unwrap_err();
+    assert_eq!(err.0, protocol::INVALID_PARAMS);
+    assert!(err.1.contains("2000"), "上限要写进消息 {}", err.1);
+
+    // since 晚于 until 是最容易漏的一种错：放过它只会得到 0 条且无从诊断。
+    let err = tools::dispatch(
+        "index_changes",
+        &json!({ "since": "2026-09-23 12:00:00", "until": "2026-09-23 11:00:00" }),
+    )
+    .unwrap_err();
+    assert_eq!(err.0, protocol::INVALID_PARAMS);
+    assert!(err.1.contains("until"), "{}", err.1);
+}
+
+#[test]
+fn index_changes_accepts_valid_params() {
+    // 合法入参必须通过校验。查不到日志（CI / 没开 journal_log）时返回
+    // is_error 的友好提示；能查到时返回带 count 的 JSON —— 两种情况都不该是
+    // JSON-RPC 层面的错误。
+    for args in [
+        json!({}),
+        json!({ "action": "any" }),
+        json!({ "action": "created", "max_results": 10 }),
+        json!({ "path": "C:\\", "name": "readme", "since": "2026-09-01", "until": "2026-09-23 11:18" }),
+        json!({ "since": "2026-09-23T11:18", "until": "" }),
+        json!({ "max_results": 2000 }),
+    ] {
+        let (out, is_error) = tools::dispatch("index_changes", &args).expect("合法入参不该报错");
+        let text = out["content"][0]["text"]
+            .as_str()
+            .expect("content 应是文本");
+        if is_error {
+            assert!(text.starts_with("index_changes error"), "{}", text);
+            assert!(
+                text.contains("journal_log"),
+                "报错要给出开关相关的做法: {}",
+                text
+            );
+        } else {
+            let parsed: Value = serde_json::from_str(text).expect("成功响应应是 JSON");
+            assert!(parsed["count"].is_number(), "{}", text);
+            assert!(parsed["changes"].is_array(), "{}", text);
+        }
+    }
+}
+
+#[test]
+fn index_changes_happy_path_shape_is_readable() {
+    // 这台开发机上开着 journal_log，能真跑通一遍。万一没有日志，就以
+    // 友好报错成立，不强求查到数据。
+    let (out, is_error) =
+        tools::dispatch("index_changes", &json!({ "max_results": 5 })).expect("合法入参不该报错");
+    let text = out["content"][0]["text"].as_str().unwrap();
+    if is_error {
+        assert!(text.contains("journal_log"), "{}", text);
+        return;
+    }
+    let parsed: Value = serde_json::from_str(text).unwrap();
+    assert!(parsed["count"].as_u64().unwrap() <= 5, "{}", text);
+    // 每条变更都要带 LLM 判断所需的字段，且动作值来自封闭集合。
+    for c in parsed["changes"].as_array().unwrap() {
+        assert!(c["date"].is_string() && c["path"].is_string());
+        assert!(c["action"].is_string(), "{}", c);
+        assert!(
+            ["created", "modified", "deleted", "renamed", "moved", "other"]
+                .contains(&c["action"].as_str().unwrap()),
+            "{}",
+            c
+        );
+        assert!(
+            c["action_text"].is_string(),
+            "原始的本地化动作串要保留 {}",
+            c
+        );
+        assert!(
+            ["file", "folder"].contains(&c["kind"].as_str().unwrap()),
+            "{}",
+            c
+        );
+    }
+    // 倒序：最新的在最前面。
+    let dates: Vec<&str> = parsed["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["date"].as_str().unwrap())
+        .collect();
+    let mut sorted = dates.clone();
+    sorted.sort_unstable();
+    sorted.reverse();
+    assert_eq!(dates, sorted, "应按时间倒序返回");
+}
+
 // ====================================================================
 // 端到端：真实 TCP 连接（只发不触达 Everything host 的请求，
 // 因此没有主程序环境的 CI 上也能跑）
@@ -785,7 +964,16 @@ fn end_to_end_over_real_tcp() {
     assert_eq!(resp["result"]["resultType"], "complete");
     assert_eq!(resp["result"]["ttlMs"], json!(protocol::TOOLS_LIST_TTL_MS));
     assert_eq!(resp["result"]["cacheScope"], "public");
-    assert_eq!(resp["result"]["tools"].as_array().unwrap().len(), 3);
+    assert_eq!(resp["result"]["tools"].as_array().unwrap().len(), 4);
+    // 清单里应当能看到新工具，且按现有顺序排在最后。
+    let names: Vec<&str> = resp["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names[3], "index_changes");
+    assert_eq!(resp["result"]["tools"][3]["name"], "index_changes");
 
     // modern 未知方法 → 404。
     let (head, _) = http_post(

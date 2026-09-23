@@ -124,8 +124,7 @@ pub fn create() -> PluginState {
 /// 调用者必须保证此时没有其他线程正在调用主程序数据库接口。
 pub unsafe fn destroy() {
     if let Some(s) = STATE.get() {
-        s.shutdown
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        s.shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     let host = Host::get();

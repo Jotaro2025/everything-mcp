@@ -30,6 +30,9 @@ an **MCP (Model Context Protocol)** server for LLMs (Claude Desktop, Cursor, …
   slash-unified, backslash-collapsed and trailing-slash-trimmed before it ever
   reaches Everything; invalid paths come back as `INVALID_PARAMS` with
   examples instead of silently returning zero results.
+- **Index change queries** — `index_changes` answers "what changed lately":
+  file/folder creations, modifications, deletions, renames and moves, newest
+  first, filterable by action, path prefix, name substring and time window.
 - **Installable** — one command produces x64 and x86 installers; Everything
   itself performs the install and uninstall (same mechanism as the official
   plugins).
@@ -52,6 +55,7 @@ everything-mcp/
 │   │   ├── diag.rs              Disk diagnostic log (%LOCALAPPDATA%\everything-mcp\plugin.log)
 │   │   ├── ffi_types.rs         #[repr(C)] types (Utf8Buf/DbHandle/FileInfoFd...)
 │   │   ├── host.rs              Host function pointer table + HOST/HOST_LOCK
+│   │   ├── journal.rs           Index journal (index-journal-*.txt) parsing & querying
 │   │   ├── search.rs            Async search → sync wait wrapper (main-thread marshaling)
 │   │   ├── main_thread.rs       Main-thread window + PostMessage task dispatch
 │   │   └── state.rs             Runtime state (lazily created db/query, shutdown flag)
@@ -60,7 +64,7 @@ everything-mcp/
 │       ├── protocol.rs          JSON-RPC 2.0 + dual-era MCP types (2024-11-05 / 2026-07-28)
 │       ├── server.rs            HTTP server on std::net; per-request version
 │       │                         negotiation and Origin validation
-│       ├── tools.rs             Tool implementations (search_in_folder/list_folder/count)
+│       ├── tools.rs             Tool implementations (search_in_folder/list_folder/count/index_changes)
 │       └── validate.rs          Argument validation & path normalization
 ├── installer/
 │   ├── build-installers.ps1     One-command packaging script (x64 + x86 installers)
@@ -142,8 +146,8 @@ Outputs (in `installer\dist\`):
 
 | Installer                            | Arch | Embedded plugin dll   |
 | ------------------------------------ | ---- | --------------------- |
-| `everything-mcp-1.0.0-x64-setup.exe` | x64  | `everything_mcp64.dll` |
-| `everything-mcp-1.0.0-x86-setup.exe` | x86  | `everything_mcp32.dll` |
+| `everything-mcp-1.1.0-x64-setup.exe` | x64  | `everything_mcp64.dll` |
+| `everything-mcp-1.1.0-x86-setup.exe` | x86  | `everything_mcp32.dll` |
 
 To install, run the installer for your architecture; Everything then shows its
 "Setup Plugin" dialog, where you click Install. Both installers can be
@@ -225,7 +229,7 @@ plugin is enabled (the Plugins → MCP page in Everything's options dialog, or
 `mcp_enabled=1` under `[everything_mcp64.dll]` in
 `%APPDATA%\Everything\Plugins.ini`).
 
-Once connected, the LLM discovers three tools automatically:
+Once connected, the LLM discovers four tools automatically:
 
 #### 1. `search_in_folder`
 
@@ -299,6 +303,42 @@ same `pattern` and `exclude` arguments as `search_in_folder`.
 { "folder": "D:\\source\\repos\\my-project", "pattern": "ext:rs" }
 ```
 
+#### 4. `index_changes`
+
+Query the Everything index journal: which files/folders were created,
+modified, deleted, renamed or moved, **most recent first**. It answers
+"what changed", not "what exists" — for the current state use
+`search_in_folder`.
+
+```json
+{ "action": "created", "path": "D:\\source\\repos\\my-project", "max_results": 50 }
+```
+
+- Needs Everything to log index changes: Options → Index → Journal →
+  Log changes (or `journal_log=1` under `[Everything]` in
+  `%APPDATA%\Everything\Everything.ini`, then restart Everything).
+  **When the switch is off this tool returns an error naming the exact
+  fix instead of an empty result** — so confirm it is on before the first
+  call.
+- `action` takes `created` / `modified` / `deleted` / `renamed` / `moved` /
+  `any` (default `any`). Everything distinguishes "renamed" (same folder)
+  from "moved" (different folder); each entry also carries `action_text`
+  with Everything's original localized action label, so locales the
+  interface is not set to still read sensibly.
+- `path` is a case-insensitive path prefix; `name` is a file/folder-name
+  substring (renames match the new name too). `since` / `until` bound the
+  window inclusively and accept `2026-09-23`, `2026-09-23 11:18`,
+  `2026-09-23 11:18:31` (space or `T` between date and time); a bare
+  number is read as unix seconds.
+- The response carries `count`, `truncated` (true when more matching
+  history exists beyond `max_results`), `days_searched` (how many daily
+  logs were read), `skipped_lines` (lines that failed to parse, usually a
+  half-written last line) and `log_directory` (the directory actually
+  read). The log is scanned backwards in chunks, so "the last N changes"
+  reads only a small piece of the file tail rather than the whole log.
+- History depth follows Everything's own retention: one log file per day,
+  and this tool reads back at most 92 days, up to 64 MiB per file.
+
 Argument rules shared by all three tools: `folder` must be an absolute path
 (`C:\…` or `\\server\share\…`). Quoted, forward-slash, doubled-backslash and
 trailing-slash spellings are normalized automatically; wildcards belong in
@@ -306,6 +346,11 @@ trailing-slash spellings are normalized automatically; wildcards belong in
 `-32602 INVALID_PARAMS` with the expected format and the received value in the
 message — so the LLM fixes the argument in one round trip instead of retrying
 with the same bad input.
+
+Every `index_changes` argument is optional, and the same validation rule
+applies: a bad `action`, an out-of-range `max_results` (1–2000), a
+malformed timestamp or `since` later than `until` all come back as
+`-32602` before any file is touched.
 
 #### Verifying by hand (curl)
 

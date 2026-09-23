@@ -25,6 +25,9 @@ Context Protocol）接口暴露给 LLM（如 Claude Desktop、Cursor 等）使�
 - **入参校验与路径规范化** —— `folder` 在触达 Everything 之前统一去包裹引号、
   正斜杠转反斜杠、折叠重复反斜杠、去尾斜杠；非法路径返回带范例的
   `INVALID_PARAMS`，而不是静默返回 0 结果。
+- **索引变更查询** —— `index_changes` 回答「最近变了什么」：文件/文件夹的
+  创建、修改、删除、重命名、移动，新的在前，支持按动作、路径前缀、名字
+  子串和时间窗过滤。
 - **可打包安装** —— 一条命令产出 x64 / x86 两个安装包；安装与卸载都由
   Everything 自己完成（与官方插件同一套机制）。
 
@@ -45,6 +48,7 @@ everything-mcp/
 │   │   ├── diag.rs             磁盘诊断日志（%LOCALAPPDATA%\everything-mcp\plugin.log）
 │   │   ├── ffi_types.rs        #[repr(C)] 类型（Utf8Buf/DbHandle/FileInfoFd...）
 │   │   ├── host.rs             host 函数指针表 + HOST/HOST_LOCK
+│   │   ├── journal.rs          索引日志（index-journal-*.txt）解析与查询
 │   │   ├── search.rs           异步搜索 → 同步等待的高层封装（主线程 marshaling）
 │   │   ├── main_thread.rs      主线程窗口 + PostMessage 任务分发
 │   │   └── state.rs            运行期状态（懒创建的 db/query、关闭标志）
@@ -52,7 +56,7 @@ everything-mcp/
 │       ├── mod.rs
 │       ├── protocol.rs         JSON-RPC 2.0 + MCP 双时代类型（2024-11-05 / 2026-07-28）
 │       ├── server.rs           基于 std::net 的 HTTP 服务，按请求协商协议版本、校验 Origin
-│       ├── tools.rs            工具实现（search_in_folder/list_folder/count）
+│       ├── tools.rs            工具实现（search_in_folder/list_folder/count/index_changes）
 │       └── validate.rs         入参校验与路径规范化（folder 规范化、pattern 校验）
 ├── installer/
 │   ├── build-installers.ps1    一键打包脚本（x64 / x86 两个安装包）
@@ -130,8 +134,8 @@ powershell -ExecutionPolicy Bypass -File build-installers.ps1
 
 | 安装包                              | 架构 | 内嵌插件 dll           |
 | ----------------------------------- | ---- | ---------------------- |
-| `everything-mcp-1.0.0-x64-setup.exe` | x64  | `everything_mcp64.dll` |
-| `everything-mcp-1.0.0-x86-setup.exe` | x86  | `everything_mcp32.dll` |
+| `everything-mcp-1.1.0-x64-setup.exe` | x64  | `everything_mcp64.dll` |
+| `everything-mcp-1.1.0-x86-setup.exe` | x86  | `everything_mcp32.dll` |
 
 安装：运行对应架构的安装包 → Everything 弹出「设置插件」对话框 → 点「安装」。
 两个安装包可以一起分发，`Plugins\` 下 `everything_mcp64.dll` 与
@@ -203,7 +207,7 @@ Everything 官方插件页：<https://www.voidtools.com/support/everything/plugi
 或 `%APPDATA%\Everything\Plugins.ini` 的 `[everything_mcp64.dll]` 小节里
 `mcp_enabled=1`）。
 
-接入后 LLM 会自动发现以下三个工具：
+接入后 LLM 会自动发现以下四个工具：
 
 #### 1. `search_in_folder`
 
@@ -271,10 +275,45 @@ gitignore），常见做法：
 { "folder": "D:\\source\\repos\\my-project", "pattern": "ext:rs" }
 ```
 
+#### 4. `index_changes`
+
+查询 Everything 的索引日志：哪些文件 / 文件夹被创建、修改、删除、重命名、
+移动，**新的在前**。它回答的是「最近变了什么」，而不是「现在有什么」——
+要知道当前状态用 `search_in_folder`。
+
+```json
+{ "action": "created", "path": "D:\\source\\repos\\my-project", "max_results": 50 }
+```
+
+- **需要 Everything 端开启日志记录**：选项 →「索引 → 日志 → 记录变更」
+  （或 `%APPDATA%\Everything\Everything.ini` 的 `[Everything]` 段里
+  `journal_log=1`，然后重启 Everything）。**没开时这个工具返回带确切
+  开关位置的友好错误提示**，而不是静默返回空结果 —— 所以第一次调用前
+  要先确认开关已打开。
+- `action` 取 `created` / `modified` / `deleted` / `renamed` / `moved` /
+  `any`（默认 `any`）。Everything 区分「重命名」（同一文件夹内）与
+  「移动」（换文件夹）；每条结果另带 `action_text` 保存 Everything 原始
+  输出的本地化动作串，界面语言看不懂的 locale 也能读懂。
+- `path` 是不区分大小写的路径前缀，`name` 是文件 / 文件夹名子串（重命名同样
+  匹配新名字）。`since` / `until` 给出时间窗（含端点），接受
+  `2026-09-23`、`2026-09-23 11:18`、`2026-09-23 11:18:31`（日期与时间之间
+  空格或 `T` 都行），裸数字按 Unix 秒处理。
+- 响应带 `count`、`truncated`（还有更多匹配的历史时说明被 `max_results`
+  截断了）、`days_searched`（回溯了几天的日志）、`skipped_lines`
+  （解析失败的行数，通常就是正在写入的半行）和 `log_directory`（实际读的
+  日志目录）。日志按天倒序分块读，「取最近 N 条」只读文件尾部一小段，
+  不会把整份日志穿完。
+- 深度受 Everything 侧的日志保留策略限制：日志按天一个文件，本工具最多
+  回溯 92 天、单文件最多 64 MiB。
+
 三个工具共用的入参规则：`folder` 必须是绝对路径（`C:\…` 或 `\\server\share\…`）。
 带引号、正斜杠、重复反斜杠、尾斜杠的写法会被自动规范化；通配符属于 `pattern`
 而不属于 `folder`。规范化失败时返回 `-32602 INVALID_PARAMS`，消息里带期望格式
 的范例与收到的原值 —— LLM 据此一次改对，不会带着坏参数反复重试。
+
+`index_changes` 的入参全部可选，校验规则同上：坏 `action`、越界的
+`max_results`（1–2000）、格式不对的时间戳、`since` 晚于 `until`，都在
+触达文件系统之前返回 `-32602`。
 
 #### 手动验证（curl）
 

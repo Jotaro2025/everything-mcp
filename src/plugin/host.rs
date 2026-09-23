@@ -50,7 +50,8 @@ pub type GetSettingStringFn =
 
 /// 设置写回（PM_SAVE_SETTINGS 时把配置写进主程序的设置输出流）。
 /// data 是 output_stream_t；键名与读取时一致（如 "mcp_port"）。
-pub type SetSettingIntFn = unsafe extern "system" fn(data: *mut c_void, name: *const u8, value: i32);
+pub type SetSettingIntFn =
+    unsafe extern "system" fn(data: *mut c_void, name: *const u8, value: i32);
 pub type SetSettingStringFn =
     unsafe extern "system" fn(data: *mut c_void, name: *const u8, value: *const u8);
 
@@ -63,11 +64,12 @@ pub type DbAddLocalRefFn = unsafe extern "system" fn() -> DbHandle;
 pub type DbReleaseFn = unsafe extern "system" fn(db: DbHandle);
 
 /// 数据库查询对象生命周期。
-pub type DbQueryEventProcFn =
-    unsafe extern "system" fn(user_data: *mut c_void, evtype: i32);
-pub type DbQueryCreateFn =
-    unsafe extern "system" fn(db: DbHandle, proc_: DbQueryEventProcFn, user_data: *mut c_void)
-        -> DbQueryHandle;
+pub type DbQueryEventProcFn = unsafe extern "system" fn(user_data: *mut c_void, evtype: i32);
+pub type DbQueryCreateFn = unsafe extern "system" fn(
+    db: DbHandle,
+    proc_: DbQueryEventProcFn,
+    user_data: *mut c_void,
+) -> DbQueryHandle;
 pub type DbQueryDestroyFn = unsafe extern "system" fn(q: DbQueryHandle);
 pub type DbCancelQueryFn = unsafe extern "system" fn(q: DbQueryHandle) -> i32;
 
@@ -145,8 +147,11 @@ pub type DbFindFirstFileFn = unsafe extern "system" fn(
     filename_cbuf: *mut Utf8Buf,
     fd: *mut FileInfoFd,
 ) -> DbFindHandle;
-pub type DbFindNextFileFn =
-    unsafe extern "system" fn(fh: DbFindHandle, filename_cbuf: *mut Utf8Buf, fd: *mut FileInfoFd) -> i32;
+pub type DbFindNextFileFn = unsafe extern "system" fn(
+    fh: DbFindHandle,
+    filename_cbuf: *mut Utf8Buf,
+    fd: *mut FileInfoFd,
+) -> i32;
 pub type DbFindCloseFn = unsafe extern "system" fn(fh: DbFindHandle);
 pub type DbFindGetCountFn = unsafe extern "system" fn(fh: DbFindHandle) -> usize;
 
@@ -200,14 +205,8 @@ pub type HCURSOR = *mut c_void;
 pub type LPVOID = *mut c_void;
 #[allow(non_camel_case_types)]
 /// Win32 窗口过程函数指针 —— 与 user32 一致。
-pub type WNDPROC = Option<
-    unsafe extern "system" fn(
-        hwnd: HWND,
-        msg: u32,
-        wparam: usize,
-        lparam: isize,
-    ) -> isize,
->;
+pub type WNDPROC =
+    Option<unsafe extern "system" fn(hwnd: HWND, msg: u32, wparam: usize, lparam: isize) -> isize>;
 
 pub type OsRegisterClassFn = unsafe extern "system" fn(
     style: UINT,
@@ -248,12 +247,11 @@ pub type OsCreateWindowFn = unsafe extern "system" fn(
 
 /// 在 Everything 选项对话框中注册一个插件设置页（PM_ADD_OPTIONS_PAGES 时调用）。
 /// 第一个参数是 PM_ADD_OPTIONS_PAGES 的 data（不透明，直接透传）。
-pub type UiOptionsAddPluginPageFn =
-    unsafe extern "system" fn(
-        add_custom_page: *mut c_void,
-        user_data: *mut c_void,
-        name: *const u8,
-    ) -> *mut c_void;
+pub type UiOptionsAddPluginPageFn = unsafe extern "system" fn(
+    add_custom_page: *mut c_void,
+    user_data: *mut c_void,
+    name: *const u8,
+) -> *mut c_void;
 
 pub type OsCreateCheckboxFn = unsafe extern "system" fn(
     parent: HWND,
@@ -262,27 +260,15 @@ pub type OsCreateCheckboxFn = unsafe extern "system" fn(
     checked: i32,
     text: *const u8,
 ) -> HWND;
-pub type OsCreateStaticFn = unsafe extern "system" fn(
-    parent: HWND,
-    id: i32,
-    extra_style: DWORD,
-    text: *const u8,
-) -> HWND;
-pub type OsCreateEditFn = unsafe extern "system" fn(
-    parent: HWND,
-    id: i32,
-    extra_style: DWORD,
-    text: *const u8,
-) -> HWND;
+pub type OsCreateStaticFn =
+    unsafe extern "system" fn(parent: HWND, id: i32, extra_style: DWORD, text: *const u8) -> HWND;
+pub type OsCreateEditFn =
+    unsafe extern "system" fn(parent: HWND, id: i32, extra_style: DWORD, text: *const u8) -> HWND;
 /// 数字编辑框 —— `number` 是 __int64。
 pub type OsCreateNumberEditFn =
     unsafe extern "system" fn(parent: HWND, id: i32, extra_style: DWORD, number: i64) -> HWND;
-pub type OsCreateButtonFn = unsafe extern "system" fn(
-    parent: HWND,
-    id: i32,
-    extra_style: DWORD,
-    text: *const u8,
-) -> HWND;
+pub type OsCreateButtonFn =
+    unsafe extern "system" fn(parent: HWND, id: i32, extra_style: DWORD, text: *const u8) -> HWND;
 pub type OsAddTooltipFn =
     unsafe extern "system" fn(tooltip: HWND, parent: HWND, id: i32, text: *const u8);
 pub type OsSetDlgRectFn =
@@ -357,7 +343,8 @@ pub struct Host {
     pub os_enable_or_disable_dlg_item: Option<OsEnableOrDisableDlgItemFn>,
     pub os_get_logical_wide: Option<OsGetLogicalWideFn>,
     pub os_get_logical_high: Option<OsGetLogicalHighFn>,
-    pub os_expand_dialog_text_logical_wide_no_prefix: Option<OsExpandDialogTextLogicalWideNoPrefixFn>,
+    pub os_expand_dialog_text_logical_wide_no_prefix:
+        Option<OsExpandDialogTextLogicalWideNoPrefixFn>,
 }
 
 /// `get_proc_address` 回调的类型。
@@ -388,7 +375,11 @@ impl Host {
             ($field:ident, $name:literal) => {{
                 // concat! 要求字面量参数 —— 因此 $name 必须是字符串字面量。
                 let p = unsafe { get_proc_address(concat!($name, "\0").as_ptr()) };
-                super::diag::write(&format!("  resolve {}: {}", $name, if p.is_null() { "MISSING" } else { "ok" }));
+                super::diag::write(&format!(
+                    "  resolve {}: {}",
+                    $name,
+                    if p.is_null() { "MISSING" } else { "ok" }
+                ));
                 if p.is_null() {
                     return Err($name);
                 }
@@ -447,7 +438,10 @@ impl Host {
         opt!(db_query_get_result_count, "db_query_get_result_count");
         opt!(db_query_get_result_name, "db_query_get_result_name");
         opt!(db_query_get_result_path, "db_query_get_result_path");
-        opt!(db_query_get_result_indexed_fd, "db_query_get_result_indexed_fd");
+        opt!(
+            db_query_get_result_indexed_fd,
+            "db_query_get_result_indexed_fd"
+        );
         opt!(db_query_is_folder_result, "db_query_is_folder_result");
         // 内置属性指针 —— db_query_search2 的 sort_property_type 必须用它
         // （传 NULL 会崩）。按强制项解析：拿不到就不该执行搜索。
@@ -482,7 +476,10 @@ impl Host {
         opt!(os_set_dlg_rect, "os_set_dlg_rect");
         opt!(os_set_dlg_text, "os_set_dlg_text");
         opt!(os_get_dlg_text, "os_get_dlg_text");
-        opt!(os_enable_or_disable_dlg_item, "os_enable_or_disable_dlg_item");
+        opt!(
+            os_enable_or_disable_dlg_item,
+            "os_enable_or_disable_dlg_item"
+        );
         opt!(os_get_logical_wide, "os_get_logical_wide");
         opt!(os_get_logical_high, "os_get_logical_high");
         opt!(
@@ -497,7 +494,8 @@ impl Host {
 
     /// 取全局 host 表的引用。必须在 PM_INIT 之后调用。
     pub fn get() -> &'static Host {
-        HOST.get().expect("HOST not initialized; PM_INIT not received")
+        HOST.get()
+            .expect("HOST not initialized; PM_INIT not received")
     }
 
     /// 输出一行调试日志到主程序的调试输出窗口。

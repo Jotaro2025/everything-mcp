@@ -115,6 +115,98 @@ fn u64_arg(args: &Value, key: &str, default: u64) -> Result<u64, (i32, String)> 
     }
 }
 
+/// `index_changes` 的默认返回条数。
+const INDEX_CHANGES_DEFAULT: u64 = 50;
+
+/// `index_changes` 的返回条数上限。日志一行一条，2000 条已是很长的排查
+/// 历史；再加限是为了不让一次调用把整天的日志啃穿。
+const INDEX_CHANGES_LIMIT: u64 = 2000;
+
+/// 把 `action` 参数映射成 journal 的动作枚举。
+///
+/// 接收 `Action::as_str()` 的全部取值外加 `any`（不限）。空串与缺省都视为
+/// 不限 —— LLM 常传 `""` 表示「不过滤」。顺手收几个同义字：LLM 偶尔把
+/// 动作写成动词原形或 updated/removed。
+fn action_arg(args: &Value) -> Result<Option<plugin::journal::Action>, (i32, String)> {
+    let raw = match args.get("action") {
+        None | Some(Value::Null) => return Ok(None),
+        Some(Value::String(s)) => s.as_str(),
+        Some(v) => {
+            return Err((
+                INVALID_PARAMS,
+                format!(
+                "'action' must be one of created|modified|deleted|renamed|moved|any; received {}",
+                v
+            ),
+            ))
+        }
+    };
+    let raw = raw.trim();
+    if raw.is_empty() || raw.eq_ignore_ascii_case("any") {
+        return Ok(None);
+    }
+    use plugin::journal::Action::*;
+    let action = match raw.to_ascii_lowercase().as_str() {
+        "created" | "create" | "new" => Created,
+        "modified" | "modify" | "updated" | "changed" => Modified,
+        "deleted" | "delete" | "removed" => Deleted,
+        "renamed" | "rename" => Renamed,
+        "moved" | "move" => Moved,
+        _ => {
+            return Err((
+                INVALID_PARAMS,
+                format!(
+                "'action' must be one of created|modified|deleted|renamed|moved|any; received {:?}",
+                raw
+            ),
+            ))
+        }
+    };
+    Ok(Some(action))
+}
+
+/// `index_changes` 的时间参数规范化。缺省/空串都视为不限。
+fn timestamp_arg(args: &Value, key: &str) -> Result<Option<String>, (i32, String)> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) if s.trim().is_empty() => Ok(None),
+        Some(Value::String(s)) => plugin::journal::normalize_timestamp(s)
+            .map(Some)
+            .map_err(|e| (INVALID_PARAMS, format!("'{}': {}", key, e))),
+        Some(v) => Err((
+            INVALID_PARAMS,
+            format!(
+                "'{}' must be a timestamp string like '2026-09-23 11:18'; received {}",
+                key, v
+            ),
+        )),
+    }
+}
+
+/// `index_changes` 的可选字符串子串参数（`path` / `name`）。
+fn optional_text_arg(args: &Value, key: &str) -> Result<Option<String>, (i32, String)> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) if s.trim().is_empty() => Ok(None),
+        Some(Value::String(s)) => {
+            if s.chars().any(|c| c.is_control()) {
+                return Err((
+                    INVALID_PARAMS,
+                    format!(
+                        "'{}' must not contain control characters; received {:?}",
+                        key, s
+                    ),
+                ));
+            }
+            Ok(Some(s.trim().to_string()))
+        }
+        Some(v) => Err((
+            INVALID_PARAMS,
+            format!("'{}' must be a string; received {}", key, v),
+        )),
+    }
+}
+
 /// 分发工具调用。`name` 是工具名，`args` 是参数对象。
 pub fn dispatch(name: &str, args: &Value) -> Result<ToolOutput, (i32, String)> {
     match name {
@@ -222,6 +314,94 @@ pub fn dispatch(name: &str, args: &Value) -> Result<ToolOutput, (i32, String)> {
             }
         }
 
+        "index_changes" => {
+            // 所有入参先规范化完再触达插件：坏 action / 坏时间格式在这里就
+            // 报 INVALID_PARAMS，消息里带范例，LLM 一次就能改对。
+            let action = action_arg(args)?;
+            let path = optional_text_arg(args, "path")?;
+            let name = optional_text_arg(args, "name")?;
+            let since = timestamp_arg(args, "since")?;
+            let until = timestamp_arg(args, "until")?;
+            let max_results = u64_arg(args, "max_results", INDEX_CHANGES_DEFAULT)? as usize;
+
+            if max_results == 0 {
+                return Err((
+                    INVALID_PARAMS,
+                    format!(
+                        "'max_results' must be at least 1 (and at most {}); received 0",
+                        INDEX_CHANGES_LIMIT
+                    ),
+                ));
+            }
+            if max_results as u64 > INDEX_CHANGES_LIMIT {
+                return Err((
+                    INVALID_PARAMS,
+                    format!(
+                        "'max_results' must not exceed {}; received {}. \
+                         Narrow the query with 'action', 'path', 'name' or a 'since'/'until' window instead.",
+                        INDEX_CHANGES_LIMIT, max_results
+                    ),
+                ));
+            }
+            // since 晚于 until 是最容易犯的错：放过它只会得到 0 条且无从诊断。
+            if let (Some(s), Some(u)) = (&since, &until) {
+                if s > u {
+                    return Err((
+                        INVALID_PARAMS,
+                        format!("'since' ({}) must not be later than 'until' ({})", s, u),
+                    ));
+                }
+            }
+
+            let filter = plugin::journal::Filter {
+                action,
+                path,
+                name,
+                since,
+                until,
+                max_results,
+            };
+
+            match plugin::journal::query(&filter) {
+                Ok(outcome) => {
+                    let changes: Vec<Value> = outcome
+                        .changes
+                        .iter()
+                        .map(|c| {
+                            json!({
+                                "journal_id": c.journal_id,
+                                "change_id": c.change_id,
+                                "date": c.date,
+                                "action": c.action.as_str(),
+                                "action_text": c.action_text,
+                                "kind": if c.is_folder { "folder" } else { "file" },
+                                "path": c.path,
+                                "name": c.name(),
+                                "new_path": c.new_path,
+                            })
+                        })
+                        .collect();
+                    let text = serde_json::to_string_pretty(&json!({
+                        "action": filter.action.map(|a| a.as_str()),
+                        "path": filter.path,
+                        "name": filter.name,
+                        "since": filter.since,
+                        "until": filter.until,
+                        "count": outcome.count,
+                        "truncated": outcome.truncated,
+                        "days_searched": outcome.days_searched,
+                        "skipped_lines": outcome.skipped_lines,
+                        "log_directory": outcome.log_directory,
+                        "changes": changes,
+                    }))
+                    .unwrap_or_else(|_| "{\"error\":\"serialization failed\"}".into());
+
+                    Ok((content_text(&text), false))
+                }
+                Err(e) => Ok((content_text(&format!("index_changes error: {}", e)), true)),
+            }
+        }
+
         other => Err((METHOD_NOT_FOUND, format!("unknown tool: {}", other))),
     }
 }
@@ -302,5 +482,96 @@ mod tests {
             pattern_arg(&json!({ "pattern": "src/**/*.cs" })).unwrap(),
             "src/**/*.cs"
         );
+    }
+
+    #[test]
+    fn action_arg_maps_synonyms_and_rejects_junk() {
+        use plugin::journal::Action::*;
+        // 缺省 / 空串 / any 都表示不限。
+        assert_eq!(action_arg(&json!({})).unwrap(), None);
+        assert_eq!(action_arg(&json!({ "action": null })).unwrap(), None);
+        assert_eq!(action_arg(&json!({ "action": "" })).unwrap(), None);
+        assert_eq!(action_arg(&json!({ "action": "any" })).unwrap(), None);
+        assert_eq!(action_arg(&json!({ "action": "ANY" })).unwrap(), None);
+
+        // 大小写不敏感；顺手收几个 LLM 常写的同义字与动词原形。
+        assert_eq!(
+            action_arg(&json!({ "action": "created" })).unwrap(),
+            Some(Created)
+        );
+        assert_eq!(
+            action_arg(&json!({ "action": "Deleted" })).unwrap(),
+            Some(Deleted)
+        );
+        assert_eq!(
+            action_arg(&json!({ "action": "modified" })).unwrap(),
+            Some(Modified)
+        );
+        assert_eq!(
+            action_arg(&json!({ "action": "updated" })).unwrap(),
+            Some(Modified)
+        );
+        assert_eq!(
+            action_arg(&json!({ "action": "removed" })).unwrap(),
+            Some(Deleted)
+        );
+        assert_eq!(
+            action_arg(&json!({ "action": "rename" })).unwrap(),
+            Some(Renamed)
+        );
+        assert_eq!(
+            action_arg(&json!({ "action": "move" })).unwrap(),
+            Some(Moved)
+        );
+
+        // 消息必须列出合法值，让 LLM 一次改对。
+        let e = action_arg(&json!({ "action": "destoryed" })).unwrap_err();
+        assert_eq!(e.0, INVALID_PARAMS);
+        assert!(
+            e.1.contains("created") && e.1.contains("renamed"),
+            "{}",
+            e.1
+        );
+        let e = action_arg(&json!({ "action": ["created"] })).unwrap_err();
+        assert_eq!(e.0, INVALID_PARAMS);
+    }
+
+    #[test]
+    fn timestamp_arg_normalizes_and_rejects_bad_types() {
+        assert_eq!(timestamp_arg(&json!({}), "since").unwrap(), None);
+        assert_eq!(
+            timestamp_arg(&json!({ "since": "  " }), "since").unwrap(),
+            None
+        );
+        assert_eq!(
+            timestamp_arg(&json!({ "since": "2026-09-23" }), "since").unwrap(),
+            Some("2026-09-23 00:00:00".to_string())
+        );
+
+        let e = timestamp_arg(&json!({ "until": "昨天" }), "until").unwrap_err();
+        assert_eq!(e.0, INVALID_PARAMS);
+        assert!(e.1.contains("until"), "{}", e.1);
+        // 数字会被 literal 的 normalize_timestamp 当 unix 秒收下，所以类型
+        // 错误用小数来试。
+        let e = timestamp_arg(&json!({ "since": 3.5 }), "since").unwrap_err();
+        assert_eq!(e.0, INVALID_PARAMS);
+    }
+
+    #[test]
+    fn optional_text_arg_trims_and_rejects_control_chars() {
+        assert_eq!(optional_text_arg(&json!({}), "path").unwrap(), None);
+        assert_eq!(
+            optional_text_arg(&json!({ "name": "   " }), "name").unwrap(),
+            None
+        );
+        assert_eq!(
+            optional_text_arg(&json!({ "name": "  readme  " }), "name").unwrap(),
+            Some("readme".to_string())
+        );
+        let e = optional_text_arg(&json!({ "path": "a\tb" }), "path").unwrap_err();
+        assert_eq!(e.0, INVALID_PARAMS);
+        assert!(e.1.contains("path"), "{}", e.1);
+        let e = optional_text_arg(&json!({ "path": 42 }), "path").unwrap_err();
+        assert_eq!(e.0, INVALID_PARAMS);
     }
 }

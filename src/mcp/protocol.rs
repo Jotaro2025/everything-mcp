@@ -200,7 +200,7 @@ pub fn make_initialize_result(params: &Value) -> Value {
         },
         "serverInfo": {
             "name": "everything-mcp",
-            "version": "1.0.0"
+            "version": "1.1.0"
         }
     });
     with_result_type(result, is_modern_version(version))
@@ -223,10 +223,10 @@ pub fn make_discover_result() -> Value {
         "_meta": {
             "io.modelcontextprotocol/serverInfo": {
                 "name": "everything-mcp",
-                "version": "1.0.0"
+                "version": "1.1.0"
             }
         },
-        "instructions": "Folder-scoped Everything file search. Use search_in_folder with an absolute folder path plus Everything search syntax; list_folder for immediate children; count for totals only. Search results are truncated by max_results and carry a separate 'total' count of all matches found.",
+        "instructions": "Folder-scoped Everything file search. Use search_in_folder with an absolute folder path plus Everything search syntax; list_folder for immediate children; count for totals only; index_changes to read the index journal (created/modified/deleted/renamed); it needs journal_log enabled in Everything and returns an actionable error when it is not. Search results are truncated by max_results and carry a separate 'total' count of all matches found.",
         "ttlMs": DISCOVER_TTL_MS,
         "cacheScope": CACHE_SCOPE_PUBLIC
     })
@@ -304,6 +304,41 @@ pub fn make_tools_list() -> Value {
                         }
                     },
                     "required": ["folder"]
+                }
+            },
+            {
+                "name": "index_changes",
+                "description": "Query the Everything index journal: which files/folders were created, modified, deleted, renamed or moved, most recent first. This answers 'what changed recently' from Everything's change history — it does not describe the current index state (use search_in_folder for that). Requires 'journal_log' to be enabled in Everything (Tools > Options > Index > Journal > Log changes); when it is off the tool returns an error that says so. Results are capped by max_results and carry 'truncated' when more matching history exists further back. Each entry's 'action_text' holds Everything's original localized action label, so an unfamiliar locale still reads sensibly.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "action": {
+                            "type": "string",
+                            "enum": ["created", "modified", "deleted", "renamed", "moved", "any"],
+                            "description": "Filter by change type. 'any' (default) returns everything. Everything distinguishes 'renamed' (same folder) from 'moved' (different folder); 'action_text' in each result carries the original localized label."
+                        },
+                        "path": {
+                            "type": "string",
+                            "description": "Only report changes at or under this folder, matched as a case-insensitive path prefix, e.g. D:\\source\\repos\\myproject. Omit to cover the whole index."
+                        },
+                        "name": {
+                            "type": "string",
+                            "description": "Case-insensitive substring of the file/folder name; for renames the new name is matched too."
+                        },
+                        "since": {
+                            "type": "string",
+                            "description": "Lower bound (inclusive) as '2026-09-23', '2026-09-23 11:18' or '2026-09-23 11:18:31' (space or 'T' between date and time); a bare number is read as unix seconds. Omit for no lower bound."
+                        },
+                        "until": {
+                            "type": "string",
+                            "description": "Upper bound (inclusive), same formats as 'since'. Omit for no upper bound."
+                        },
+                        "max_results": {
+                            "type": "integer",
+                            "description": "Maximum number of changes to return, newest first (default 50).",
+                            "default": 50
+                        }
+                    }
                 }
             }
         ]
