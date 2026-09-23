@@ -226,7 +226,7 @@ pub fn make_discover_result() -> Value {
                 "version": "1.1.2"
             }
         },
-        "instructions": "Folder-scoped Everything file search. Use search_in_folder with an absolute folder path plus Everything search syntax; list_folder for immediate children; count for totals only; index_changes to read the index journal (created/modified/deleted/renamed); it needs journal_log enabled in Everything and returns an actionable error when it is not. search_everywhere finds files/folders by NAME across the whole index without a folder — for when you know what it is called but not where it lives; it is gated by the server's global-search policy ('deny' rejects every call with GLOBAL_SEARCH_DISABLED, 'review' requires the user to confirm first, 'allow' serves calls directly) and its pattern must be at least 2 characters with no 'content:'. search_in_folder results carry size and modified/created timestamps, can be sorted (sort=name|path|size|modified|created, descending=true for newest/largest first), and support case/whole-word/regex matching. Results are capped by max_results and carry a separate 'total' count of all matches found — when count < total, page through with 'offset'.",
+        "instructions": "Folder-scoped Everything file search. Search scope follows Everything's index: local drives are included automatically, but a network share is only searchable after being added in Tools > Options > Indexes > Folders — an un-indexed share yields 0 results, not an error. Use search_in_folder with an absolute folder path (a drive path like D:\\source\\repos\\myproject or a UNC path like \\\\server\\share\\project) plus Everything search syntax; list_folder for immediate children; count for totals only; index_changes to read the index journal (created/modified/deleted/renamed); it needs journal_log enabled in Everything and returns an actionable error when it is not. search_everywhere finds files/folders by NAME across the whole index without a folder — for when you know what it is called but not where it lives; it is gated by the server's global-search policy ('deny' rejects every call with GLOBAL_SEARCH_DISABLED, 'review' requires the user to confirm first, 'allow' serves calls directly) and its pattern must be at least 2 characters with no 'content:'. search_in_folder results carry size and modified/created timestamps, can be sorted (sort=name|path|size|modified|created, descending=true for newest/largest first), and support case/whole-word/regex matching. Results are capped by max_results and carry a separate 'total' count of all matches found — when count < total, page through with 'offset'.",
         "ttlMs": DISCOVER_TTL_MS,
         "cacheScope": CACHE_SCOPE_PUBLIC
     })
@@ -396,13 +396,13 @@ pub fn make_tools_list(mode: GlobalSearchMode) -> Value {
         "tools": [
             {
                 "name": "search_in_folder",
-                "description": "Search files/folders recursively under a specific folder using Everything search syntax. Prefer this over global search when working within a project directory. This is not shell glob: use '*.rs', not '**/*.rs' (a leading '**/' is stripped for you); exclude matches with a '!' prefix (e.g. 'ext:rs !test') or the 'exclude' parameter (e.g. ['\\obj\\', '\\.git\\'] to drop build/VCS noise); 'content:\"fn main\"' searches file contents (it works with no content index on the Everything side, but an unfiltered content search over a large tree is slow enough to time out — narrow it with 'ext:', a subfolder or 'exclude', or raise 'timeout_ms'). Each result carries 'size' plus 'modified'/'created' (ISO 8601 UTC). The response reports both 'count' (entries returned, capped by max_results) and 'total' (all matches found) — when they differ, page through with 'offset'. Results are sorted by 'sort' (default name ascending).",
+                "description": "Search files/folders recursively under a specific folder using Everything search syntax. Prefer this over global search when working within a project directory. This is not shell glob: use '*.rs', not '**/*.rs' (a leading '**/' is stripped for you); exclude matches with a '!' prefix (e.g. 'ext:rs !test') or the 'exclude' parameter (e.g. ['\\obj\\', '\\.git\\'] to drop build/VCS noise); 'content:\"fn main\"' searches file contents (it works with no content index on the Everything side, but an unfiltered content search over a large tree is slow enough to time out — narrow it with 'ext:', a subfolder or 'exclude', or raise 'timeout_ms'). Each result carries 'size' plus 'modified'/'created' (ISO 8601 UTC). The response reports both 'count' (entries returned, capped by max_results) and 'total' (all matches found) — when they differ, page through with 'offset'. Results are sorted by 'sort' (default name ascending). Search scope follows Everything's index: local drives are included automatically, but a network share is only searchable after being added in Tools > Options > Indexes > Folders — an un-indexed share yields 0 results, not an error.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "folder": {
                             "type": "string",
-                            "description": "Absolute path to the folder to search in, e.g. D:\\\\source\\\\repos\\\\myproject"
+                            "description": "Absolute path to the folder to search in, e.g. D:\\\\source\\\\repos\\\\myproject, or an indexed UNC path like \\\\server\\share\\project"
                         },
                         "pattern": {
                             "type": "string",
@@ -460,11 +460,11 @@ pub fn make_tools_list(mode: GlobalSearchMode) -> Value {
             },
             {
                 "name": "list_folder",
-                "description": "List immediate children of a folder (non-recursive). Returns both files and sub-folders; folder entries always report size 0 (Everything does not compute directory sizes). Each entry also carries 'modified'/'created' (ISO 8601 UTC). Use search_in_folder when you need the whole tree. Pass 'exclude' to skip children such as '.git', 'obj', 'node_modules'.",
+                "description": "List immediate children of a folder (non-recursive). Returns both files and sub-folders; folder entries always report size 0 (Everything does not compute directory sizes). Each entry also carries 'modified'/'created' (ISO 8601 UTC). Use search_in_folder when you need the whole tree. Pass 'exclude' to skip children such as '.git', 'obj', 'node_modules'. Search scope follows Everything's index: local drives are included automatically, but a network share is only searchable after being added in Tools > Options > Indexes > Folders — an un-indexed share yields 0 results, not an error.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "folder": { "type": "string", "description": "Absolute folder path" },
+                        "folder": { "type": "string", "description": "Absolute folder path, e.g. D:\\source\\repos\\myproject, or an indexed UNC path like \\\\server\\share\\project" },
                         "exclude": {
                             "type": ["string", "array"],
                             "items": { "type": "string" },
@@ -480,7 +480,7 @@ pub fn make_tools_list(mode: GlobalSearchMode) -> Value {
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "folder": { "type": "string" },
+                        "folder": { "type": "string", "description": "Absolute path to the folder to count in, e.g. D:\\source\\repos\\myproject, or an indexed UNC path like \\\\server\\share\\project" },
                         "pattern": { "type": "string", "default": "" },
                         "exclude": {
                             "type": ["string", "array"],
@@ -534,7 +534,7 @@ pub fn make_tools_list(mode: GlobalSearchMode) -> Value {
                     "properties": {
                         "path": {
                             "type": "string",
-                            "description": "Absolute path to the file to read, e.g. D:\\\\source\\\\repos\\\\myproject\\\\README.md. Wildcards are rejected — use search_in_folder to find files by pattern."
+                            "description": "Absolute path to the file to read, e.g. D:\\\\source\\\\repos\\\\myproject\\\\README.md, or a file on an indexed UNC share like \\\\server\\share\\project\\\\README.md. Wildcards are rejected — use search_in_folder to find files by pattern."
                         },
                         "start_line": {
                             "type": "integer",
@@ -564,7 +564,7 @@ pub fn make_tools_list(mode: GlobalSearchMode) -> Value {
                         },
                         "folder": {
                             "type": "string",
-                            "description": "Absolute path to the folder to search in, e.g. D:\\\\source\\\\repos\\\\myproject. Always recurse into subfolders."
+                            "description": "Absolute path to the folder to search in, e.g. D:\\\\source\\\\repos\\\\myproject, or an indexed UNC path like \\\\server\\share\\project. Always recurse into subfolders."
                         },
                         "filter": {
                             "type": "string",

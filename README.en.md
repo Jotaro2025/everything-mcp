@@ -618,7 +618,11 @@ follow-up work.
   and `offset` paging.
 
 Argument rules shared by all three tools: `folder` must be an absolute path
-(`C:\…` or `\\server\share\…`). Quoted, forward-slash, doubled-backslash and
+(`C:\…` or `\\server\share\…`) — UNC network shares are on equal footing with
+local drives. Search scope follows Everything's index: local drives are
+included automatically, while a network share must be added under
+Tools → Options → Indexes → Folders first — an un-indexed share yields
+0 results, not an error. Quoted, forward-slash, doubled-backslash and
 trailing-slash spellings are normalized automatically; wildcards belong in
 `pattern`, not in `folder`. A path that cannot be normalized comes back as
 `-32602 INVALID_PARAMS` with the expected format and the received value in the

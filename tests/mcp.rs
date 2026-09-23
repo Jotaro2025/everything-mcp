@@ -257,6 +257,52 @@ fn search_description_warns_against_shell_glob_and_documents_truncation() {
 }
 
 #[test]
+fn folder_params_document_unc_share_paths() {
+    // 下午有 LLM 不会搜共享文件夹 —— 五个 folder / path 参数的说明都必须
+    // 带 UNC 范例，模型才会知道 `\\server\share\project` 是合法入参。
+    let list = protocol::make_tools_list(protocol::GlobalSearchMode::Deny);
+    for (tool, param) in [
+        (0, "folder"),
+        (1, "folder"),
+        (2, "folder"),
+        (4, "path"),
+        (5, "folder"),
+    ] {
+        let desc = list["tools"][tool]["inputSchema"]["properties"][param]["description"]
+            .as_str()
+            .unwrap();
+        assert!(desc.contains("indexed UNC"), "desc: {desc}");
+        assert!(desc.contains(r"\\server\share"), "desc: {desc}");
+    }
+}
+
+#[test]
+fn search_scope_documents_the_index_premise() {
+    // 范围 = Everything 的索引：共享盘要先加进「选项 → 索引 → 文件夹」，
+    // 没加的表现是 0 结果而不是报错。这句要进 search_in_folder / list_folder
+    // 的描述和 discover instructions —— 不写清，LLM 会像下午那次一样
+    // net view 逐个共享试。
+    let list = protocol::make_tools_list(protocol::GlobalSearchMode::Deny);
+    let instructions = protocol::make_discover_result()["instructions"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let docs = [
+        list["tools"][0]["description"].as_str().unwrap().to_string(),
+        list["tools"][1]["description"].as_str().unwrap().to_string(),
+        instructions,
+    ];
+    for d in &docs {
+        assert!(
+            d.contains("Search scope follows Everything's index"),
+            "desc: {d}"
+        );
+        assert!(d.contains("Tools > Options > Indexes > Folders"), "desc: {d}");
+        assert!(d.contains("0 results, not an error"), "desc: {d}");
+    }
+}
+
+#[test]
 fn read_file_description_documents_the_contract() {
     let list = protocol::make_tools_list(protocol::GlobalSearchMode::Deny);
     let tool = &list["tools"][4];

@@ -526,7 +526,10 @@ gitignore），常见做法：
 - 结果每条带 `name` / `path` / `kind` / `size` / `modified` / `created`
   （时间戳为 ISO 8601 UTC），同样有 `count` / `total` 配对，用 `offset` 翻页。
 
-三个工具共用的入参规则：`folder` 必须是绝对路径（`C:\…` 或 `\\server\share\…`）。
+三个工具共用的入参规则：`folder` 必须是绝对路径（`C:\…` 或 `\\server\share\…`），
+UNC 网络共享与本地盘同权。搜索范围以 Everything 的索引为准 —— 本地盘自动全收，
+网络共享要先在 Everything 的「工具 → 选项 → 索引 → 文件夹」里添加；没加进索引的
+共享不会出现在任何结果里（返回 0 条结果，而不是报错）。
 带引号、正斜杠、重复反斜杠、尾斜杠的写法会被自动规范化；通配符属于 `pattern`
 而不属于 `folder`。规范化失败时返回 `-32602 INVALID_PARAMS`，消息里带期望格式
 的范例与收到的原值 —— LLM 据此一次改对，不会带着坏参数反复重试。
