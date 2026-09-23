@@ -110,10 +110,16 @@ pub mod db_event {
     pub const SORT_COMPLETE: i32 = 6;
 }
 
-/// 文件夹搜索默认排序常量（PropertyType = 0 表示 NAME）。
-/// 主程序中通过 `property_get_builtin_type(0)` 可取得对应的 property_t 指针，
-/// 但我们这里只用空指针跳过排序，让主程序按默认返回。
+/// 内置属性类型 ID（`property_get_builtin_type` 的入参）。
+///
+/// 与 everything_plugin.h 第 189–201 行一致，SDK 文档 4.2 节确认这些 ID 稳定。
+/// 用作 `db_query_search2` 的 `sort_property_type`（排序键）—— 主排序键必须是
+/// 有效指针，不能传 NULL（见 host.rs 的 DbQuerySearchFn 文档）。
 pub const PROPERTY_TYPE_NAME: i32 = 0;
+pub const PROPERTY_TYPE_PATH: i32 = 1;
+pub const PROPERTY_TYPE_SIZE: i32 = 2;
+pub const PROPERTY_TYPE_DATE_MODIFIED: i32 = 5;
+pub const PROPERTY_TYPE_DATE_CREATED: i32 = 6;
 
 /// 主程序配置大小显示风格常量（来自 everything_plugin.h）。
 /// SIZE_STANDARD_JEDEC = 0 是默认二进制风格（KB/MB/GB）。

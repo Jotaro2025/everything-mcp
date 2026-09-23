@@ -226,7 +226,7 @@ pub fn make_discover_result() -> Value {
                 "version": "1.1.2"
             }
         },
-        "instructions": "Folder-scoped Everything file search. Use search_in_folder with an absolute folder path plus Everything search syntax; list_folder for immediate children; count for totals only; index_changes to read the index journal (created/modified/deleted/renamed); it needs journal_log enabled in Everything and returns an actionable error when it is not. Search results are truncated by max_results and carry a separate 'total' count of all matches found.",
+        "instructions": "Folder-scoped Everything file search. Use search_in_folder with an absolute folder path plus Everything search syntax; list_folder for immediate children; count for totals only; index_changes to read the index journal (created/modified/deleted/renamed); it needs journal_log enabled in Everything and returns an actionable error when it is not. search_in_folder results carry size and modified/created timestamps, can be sorted (sort=name|path|size|modified|created, descending=true for newest/largest first), and support case/whole-word/regex matching. Results are capped by max_results and carry a separate 'total' count of all matches found — when count < total, page through with 'offset'.",
         "ttlMs": DISCOVER_TTL_MS,
         "cacheScope": CACHE_SCOPE_PUBLIC
     })
@@ -242,7 +242,7 @@ pub fn make_tools_list() -> Value {
         "tools": [
             {
                 "name": "search_in_folder",
-                "description": "Search files/folders recursively under a specific folder using Everything search syntax. Prefer this over global search when working within a project directory. This is not shell glob: use '*.rs', not '**/*.rs' (a leading '**/' is stripped for you); exclude matches with a '!' prefix (e.g. 'ext:rs !test') or the 'exclude' parameter (e.g. ['\\obj\\', '\\.git\\'] to drop build/VCS noise); 'content:\"fn main\"' searches file contents. The response reports both 'count' (entries returned, capped by max_results) and 'total' (all matches found) — when they differ, the results are truncated.",
+                "description": "Search files/folders recursively under a specific folder using Everything search syntax. Prefer this over global search when working within a project directory. This is not shell glob: use '*.rs', not '**/*.rs' (a leading '**/' is stripped for you); exclude matches with a '!' prefix (e.g. 'ext:rs !test') or the 'exclude' parameter (e.g. ['\\obj\\', '\\.git\\'] to drop build/VCS noise); 'content:\"fn main\"' searches file contents. Each result carries 'size' plus 'modified'/'created' (ISO 8601 UTC). The response reports both 'count' (entries returned, capped by max_results) and 'total' (all matches found) — when they differ, page through with 'offset'. Results are sorted by 'sort' (default name ascending).",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -258,6 +258,37 @@ pub fn make_tools_list() -> Value {
                             "type": ["string", "array"],
                             "items": { "type": "string" },
                             "description": "Terms to exclude, appended as Everything NOT operators. Accepts a string or an array of strings. Quoted path fragments match well: ['\\obj\\', '\\.git\\', '\\node_modules\\'] drops build output, VCS metadata and dependencies. Default: none."
+                        },
+                        "sort": {
+                            "type": "string",
+                            "enum": ["name", "path", "size", "modified", "created"],
+                            "description": "Sort key for the results. 'modified'/'created' sort by file time, 'size' by byte size. Default: 'name'.",
+                            "default": "name"
+                        },
+                        "descending": {
+                            "type": "boolean",
+                            "description": "Sort descending (e.g. 'sort':'modified' + 'descending':true = newest first; 'sort':'size' + 'descending':true = largest first). Default: false (ascending).",
+                            "default": false
+                        },
+                        "match_case": {
+                            "type": "boolean",
+                            "description": "Case-sensitive matching. Default: false.",
+                            "default": false
+                        },
+                        "match_whole_word": {
+                            "type": "boolean",
+                            "description": "Match whole words only. Default: false.",
+                            "default": false
+                        },
+                        "match_regex": {
+                            "type": "boolean",
+                            "description": "Treat the pattern as a regular expression (Everything's 'regex:' syntax, applied to the pattern term). Default: false.",
+                            "default": false
+                        },
+                        "offset": {
+                            "type": "integer",
+                            "description": "Index of the first result to return, for paging through a large result set: when 'count' < 'total', re-query with 'offset' advanced by 'count'. Default 0.",
+                            "default": 0
                         },
                         "max_results": {
                             "type": "integer",
@@ -275,7 +306,7 @@ pub fn make_tools_list() -> Value {
             },
             {
                 "name": "list_folder",
-                "description": "List immediate children of a folder (non-recursive). Returns both files and sub-folders; folder entries always report size 0 (Everything does not compute directory sizes). Use search_in_folder when you need the whole tree. Pass 'exclude' to skip children such as '.git', 'obj', 'node_modules'.",
+                "description": "List immediate children of a folder (non-recursive). Returns both files and sub-folders; folder entries always report size 0 (Everything does not compute directory sizes). Each entry also carries 'modified'/'created' (ISO 8601 UTC). Use search_in_folder when you need the whole tree. Pass 'exclude' to skip children such as '.git', 'obj', 'node_modules'.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {

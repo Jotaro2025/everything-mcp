@@ -28,6 +28,9 @@ Context Protocol）接口暴露给 LLM（如 Claude Desktop、Cursor 等）使�
 - **索引变更查询** —— `index_changes` 回答「最近变了什么」：文件/文件夹的
   创建、修改、删除、重命名、移动，新的在前，支持按动作、路径前缀、名字
   子串和时间窗过滤。
+- **结果带时间戳、可排序、可分页** —— 每条搜索结果附带修改 / 创建时间
+  （ISO 8601 UTC），可按名字 / 路径 / 大小 / 时间排序（升 / 降序），大结果集
+  用 `offset` 翻页取完；匹配支持大小写敏感、全字、正则开关。
 - **可打包安装** —— 一条命令产出 x64 / x86 两个安装包；安装与卸载都由
   Everything 自己完成（与官方插件同一套机制）。
 
@@ -217,6 +220,8 @@ Everything 官方插件页：<https://www.voidtools.com/support/everything/plugi
 {
   "folder": "D:\\source\\repos\\my-project",
   "pattern": "ext:rs;toml",
+  "sort": "modified",
+  "descending": true,
   "max_results": 30,
   "timeout_ms": 10000
 }
@@ -234,10 +239,21 @@ Everything 官方插件页：<https://www.voidtools.com/support/everything/plugi
   开启后首次建索引会明显变慢）。权限位已随插件放开，开关在
   Everything 选项里。
 - 空字符串 `""` 表示列出该文件夹下所有文件。
-- `max_results = 0` 表示无上限（大目录慎用）。
-- 响应里 `count` 是实际返回的条数（受 `max_results` 截断），`total` 是
-  命中的总条数 —— 两者不等即说明结果被截断了，可以据此调大
-  `max_results` 或用 `count` 先摸底。
+- **每条结果带 `modified` / `created`**（修改 / 创建时间，ISO 8601 UTC，
+  形如 `2026-09-23T11:18:31Z`；索引项没有该时间时为 `null`。Everything
+  默认不索引创建时间，所以 `created` 常见为 `null`，`modified` 一般都有）。
+- **排序**：`sort` 取 `name`（默认）/ `path` / `size` / `modified` /
+  `created`，`descending: true` 反序。找「最近改动的文件」用
+  `"sort": "modified", "descending": true`，「最大的文件」用
+  `"sort": "size", "descending": true`。
+- **匹配开关**：`match_case`（区分大小写）、`match_whole_word`（全字）、
+  `match_regex`（正则，内部用 Everything 的 `regex:` 搜索函数实现），
+  默认都是 `false`。也可以直接在 pattern 里写 `case:` / `ww:` / `regex:`。
+- **翻页**：`offset` 指定从第几条开始返回（默认 0）。`max_results = 0`
+  表示无上限（大目录慎用）。响应里 `count` 是实际返回条数（受
+  `max_results` 截断），`total` 是命中总数 —— 两者不等即说明还有更多，
+  把 `offset` 递增 `count` 再查一批即可翻页。
+
 
 `exclude` 参数（三个工具都支持）：字符串或字符串数组，每项作为一条
 Everything NOT 项拼进搜索词。仓库噪声默认会进结果（Everything 不知道
@@ -256,7 +272,7 @@ gitignore），常见做法：
 
 #### 2. `list_folder`
 
-列出某个文件夹的直接子项（非递归），返回名字、类型、大小。
+列出某个文件夹的直接子项（非递归），返回名字、类型、大小、修改 / 创建时间。
 
 ```json
 { "folder": "D:\\source\\repos\\my-project", "exclude": ["\\.git\\"] }
@@ -264,6 +280,7 @@ gitignore），常见做法：
 
 - 文件夹条目的 `size` 恒为 0 —— Everything 不计算目录大小，这是口径
   而非缺失。要整个目录树的内容，用 `search_in_folder` 递归搜索。
+- 每条同样带 `modified` / `created`（ISO 8601 UTC，无该时间时为 `null`）。
 - 响应同样带 `total`（该目录直接子项总数，排除后的数量）。
 
 #### 3. `count`

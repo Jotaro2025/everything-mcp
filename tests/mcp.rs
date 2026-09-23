@@ -73,6 +73,23 @@ fn tools_list_contains_four_tools_with_required_params() {
         10_000
     );
 
+    // 排序 / 分页 / 匹配开关：全部可选，且带默认值。
+    let props = &search["inputSchema"]["properties"];
+    assert_eq!(props["offset"]["default"], 0);
+    assert_eq!(props["match_case"]["default"], false);
+    assert_eq!(props["match_whole_word"]["default"], false);
+    assert_eq!(props["match_regex"]["default"], false);
+    assert_eq!(props["descending"]["default"], false);
+    assert_eq!(props["sort"]["default"], "name");
+    assert_eq!(
+        props["sort"]["enum"],
+        json!(["name", "path", "size", "modified", "created"])
+    );
+    // 这些新参数都不进 required —— 缺省即可用。
+    assert!(!required
+        .iter()
+        .any(|v| v.as_str() == Some("sort") || v.as_str() == Some("offset")));
+
     // list_folder / count 只要求 folder；index_changes 一个参数都不必带。
     assert_eq!(tools[1]["inputSchema"]["required"], json!(["folder"]));
     assert_eq!(tools[2]["inputSchema"]["required"], json!(["folder"]));
@@ -136,6 +153,9 @@ fn search_description_warns_against_shell_glob_and_documents_truncation() {
     assert!(desc.contains('!'), "desc should document the '!' exclusion prefix");
     assert!(desc.contains("total"), "desc should document the total/count pair");
     assert!(desc.contains("content:"), "desc should mention content search");
+    // 新增能力也要在描述里点明：时间戳、翻页、排序。
+    assert!(desc.contains("modified"), "desc should mention timestamps");
+    assert!(desc.contains("offset"), "desc should document paging");
 
     // pattern 的参数说明同样带 glob 警告与排除范例。
     let pattern_desc = search["inputSchema"]["properties"]["pattern"]["description"]

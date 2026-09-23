@@ -90,6 +90,10 @@ pub struct SearchResult {
     pub path: String,
     pub is_folder: bool,
     pub size: u64,
+    /// 修改时间，ISO 8601 UTC（`2026-09-23T11:18:31Z`）。索引项没有该时间时为 None。
+    pub modified: Option<String>,
+    /// 创建时间，同上。
+    pub created: Option<String>,
 }
 
 /// 搜索范围。
@@ -102,6 +106,84 @@ pub enum SearchScope {
     /// search_in_folder / count 用这个。
     Recursive,
 }
+
+/// 结果排序键。映射到 `property_get_builtin_type` 的内置属性类型 ID。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortKey {
+    Name,
+    Path,
+    Size,
+    DateModified,
+    DateCreated,
+}
+
+impl SortKey {
+    /// 该排序键对应的内置属性类型 ID（见 ffi_types 的 PROPERTY_TYPE_*）。
+    pub fn property_type(self) -> i32 {
+        match self {
+            SortKey::Name => PROPERTY_TYPE_NAME,
+            SortKey::Path => PROPERTY_TYPE_PATH,
+            SortKey::Size => PROPERTY_TYPE_SIZE,
+            SortKey::DateModified => PROPERTY_TYPE_DATE_MODIFIED,
+            SortKey::DateCreated => PROPERTY_TYPE_DATE_CREATED,
+        }
+    }
+
+    /// 规范名（回显给调用方用）。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SortKey::Name => "name",
+            SortKey::Path => "path",
+            SortKey::Size => "size",
+            SortKey::DateModified => "modified",
+            SortKey::DateCreated => "created",
+        }
+    }
+
+    /// 解析排序键。大小写不敏感，并收几个 LLM 常写的同义字。
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "" | "name" | "filename" => Some(SortKey::Name),
+            "path" => Some(SortKey::Path),
+            "size" | "filesize" => Some(SortKey::Size),
+            "modified" | "date_modified" | "datemodified" | "mtime" | "date" => {
+                Some(SortKey::DateModified)
+            }
+            "created" | "date_created" | "datecreated" | "ctime" => Some(SortKey::DateCreated),
+            _ => None,
+        }
+    }
+}
+
+/// 一次搜索的完整选项（范围 + 匹配开关 + 排序）。
+///
+/// 打包成一个结构体，避免 `search_in_folder` 的形参长到失控，也便于
+/// `count` 这类只需要范围的调用方用 [`SearchOptions::for_scope`] 取默认值。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SearchOptions {
+    pub scope: SearchScope,
+    /// 区分大小写（`db_query_search2` 的 match_case）。
+    pub match_case: bool,
+    /// 全字匹配（match_whole_word）。
+    pub match_whole_word: bool,
+    pub sort: SortKey,
+    /// 是否降序。默认升序（按名字 A→Z）。
+    pub descending: bool,
+}
+
+impl SearchOptions {
+    /// 只指定范围的默认选项：不区分大小写、按名字升序。
+    pub fn for_scope(scope: SearchScope) -> Self {
+        Self {
+            scope,
+            match_case: false,
+            match_whole_word: false,
+            sort: SortKey::Name,
+            descending: false,
+        }
+    }
+}
+
 
 /// 拼 Everything 搜索字符串。纯函数，单独单测。
 ///
@@ -135,33 +217,36 @@ fn build_search_string(folder: &str, pattern: &str, scope: SearchScope) -> Strin
     s
 }
 
-/// 一次搜索的结果：已按 max_results 截断的条目 + 未截断的命中总数。
+/// 一次搜索的结果：已按 `offset`/`max_results` 截断的条目 + 未截断的命中总数。
 #[derive(Debug, Clone)]
 pub struct SearchOutcome {
     pub results: Vec<SearchResult>,
-    /// 命中总条数（截断前的数量）。与 `results.len()` 相等即未被截断。
+    /// 命中总条数（截断前的数量）。`results.len()` 小于它即说明还有更多。
     pub total: usize,
+    /// 本次结果在完整命中列表中的起始下标（回显给调用方，便于翻页）。
+    pub offset: usize,
 }
 
 /// 在指定文件夹下执行搜索。
 ///
 /// `folder` 必须是绝对路径（如 `D:\source\repos\Everything-Plugin`）；
-/// `pattern` 是 Everything 搜索语法（如 `*.rs`、`"readme"`、`ext:md;txt`）；
-/// `scope` 决定搜直接子项（Children）还是递归整棵子树（Recursive）。
-/// `max_results` 限制返回条数（0 表示无上限，但会读取全部结果可能耗时）。
+/// `pattern` 是 Everything 搜索语法（如 `*.rs`、`"readme"`、`ext:md;txt`）。
+/// `offset` / `max_results` 一起圈定返回窗口（`max_results == 0` 表示读到末尾）。
 /// `timeout_ms` 是异步等待查询完成的最大时间（建议 5000–30000）。
+/// `options` 决定搜索范围、匹配开关与排序。
 ///
-/// 返回值的 `total` 不受 `max_results` 截断影响 —— 调用方据此告诉 LLM
-/// 「命中的比返回的多」。
+/// 返回值的 `total` 不受窗口截断影响 —— 调用方据此告诉 LLM
+/// 「命中的比返回的多」以及下一批的 `offset` 该取多少。
 pub fn search_in_folder(
     folder: &str,
     pattern: &str,
+    offset: usize,
     max_results: usize,
     timeout_ms: u32,
-    scope: SearchScope,
+    options: SearchOptions,
 ) -> Result<SearchOutcome, String> {
-    let q = submit_query(folder, pattern, scope, timeout_ms)?;
-    read_results(q.query, max_results)
+    let q = submit_query(folder, pattern, options, timeout_ms)?;
+    read_results(q.query, offset, max_results)
 }
 
 /// 统计文件夹下匹配 `pattern` 的条目数，不读出任何名字。
@@ -169,7 +254,12 @@ pub fn search_in_folder(
 /// 与 search_in_folder 同范围（递归子树），但只取
 /// `db_query_get_result_count` 的计数值 —— 不为每条结果拼 name/path 字符串。
 pub fn count_in_folder(folder: &str, pattern: &str, timeout_ms: u32) -> Result<usize, String> {
-    let q = submit_query(folder, pattern, SearchScope::Recursive, timeout_ms)?;
+    let q = submit_query(
+        folder,
+        pattern,
+        SearchOptions::for_scope(SearchScope::Recursive),
+        timeout_ms,
+    )?;
     count_results(q.query)
 }
 
@@ -192,13 +282,13 @@ struct CompletedQuery {
 /// 它直到读完结果/计数）；超时会取消查询并返回错误。
 ///
 /// 实现细节：
-///   - 按 scope 拼 Everything 搜索字符串限定文件夹（见 build_search_string）；
+///   - 按 options.scope 拼 Everything 搜索字符串限定文件夹（见 build_search_string）；
 ///   - 主程序异步执行查询，我们用 Win32 事件等待 QUERY_COMPLETE 回调；
 ///   - 完成后 query 即可读结果（读取仍需 marshal 到主线程，由调用方负责）。
 fn submit_query(
     folder: &str,
     pattern: &str,
-    scope: SearchScope,
+    options: SearchOptions,
     timeout_ms: u32,
 ) -> Result<CompletedQuery, String> {
     let host = Host::get();
@@ -209,7 +299,7 @@ fn submit_query(
     }
 
     // 1. 拼接 Everything 搜索字符串（限定范围 + 用户 pattern）。
-    let search_string = build_search_string(folder, pattern, scope);
+    let search_string = build_search_string(folder, pattern, options.scope);
 
     // 2. 加锁、创建事件、设置槽位、提交查询、等待。
     let guard = Host::lock_host();
@@ -265,6 +355,7 @@ fn submit_query(
         search_fn: search,
         query: core::ptr::null_mut(),
         search_bytes: leaked.0.as_ptr(),
+        options,
         error: None,
     });
     // 提交前置位守卫：只有这次提交触发的完成事件才允许唤醒等待方，
@@ -360,12 +451,15 @@ struct SearchCtx {
     search_fn: super::host::DbQuerySearchFn,
     query: DbQueryHandle,
     search_bytes: *const u8,
+    /// 匹配开关与排序键 —— 由 run_search_on_main 透传给 db_query_search2。
+    options: SearchOptions,
     error: Option<String>,
 }
 
 /// read_results 的主线程调用上下文。结果与命中总数写回本结构体字段。
 struct ReadCtx {
     query: DbQueryHandle,
+    offset: usize,
     max_results: usize,
     result: Vec<SearchResult>,
     total: usize,
@@ -403,19 +497,26 @@ unsafe extern "system" fn run_search_on_main(ctx: *mut core::ffi::c_void) {
     };
     c.query = query;
 
-    // 排序属性：必须取内置 NAME 属性指针。etp_server.c 同样传这个而不是 NULL ——
-    // 传 NULL 会让主程序在排序阶段解引用空指针崩溃。
+    let opts = c.options;
+    // 排序属性：必须取内置属性指针（NAME/SIZE/DATE_MODIFIED…）。etp_server.c 同样
+    // 传有效指针而不是 NULL —— 传 NULL 会让主程序在排序阶段解引用空指针崩溃。
+    let sort_type = opts.sort.property_type();
     let sort_property = match Host::get().property_get_builtin_type {
-        Some(f) => unsafe { f(PROPERTY_TYPE_NAME) },
+        Some(f) => unsafe { f(sort_type) },
         None => core::ptr::null(),
     };
     if sort_property.is_null() {
-        super::diag::write("run_search_on_main: property_get_builtin_type(NAME) returned NULL");
+        super::diag::write(&format!(
+            "run_search_on_main: property_get_builtin_type({}) returned NULL",
+            sort_type
+        ));
     }
+    // db_query_search2 的 sort_ascending：1 = 升序，0 = 降序。
+    let sort_ascending = if opts.descending { 0 } else { 1 };
 
     super::diag::write_flush(&format!(
-        "run_search_on_main: calling db_query_search2 query={:p} sort={:p}...",
-        query, sort_property
+        "run_search_on_main: calling db_query_search2 query={:p} sort={:p} asc={} case={} ww={}...",
+        query, sort_property, sort_ascending, opts.match_case, opts.match_whole_word
     ));
     // 搜索函数权限位。映射来自官方 http_server 插件的注释
     // （reference/http_server-1.0.5.6/src/http_server.c:408-410）：
@@ -427,19 +528,24 @@ unsafe extern "system" fn run_search_on_main(ctx: *mut core::ffi::c_void) {
     // （docs/PLUGIN_SDK_API_CN.md:582）明确建议 MCP 场景放开这些权限位。
     // 置 0 的后果：content: 一类函数直接返回 0 条 —— 评测里「content: 搜索
     // 不可用」正是这三个 0 造成的，与 Everything 自身能力无关。
+    //
+    // 前 10 个 match_* / ignore_* 开关：只放开用户显式要的 case / whole word。
+    // 其余保持 0。特别注意 match_regex 必须传 0 —— 实测它会把这整条搜索串
+    // （含我们前置的文件夹路径）当成一个正则编译，路径里的 `\s` 之类让结果
+    // 恒为 0。正则改由搜索串里的 `regex:` 搜索函数表达（见 tools.rs）。
     unsafe {
         (c.search_fn)(
             c.query,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0, // 10 个 match_* / ignore_* 开关
+            opts.match_case as i32,
+            opts.match_whole_word as i32,
+            0, // match_path
+            0, // match_diacritics
+            0, // match_prefix
+            0, // match_suffix
+            0, // ignore_punctuation
+            0, // ignore_whitespace
+            0, // match_regex —— 见上方注释，永远 0
+            0, // hide_empty_search_results
             1, // clear_selection
             1, // clear_item_refs
             c.search_bytes,
@@ -451,7 +557,7 @@ unsafe extern "system" fn run_search_on_main(ctx: *mut core::ffi::c_void) {
             -1,
             1, // filter_sort / asc / view / fast_sort_only
             sort_property,
-            1, // sort_property_type = NAME / ascending（不能是 NULL）
+            sort_ascending, // sort_property_type / ascending（不能是 NULL）
             core::ptr::null(),
             0, // sort 2 —— etp 同样传 NULL
             core::ptr::null(),
@@ -484,7 +590,7 @@ unsafe extern "system" fn run_read_on_main(ctx: *mut core::ffi::c_void) {
         return;
     }
     let c = &mut *(ctx as *mut ReadCtx);
-    match read_all(c.query, c.max_results) {
+    match read_all(c.query, c.offset, c.max_results) {
         Ok((v, total)) => {
             c.result = v;
             c.total = total;
@@ -550,9 +656,14 @@ fn cancel_query(query: DbQueryHandle) {
 ///
 /// db_query_get_result_* 有主线程亲和性（共享同一个 query 对象的主线程
 /// 所有权语义），因此 marshal 到主线程执行。
-fn read_results(query: DbQueryHandle, max_results: usize) -> Result<SearchOutcome, String> {
+fn read_results(
+    query: DbQueryHandle,
+    offset: usize,
+    max_results: usize,
+) -> Result<SearchOutcome, String> {
     let ctx = Box::new(ReadCtx {
         query,
+        offset,
         max_results,
         result: Vec::new(),
         total: 0,
@@ -568,6 +679,7 @@ fn read_results(query: DbQueryHandle, max_results: usize) -> Result<SearchOutcom
         None => Ok(SearchOutcome {
             results: core::mem::take(&mut ctx.result),
             total: ctx.total,
+            offset: ctx.offset,
         }),
     }
 }
@@ -603,23 +715,37 @@ unsafe fn read_result_count(query: DbQueryHandle) -> Result<usize, String> {
     Ok(total)
 }
 
-/// 从已完成的 query 对象中读出（最多 max_results 条）结果与命中总数。
+/// 由总数、`offset`、`max_results` 算出实际要读的下标窗口 `(start, take)`。
+///
+/// `max_results == 0` 表示读到末尾；`offset` 超出总数时返回空窗口（take=0）。
+/// 纯函数，单独单测。
+fn page_window(total: usize, offset: usize, max_results: usize) -> (usize, usize) {
+    let start = offset.min(total);
+    let remaining = total - start;
+    let take = if max_results == 0 {
+        remaining
+    } else {
+        remaining.min(max_results)
+    };
+    (start, take)
+}
+
+/// 从已完成的 query 对象中读出窗口 `[offset, offset+max_results)` 的结果与命中总数。
 /// 在主线程上运行；缓冲区生命周期自行管理。
 unsafe fn read_all(
     query: DbQueryHandle,
+    offset: usize,
     max_results: usize,
 ) -> Result<(Vec<SearchResult>, usize), String> {
     let host = Host::get();
     let total = unsafe { read_result_count(query)? };
+    let (start, take) = page_window(total, offset, max_results);
     super::diag::write(&format!(
-        "read_all: total={} take<=max={}",
-        total, max_results
+        "read_all: total={} window=[{}, {})",
+        total,
+        start,
+        start + take
     ));
-    let take = if max_results == 0 {
-        total
-    } else {
-        total.min(max_results)
-    };
 
     let mut out = Vec::with_capacity(take);
     let mut name_buf = Utf8Buf::default();
@@ -634,7 +760,7 @@ unsafe fn read_all(
     // 读出结果。包在闭包里是为了无论中途哪个 host 调用缺失、以 `?` 提前
     // 返回，下面的 utf8_buf_kill 都一定执行 —— 否则泄漏主程序分配的缓冲区。
     let read = || -> Result<(), String> {
-        for i in 0..take {
+        for i in start..start + take {
             let name = unsafe {
                 (host
                     .db_query_get_result_name
@@ -663,6 +789,9 @@ unsafe fn read_all(
                     fd.file_size()
                 }
             };
+            // fd 里同时带时间戳（同一结构体，读出即免费）。转成 ISO 便于 LLM 读。
+            let modified = super::timefmt::filetime_to_iso(fd.date_modified);
+            let created = super::timefmt::filetime_to_iso(fd.date_created);
 
             // db_query_get_result_path 只返回父路径（SDK 语义：不含文件名），
             // 完整路径要自己拼；盘符根（C:\）结尾时不再补分隔符。
@@ -677,6 +806,8 @@ unsafe fn read_all(
                 path,
                 is_folder,
                 size,
+                modified,
+                created,
             });
         }
         Ok(())
@@ -745,5 +876,57 @@ mod tests {
             build_search_string("D:\\pr\"oj", "x", SearchScope::Recursive),
             r#""D:\proj\" x"#
         );
+    }
+
+    #[test]
+    fn page_window_clamps_offset_and_limit() {
+        // 常规翻页。
+        assert_eq!(page_window(100, 0, 50), (0, 50));
+        assert_eq!(page_window(100, 50, 50), (50, 50));
+        assert_eq!(page_window(100, 90, 50), (90, 10)); // 最后一批不足一页
+        // max_results == 0 表示读到末尾。
+        assert_eq!(page_window(100, 40, 0), (40, 60));
+        assert_eq!(page_window(100, 0, 0), (0, 100));
+        // offset 越界 → 空窗口，不 panic。
+        assert_eq!(page_window(100, 100, 50), (100, 0));
+        assert_eq!(page_window(100, 999, 50), (100, 0));
+        // 空结果集。
+        assert_eq!(page_window(0, 0, 50), (0, 0));
+    }
+
+    #[test]
+    fn sort_key_maps_to_builtin_property_ids() {
+        assert_eq!(SortKey::Name.property_type(), PROPERTY_TYPE_NAME);
+        assert_eq!(SortKey::Path.property_type(), PROPERTY_TYPE_PATH);
+        assert_eq!(SortKey::Size.property_type(), PROPERTY_TYPE_SIZE);
+        assert_eq!(
+            SortKey::DateModified.property_type(),
+            PROPERTY_TYPE_DATE_MODIFIED
+        );
+        assert_eq!(
+            SortKey::DateCreated.property_type(),
+            PROPERTY_TYPE_DATE_CREATED
+        );
+    }
+
+    #[test]
+    fn sort_key_parses_names_and_synonyms() {
+        assert_eq!(SortKey::parse(""), Some(SortKey::Name));
+        assert_eq!(SortKey::parse("name"), Some(SortKey::Name));
+        assert_eq!(SortKey::parse("SIZE"), Some(SortKey::Size));
+        assert_eq!(SortKey::parse(" modified "), Some(SortKey::DateModified));
+        assert_eq!(SortKey::parse("date"), Some(SortKey::DateModified));
+        assert_eq!(SortKey::parse("created"), Some(SortKey::DateCreated));
+        assert_eq!(SortKey::parse("path"), Some(SortKey::Path));
+        assert_eq!(SortKey::parse("bogus"), None);
+    }
+
+    #[test]
+    fn default_options_are_name_ascending_without_modifiers() {
+        let o = SearchOptions::for_scope(SearchScope::Recursive);
+        assert_eq!(o.scope, SearchScope::Recursive);
+        assert_eq!(o.sort, SortKey::Name);
+        assert!(!o.descending);
+        assert!(!o.match_case && !o.match_whole_word);
     }
 }

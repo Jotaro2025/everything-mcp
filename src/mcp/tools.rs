@@ -85,6 +85,20 @@ fn exclude_arg(args: &Value) -> Result<Vec<String>, (i32, String)> {
     Ok(terms)
 }
 
+/// 把 pattern 包成 Everything 的 `regex:` 搜索函数项。
+///
+/// 正则不能用 `db_query_search2` 的 match_regex 开关表达：那会把整条搜索串
+/// （含我们前置的文件夹路径前缀）当成一个正则编译，路径里的 `\s`、`\.` 之类
+/// 让结果恒为 0（实测）。`regex:` 只作用于紧跟其后的这一项，与文件夹前缀天然
+/// 共存。空 pattern 或未开正则时原样返回。
+fn regex_term(pattern: &str, match_regex: bool) -> String {
+    if match_regex && !pattern.is_empty() {
+        format!("regex:{}", pattern)
+    } else {
+        pattern.to_string()
+    }
+}
+
 /// 把 pattern 与 exclude 项拼成最终 Everything 搜索词。
 ///
 /// exclude 每项变成 NOT 项（`!term`）—— 与评测建议的
@@ -113,6 +127,45 @@ fn u64_arg(args: &Value, key: &str, default: u64) -> Result<u64, (i32, String)> 
             format!("'{}' must be a non-negative integer; received {}", key, v),
         )),
     }
+}
+
+/// 取布尔参数：缺省用默认值。
+///
+/// 只接受真正的 JSON 布尔 —— 字符串 `"false"` 会被 `Value::as_bool` 拒掉并报错。
+/// 这样 LLM 把布尔写成字符串时能立刻收到带范例的错误，而不是被当成真值。
+fn bool_arg(args: &Value, key: &str, default: bool) -> Result<bool, (i32, String)> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(default),
+        Some(Value::Bool(b)) => Ok(*b),
+        Some(v) => Err((
+            INVALID_PARAMS,
+            format!(
+                "'{}' must be a boolean (true or false); received {}",
+                key, v
+            ),
+        )),
+    }
+}
+
+/// 取排序键参数：缺省按名字升序；未知取值报错并列出合法值。
+fn sort_arg(args: &Value) -> Result<plugin::search::SortKey, (i32, String)> {
+    let raw = match args.get("sort") {
+        None | Some(Value::Null) => return Ok(plugin::search::SortKey::Name),
+        Some(Value::String(s)) => s.as_str(),
+        Some(v) => {
+            return Err((
+                INVALID_PARAMS,
+                format!("'sort' must be a string; received {}", v),
+            ))
+        }
+    };
+    plugin::search::SortKey::parse(raw).ok_or((
+        INVALID_PARAMS,
+        format!(
+            "'sort' must be one of name|path|size|modified|created; received {:?}",
+            raw
+        ),
+    ))
 }
 
 /// `index_changes` 的默认返回条数。
@@ -214,28 +267,43 @@ pub fn dispatch(name: &str, args: &Value) -> Result<ToolOutput, (i32, String)> {
             let folder = require_folder(args)?;
             let pattern = pattern_arg(args)?;
             let excludes = exclude_arg(args)?;
-            let query = combine_query(&pattern, &excludes);
+            let match_regex = bool_arg(args, "match_regex", false)?;
+            // 正则改用 `regex:` 搜索函数（见 regex_term 注释），只包 pattern，
+            // 排除项 `!term` 保持独立。
+            let query = combine_query(&regex_term(&pattern, match_regex), &excludes);
+            let offset = u64_arg(args, "offset", 0)? as usize;
             let max_results = u64_arg(args, "max_results", 50)? as usize;
             let timeout_ms = u64_arg(args, "timeout_ms", 10_000)? as u32;
+            let sort = sort_arg(args)?;
+            let descending = bool_arg(args, "descending", false)?;
+            let options = plugin::search::SearchOptions {
+                scope: plugin::search::SearchScope::Recursive,
+                match_case: bool_arg(args, "match_case", false)?,
+                match_whole_word: bool_arg(args, "match_whole_word", false)?,
+                sort,
+                descending,
+            };
 
             match plugin::search::search_in_folder(
                 &folder,
                 &query,
+                offset,
                 max_results,
                 timeout_ms,
-                plugin::search::SearchScope::Recursive,
+                options,
             ) {
                 Ok(outcome) => {
                     let entries: Vec<Value> = outcome
                         .results
                         .iter()
                         .map(|r| {
-                            let kind = if r.is_folder { "folder" } else { "file" };
                             json!({
                                 "name": r.name,
                                 "path": r.path,
-                                "kind": kind,
+                                "kind": if r.is_folder { "folder" } else { "file" },
                                 "size": r.size,
+                                "modified": r.modified,
+                                "created": r.created,
                             })
                         })
                         .collect();
@@ -243,6 +311,9 @@ pub fn dispatch(name: &str, args: &Value) -> Result<ToolOutput, (i32, String)> {
                         "folder": folder,
                         "pattern": pattern,
                         "exclude": excludes,
+                        "sort": sort.as_str(),
+                        "descending": descending,
+                        "offset": outcome.offset,
                         "count": entries.len(),
                         "total": outcome.total,
                         "results": entries,
@@ -264,9 +335,10 @@ pub fn dispatch(name: &str, args: &Value) -> Result<ToolOutput, (i32, String)> {
             match plugin::search::search_in_folder(
                 &folder,
                 &query,
+                0,
                 500,
                 10_000,
-                plugin::search::SearchScope::Children,
+                plugin::search::SearchOptions::for_scope(plugin::search::SearchScope::Children),
             ) {
                 Ok(outcome) => {
                     let entries: Vec<Value> = outcome
@@ -277,6 +349,8 @@ pub fn dispatch(name: &str, args: &Value) -> Result<ToolOutput, (i32, String)> {
                                 "name": r.name,
                                 "kind": if r.is_folder { "folder" } else { "file" },
                                 "size": r.size,
+                                "modified": r.modified,
+                                "created": r.created,
                             })
                         })
                         .collect();
@@ -443,6 +517,20 @@ mod tests {
     }
 
     #[test]
+    fn regex_term_wraps_only_when_enabled_and_nonempty() {
+        assert_eq!(regex_term("^README", true), "regex:^README");
+        assert_eq!(regex_term("^README", false), "^README");
+        // 空 pattern 不包 —— `regex:` 后面没东西会变成无效项。
+        assert_eq!(regex_term("", true), "");
+        assert_eq!(regex_term("", false), "");
+        // 与 exclude 组合时只有 pattern 带前缀。
+        assert_eq!(
+            combine_query(&regex_term(r"^.*\.rs$", true), &v(&[r"\obj\"])),
+            r#"regex:^.*\.rs$ !\obj\"#
+        );
+    }
+
+    #[test]
     fn exclude_arg_accepts_string_and_array() {
         let one = json!({ "exclude": r"\obj\" });
         assert_eq!(exclude_arg(&one).unwrap(), v(&[r"\obj\"]));
@@ -572,6 +660,37 @@ mod tests {
         assert_eq!(e.0, INVALID_PARAMS);
         assert!(e.1.contains("path"), "{}", e.1);
         let e = optional_text_arg(&json!({ "path": 42 }), "path").unwrap_err();
+        assert_eq!(e.0, INVALID_PARAMS);
+    }
+
+    #[test]
+    fn bool_arg_accepts_only_json_bools() {
+        assert!(!bool_arg(&json!({}), "match_case", false).unwrap());
+        assert!(bool_arg(&json!({}), "match_case", true).unwrap());
+        assert!(bool_arg(&json!({ "match_case": true }), "match_case", false).unwrap());
+        // null 走默认值。
+        assert!(bool_arg(&json!({ "match_case": null }), "match_case", true).unwrap());
+        // 字符串 "false" 不是布尔 —— 必须报错，否则会被当成真值。
+        let e = bool_arg(&json!({ "match_case": "false" }), "match_case", false).unwrap_err();
+        assert_eq!(e.0, INVALID_PARAMS);
+        assert!(e.1.contains("match_case"), "{}", e.1);
+    }
+
+    #[test]
+    fn sort_arg_defaults_and_rejects_junk() {
+        use plugin::search::SortKey;
+        assert_eq!(sort_arg(&json!({})).unwrap(), SortKey::Name);
+        assert_eq!(sort_arg(&json!({ "sort": null })).unwrap(), SortKey::Name);
+        assert_eq!(sort_arg(&json!({ "sort": "size" })).unwrap(), SortKey::Size);
+        assert_eq!(
+            sort_arg(&json!({ "sort": "modified" })).unwrap(),
+            SortKey::DateModified
+        );
+        // 错误消息必须列出合法值，让 LLM 一次改对。
+        let e = sort_arg(&json!({ "sort": "bogus" })).unwrap_err();
+        assert_eq!(e.0, INVALID_PARAMS);
+        assert!(e.1.contains("modified"), "{}", e.1);
+        let e = sort_arg(&json!({ "sort": 3 })).unwrap_err();
         assert_eq!(e.0, INVALID_PARAMS);
     }
 }

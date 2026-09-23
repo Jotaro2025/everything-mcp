@@ -33,6 +33,11 @@ an **MCP (Model Context Protocol)** server for LLMs (Claude Desktop, Cursor, …
 - **Index change queries** — `index_changes` answers "what changed lately":
   file/folder creations, modifications, deletions, renames and moves, newest
   first, filterable by action, path prefix, name substring and time window.
+- **Timestamps, sorting and paging** — every search result carries
+  modification / creation time (ISO 8601 UTC), results can be sorted by
+  name / path / size / time (ascending or descending), large result sets page
+  through with `offset`, and matching supports case-sensitive, whole-word and
+  regex switches.
 - **Installable** — one command produces x64 and x86 installers; Everything
   itself performs the install and uninstall (same mechanism as the official
   plugins).
@@ -239,6 +244,8 @@ Recursively find files/folders under a given folder using Everything search synt
 {
   "folder": "D:\\source\\repos\\my-project",
   "pattern": "ext:rs;toml",
+  "sort": "modified",
+  "descending": true,
   "max_results": 30,
   "timeout_ms": 10000
 }
@@ -258,10 +265,23 @@ Recursively find files/folders under a given folder using Everything search synt
   slower). The plugin already passes the required permission bits — the
   switch lives in Everything's options.
 - An empty string `""` lists everything under the folder.
-- `max_results = 0` means unlimited (careful with huge folders).
-- The response reports `count` (entries returned, capped by `max_results`)
-  and `total` (all matches found) — when they differ, results were
-  truncated: raise `max_results` or use `count` to scope the folder first.
+- **Every result carries `modified` / `created`** (modification / creation
+  time, ISO 8601 UTC, e.g. `2026-09-23T11:18:31Z`; `null` when the index
+  entry has no such time. Everything does not index creation time by
+  default, so `created` is often `null` while `modified` is present).
+- **Sorting**: `sort` is one of `name` (default) / `path` / `size` /
+  `modified` / `created`, and `descending: true` reverses it. "Recently
+  changed files" is `"sort": "modified", "descending": true`; "largest
+  files" is `"sort": "size", "descending": true`.
+- **Match switches**: `match_case` (case-sensitive), `match_whole_word`
+  (whole words) and `match_regex` (regular expression, implemented via
+  Everything's `regex:` search function) — all default `false`. You can
+  also write `case:` / `ww:` / `regex:` directly in the pattern.
+- **Paging**: `offset` is the index of the first result to return
+  (default 0). `max_results = 0` means unlimited (careful with huge
+  folders). The response reports `count` (entries returned, capped by
+  `max_results`) and `total` (all matches found) — when they differ there
+  is more, so advance `offset` by `count` and query again.
 
 `exclude` (all three tools accept it): a string or an array of strings,
 each appended as an Everything NOT term. Repository noise is in the
@@ -281,7 +301,8 @@ dropped. The equivalent pattern spelling is `*.cs !\obj\ !\.git\`.
 
 #### 2. `list_folder`
 
-List the direct children (non-recursive) of a folder: name, kind, size.
+List the direct children (non-recursive) of a folder: name, kind, size,
+modification / creation time.
 
 ```json
 { "folder": "D:\\source\\repos\\my-project", "exclude": ["\\.git\\"] }
@@ -290,6 +311,8 @@ List the direct children (non-recursive) of a folder: name, kind, size.
 - Folder entries always report `size` 0 — Everything does not compute
   directory sizes; that is the convention, not missing data. Use
   `search_in_folder` for the whole tree.
+- Each entry also carries `modified` / `created` (ISO 8601 UTC, `null`
+  when unavailable).
 - The response also carries `total` (number of direct children, after
   exclusions).
 
