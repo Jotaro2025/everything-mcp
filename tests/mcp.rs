@@ -191,6 +191,12 @@ fn read_file_description_documents_the_contract() {
     assert!(desc.contains("start_line"), "desc should document paging");
     assert!(desc.contains("encoding"), "desc should document the encoding field");
     assert!(desc.contains("NUL"), "desc should say binary files are rejected");
+    // 加固后的三项：黑名单、超长行裁剪、可分支的错误码。
+    assert!(desc.contains("denylist"), "desc should document the denylist");
+    assert!(desc.contains("id_rsa"), "desc should name the denied files");
+    assert!(desc.contains("clipped_lines"), "desc should document line clipping");
+    assert!(desc.contains("next_start_line"), "desc should hand back the next offset");
+    assert!(desc.contains("PATH_DENIED"), "desc should list the error codes");
     // 与 content: 检索的分工必须写清楚 —— 这是最容易混的一处。
     assert!(desc.contains("content:"), "desc: {desc}");
 
@@ -242,9 +248,14 @@ fn out_text(out: &tools::ToolOutput) -> String {
     out.0["content"][0]["text"].as_str().unwrap().to_string()
 }
 
+/// 解析 read_file 的结构化错误载荷（`{error, code, ...}`）。
+fn out_error(out: &tools::ToolOutput) -> Value {
+    serde_json::from_str(&out_text(out)).expect("read_file 的错误必须是 JSON")
+}
+
 #[test]
 fn read_file_reads_a_real_file_and_windows_lines() {
-    // 测试进程里没有主程序 host → 走 std::fs 直读回退路径。
+    // 测试进程里没有主程序 host → 走 std::fs 直读路径。
     // 覆盖真实读取、行窗口、元信息与两段式 content。
     let path = std::env::temp_dir().join("everything_mcp_read_file_test.txt");
     let body = "alpha\nbravo\ncharlie\ndelta\n";
@@ -264,12 +275,14 @@ fn read_file_reads_a_real_file_and_windows_lines() {
     assert_eq!(meta["start_line"], 2);
     assert_eq!(meta["lines_returned"], 2);
     assert_eq!(meta["truncated"], true, "还有 delta 没返回");
+    assert_eq!(meta["clipped_lines"], 0);
+    assert_eq!(meta["next_start_line"], 4, "接着从第 4 行读");
     assert_eq!(meta["encoding"], "utf-8");
     assert_eq!(meta["size"], body.len());
     // 正文单独成项、保持原样（不是 JSON 转义过的一行）。
     assert_eq!(items[1]["text"], "bravo\ncharlie");
 
-    // max_lines=0 = 余下全部，此时不再截断。
+    // max_lines=0 = 余下全部，此时不再截断、也没有下一页
     let out = tools::dispatch(
         "read_file",
         &json!({"path": path.to_string_lossy(), "start_line": 1, "max_lines": 0}),
@@ -279,23 +292,59 @@ fn read_file_reads_a_real_file_and_windows_lines() {
         serde_json::from_str(out.0["content"][0]["text"].as_str().unwrap()).unwrap();
     assert_eq!(meta["lines_returned"], 4);
     assert_eq!(meta["truncated"], false);
+    assert_eq!(meta["next_start_line"], Value::Null);
+
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn read_file_clips_overlong_lines_and_reports_the_count() {
+    // 单行超长时不能吃掉整个窗口：裁到上限并如实上报裁了几行。
+    let path = std::env::temp_dir().join("everything_mcp_longline_test.txt");
+    let long = "x".repeat(20_000);
+    std::fs::write(&path, format!("head\n{long}\ntail\n")).unwrap();
+
+    let out = tools::dispatch(
+        "read_file",
+        &json!({"path": path.to_string_lossy(), "max_lines": 0}),
+    )
+    .unwrap();
+    assert!(!out.1, "{}", out_text(&out));
+
+    let meta: Value = serde_json::from_str(out.0["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(meta["clipped_lines"], 1);
+    assert_eq!(meta["total_lines"], 3);
+    assert_eq!(meta["lines_returned"], 3, "裁短的行仍算一行");
+    let body = out.0["content"][1]["text"].as_str().unwrap();
+    let lines: Vec<&str> = body.lines().collect();
+    assert_eq!(lines[0], "head");
+    assert_eq!(lines[1].chars().count(), 16_384);
+    assert_eq!(lines[2], "tail");
 
     let _ = std::fs::remove_file(&path);
 }
 
 #[test]
 fn read_file_reports_folders_and_missing_files_as_tool_errors() {
-    // 目录 / 不存在的文件是运行时问题（is_error），不是协议错误 ——
-    // 与 folder 参数的 INVALID_PARAMS 分工不同。
+    // 目录 / 不存在的文件是运行时问题（isError），不是协议错误 ——
+    // 与 folder 参数的 INVALID_PARAMS 分工不同。错误体是结构化 JSON：
+    // 调用方按 code 分支，目录那条还带建议的替代调用。
     let dir = std::env::temp_dir();
     let out = tools::dispatch("read_file", &json!({"path": dir.to_string_lossy()})).unwrap();
     assert!(out.1, "folder must be a tool error");
-    assert!(out_text(&out).contains("list_folder"), "{}", out_text(&out));
+    let err = out_error(&out);
+    assert_eq!(err["code"], "PATH_IS_DIRECTORY");
+    assert_eq!(err["suggested_tool"], "list_folder");
+    assert_eq!(err["suggested_args"]["folder"], dir.to_string_lossy().as_ref());
 
     let missing = dir.join("everything_mcp_definitely_missing_file.txt");
     let out = tools::dispatch("read_file", &json!({"path": missing.to_string_lossy()})).unwrap();
     assert!(out.1);
-    assert!(out_text(&out).contains("read_file error"), "{}", out_text(&out));
+    let err = out_error(&out);
+    assert_eq!(err["code"], "NOT_FOUND");
+    assert!(err["error"].as_str().unwrap().contains("cannot read"));
+    // 不存在这种错误没有替代工具可建议
+    assert!(err.get("suggested_tool").is_none());
 }
 
 #[test]
@@ -305,9 +354,41 @@ fn read_file_rejects_binary_content() {
 
     let out = tools::dispatch("read_file", &json!({"path": path.to_string_lossy()})).unwrap();
     assert!(out.1, "binary must be rejected");
-    assert!(out_text(&out).contains("binary"), "{}", out_text(&out));
+    let err = out_error(&out);
+    assert_eq!(err["code"], "BINARY_CONTENT");
+    assert!(err["error"].as_str().unwrap().contains("binary"));
 
     let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn read_file_denies_private_keys_and_env_files() {
+    // 敏感路径在读盘之前就被拒 —— 这些文件甚至不需要真实存在。
+    for path in [
+        r"C:\Users\someone\.ssh\id_rsa",
+        r"D:\proj\.env",
+        r"D:\proj\.env.production",
+        r"D:\proj\certs\server.pem",
+        r"D:\repo\.git\objects\ab\cdef0123",
+    ] {
+        let out = tools::dispatch("read_file", &json!({"path": path})).unwrap();
+        assert!(out.1, "{path} 必须被拒绝");
+        let err = out_error(&out);
+        assert_eq!(err["code"], "PATH_DENIED", "{path}");
+        assert!(
+            err["error"].as_str().unwrap().contains("denylist"),
+            "{path}: {}",
+            err["error"]
+        );
+    }
+
+    // 放行：公钥、模板 env、以及只是名字里带敏感词的普通文件
+    let dir = std::env::temp_dir();
+    let ok = dir.join("everything_mcp_env_example_probe.env.example");
+    std::fs::write(&ok, "KEY=placeholder\n").unwrap();
+    let out = tools::dispatch("read_file", &json!({"path": ok.to_string_lossy()})).unwrap();
+    assert!(!out.1, ".env.example 应可读: {}", out_text(&out));
+    let _ = std::fs::remove_file(&ok);
 }
 
 #[test]

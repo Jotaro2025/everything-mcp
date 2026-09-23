@@ -374,7 +374,7 @@ pub fn make_tools_list() -> Value {
             },
             {
                 "name": "read_file",
-                "description": "Read the contents of one text file, optionally a window of lines. The companion to search_in_folder: search to locate files, then read_file to read one. 'path' must be an absolute path to a single existing file — no wildcards (use search_in_folder for patterns) and no folders (use list_folder); files above 8 MiB are refused. Lines are returned verbatim starting at 'start_line' (1-based); the response reports 'total_lines' and 'lines_returned', so page by raising 'start_line'. 'truncated' is true when content remains beyond the window (either the line window or the 512 KiB response cap). 'encoding' reports how the bytes were decoded: 'utf-8' / 'utf-16le' / 'utf-16be' are certain (valid UTF-8 or an explicit BOM), while 'ansi' means no UTF-8 validity and no BOM, so the machine's ANSI code page was assumed (correct for GBK text on a Chinese Windows, a guess elsewhere) and 'utf-8-lossy' means undecodable bytes were replaced — treat 'ansi' and 'utf-8-lossy' bodies with suspicion. Binary files (containing NUL bytes) are rejected rather than returned as garbage. This does not search file contents — use search_in_folder with 'content:\"...\"' for that.",
+                "description": "Read the contents of one text file, optionally a window of lines. The companion to search_in_folder: search to locate files, then read_file to read one. 'path' must be an absolute path to a single existing file — no wildcards (use search_in_folder for patterns) and no folders (the error for a folder carries 'suggested_tool'/'suggested_args' pointing at list_folder); files above 8 MiB are refused. Lines are returned verbatim starting at 'start_line' (1-based). The response reports 'total_lines', 'lines_returned' and 'next_start_line': pass 'next_start_line' back as 'start_line' to page, and stop when it is null. Lines longer than 16384 characters are cut (counted in 'clipped_lines'), so a minified single-line file cannot swallow the whole window. 'truncated' is true when content remains beyond the window. 'encoding' reports how the bytes were decoded: 'utf-8' / 'utf-16le' / 'utf-16be' are certain (valid UTF-8 or an explicit BOM), while 'ansi' means no valid UTF-8 and no BOM, so the machine's ANSI code page was assumed (correct for GBK text on a Chinese Windows, a guess elsewhere) and 'utf-8-lossy' means undecodable bytes were replaced — treat 'ansi' and 'utf-8-lossy' bodies with suspicion. Private keys and credential bundles are never returned: id_rsa/id_dsa/id_ecdsa/id_ed25519, .env (but not .env.example/.sample/.template/.dist), .netrc, .git-credentials, credentials.json, *.pem/*.key/*.p12/*.pfx/*.jks/*.keystore/*.ppk, and anything under .git/objects — that denylist is deliberately not configurable. Binary files (containing NUL bytes) are rejected rather than returned as garbage. Failures come back as JSON carrying 'error' plus a machine-readable 'code' (INVALID_ARGUMENT, NOT_FOUND, PATH_IS_DIRECTORY, PATH_DENIED, BINARY_CONTENT, TOO_LARGE, READ_FAILED) — branch on the code, not the wording. This does not search file contents — use search_in_folder with 'content:\"...\"' for that.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -384,12 +384,12 @@ pub fn make_tools_list() -> Value {
                         },
                         "start_line": {
                             "type": "integer",
-                            "description": "1-based line number to start from (default 1). A value past the end of the file returns an empty window rather than an error.",
+                            "description": "1-based line number to start from (default 1). A value past the end of the file returns an empty window rather than an error. For the next page, pass back the 'next_start_line' from the previous response.",
                             "default": 1
                         },
                         "max_lines": {
                             "type": "integer",
-                            "description": "Maximum number of lines to return (default 200). 0 means all remaining lines, still capped by the 512 KiB response limit.",
+                            "description": "Maximum number of lines to return (default 200). 0 means all remaining lines, still capped by the 512 KiB response limit; individual lines are cut at 16384 characters.",
                             "default": 200
                         }
                     },

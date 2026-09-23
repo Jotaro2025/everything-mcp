@@ -63,6 +63,7 @@ everything-mcp/
 │   │   ├── journal.rs           Index journal (index-journal-*.txt) parsing & querying
 │   │   ├── read.rs              read_file: single-file content read (line window, size cap)
 │   │   ├── search.rs            Async search → sync wait wrapper (main-thread marshaling)
+│   │   ├── sensitive.rs         Sensitive-path denylist (keys, .env, credentials, .git/objects)
 │   │   ├── main_thread.rs       Main-thread window + PostMessage task dispatch
 │   │   └── state.rs             Runtime state (lazily created db/query, shutdown flag)
 │   └── mcp/
@@ -440,23 +441,46 @@ one — a search itself returns only paths and metadata, never content.
   Wildcards (`*` / `?`) are rejected with a pointer to `search_in_folder`, a
   folder is rejected with a pointer to `list_folder`, and a relative path is
   an error. Those pure argument problems come back as `-32602
-  INVALID_PARAMS` before anything touches the disk; a missing file, a binary
-  file or one over the size limit comes back as a tool error (`isError:
-  true`).
-- **8 MiB per file**, refused above that — a large file is never read into
-  memory. The response is additionally capped at 512 KiB of text (minified
-  single-line files, very long log lines); when either cap bites,
-  `truncated` is `true`.
+  INVALID_PARAMS` before anything touches the disk. Runtime problems (missing
+  file, binary file, over the size limit, denylisted path) come back as a
+  tool error (`isError: true`) whose body is structured JSON —
+  `{ "error": "…", "code": "NOT_FOUND" }`. **Branch on `code`, not on the
+  wording**: `NOT_FOUND` / `PATH_IS_DIRECTORY` / `PATH_DENIED` /
+  `BINARY_CONTENT` / `TOO_LARGE` / `READ_FAILED`. The directory case also
+  carries `suggested_tool: "list_folder"` and `suggested_args`, so a
+  recovering agent needs no extra round trip.
+- 🔒 **Sensitive-path denylist**: private keys and credential bundles are
+  **never** returned — `id_rsa`/`id_dsa`/`id_ecdsa`/`id_ed25519`, `.env`
+  (except `.env.example` / `.sample` / `.template` / `.dist`), `.netrc`,
+  `.git-credentials`, `credentials.json`, `*.pem` / `*.key` / `*.p12` /
+  `*.pfx` / `*.jks` / `*.keystore` / `*.ppk`, and everything under
+  `.git/objects`. A hit comes back as `PATH_DENIED`, refused **before any
+  stat** — the path is not even touched. **The list is not configurable**: it
+  is the only thing standing between this LLM-facing read tool and a prompt
+  injection that tries to exfiltrate `~/.ssh/id_rsa`. It applies to content
+  reads only — search results do not hide these files, because the file name
+  is not the secret; the content is.
+- **8 MiB per file**, refused above that (`TOO_LARGE`) — a large file is
+  never read into memory. The response is additionally capped at a 512 KiB
+  byte budget, accumulated **whole lines at a time**, so the budget never
+  cuts a line in half.
+- **Overlong lines are cut**: a line longer than 16384 characters is
+  truncated, and `clipped_lines` reports how many were (so a minified
+  single-line file cannot swallow the window). A clipped line still counts
+  as one line in `lines_returned`.
 - **Paging**: `start_line` is the 1-based first line to return (default 1)
   and `max_lines` the number of lines (default 200; `0` means all
-  remaining). `total_lines` and `lines_returned` in the response tell you
-  whether more remains; a `start_line` past the end returns an empty window
+  remaining). The response hands you `next_start_line` — pass it straight
+  back as `start_line` for the next page, and stop when it is `null`. No
+  arithmetic needed. A `start_line` past the end returns an empty window
   rather than an error.
 - **The response has two content items**: a metadata JSON object (`path` /
-  `size` / `total_lines` / `start_line` / `lines_returned` / `truncated` /
-  `encoding`) followed by the text itself. The body is a separate item so it
-  stays verbatim — inside JSON every newline would become `\n`, which is
-  both harder to read and easy to mangle when quoting later.
+  `size` / `total_lines` / `start_line` / `lines_returned` /
+  `next_start_line` / `truncated` / `clipped_lines` / `encoding`) followed by
+  the text itself. The body is a separate item so it stays verbatim — inside
+  JSON every newline would become `\n`, which is both harder to read and easy
+  to mangle when quoting later. `truncated` means only "there is more beyond
+  this window"; it is a different thing from `clipped_lines`.
 - **`encoding` reports how the bytes were decoded**: `utf-8` / `utf-16le` /
   `utf-16be` are certain (valid UTF-8, or an explicit BOM); `ansi` means the
   bytes were neither valid UTF-8 nor BOM-prefixed, so **the machine's ANSI
@@ -470,9 +494,9 @@ one — a search itself returns only paths and metadata, never content.
   `content:"…"` (see
   [Content search and making it fast](#content-search-and-making-it-fast));
   `read_file` only reads the one file you name.
-- ⚠️ This tool can read **any** absolute path the Everything process can
-  read, not only indexed files. The server listens on `127.0.0.1` by default
-  (see Configuration) — do not expose it to a network.
+- ⚠️ Apart from that denylist, this tool can read **any** absolute path the
+  Everything process can read, not only indexed files. The server listens on
+  `127.0.0.1` by default (see Configuration) — do not expose it to a network.
 
 Argument rules shared by all three tools: `folder` must be an absolute path
 (`C:\…` or `\\server\share\…`). Quoted, forward-slash, doubled-backslash and

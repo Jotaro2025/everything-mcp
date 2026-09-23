@@ -54,6 +54,7 @@ everything-mcp/
 │   │   ├── journal.rs          索引日志（index-journal-*.txt）解析与查询
 │   │   ├── read.rs             read_file：单文件正文读取（行窗口 / 大小上限）
 │   │   ├── search.rs           异步搜索 → 同步等待的高层封装（主线程 marshaling）
+│   │   ├── sensitive.rs        敏感路径黑名单（私钥 / .env / 凭据 / .git/objects）
 │   │   ├── main_thread.rs      主线程窗口 + PostMessage 任务分发
 │   │   └── state.rs            运行期状态（懒创建的 db/query、关闭标志）
 │   └── mcp/
@@ -386,18 +387,37 @@ gitignore），常见做法：
 - `path` 必须是**绝对路径**且指向**单个已存在的文件**。通配符（`*` / `?`）
   会被拒绝并提示改用 `search_in_folder`，目录会被拒绝并提示改用
   `list_folder`，相对路径直接报错。这些纯入参问题都在读盘之前返回
-  `-32602 INVALID_PARAMS`；文件不存在、是二进制、超过大小上限则作为工具错误
-  返回（`isError: true`）。
-- **单文件上限 8 MiB**，超过直接报错 —— 不会把大文件读进内存。返回内容另有
-  512 KiB 字节上限兜底（压缩过的单行文件、超长单行日志），触顶时
-  `truncated` 为 `true`。
+  `-32602 INVALID_PARAMS`；运行期问题（文件不存在、是二进制、超过大小上限、
+  命中黑名单）作为工具错误返回（`isError: true`），错误体是结构化 JSON：
+  `{ "error": "…", "code": "NOT_FOUND" }`，**按 `code` 分支**而不是解析文案。
+  目录那条还会带 `suggested_tool: "list_folder"` 与 `suggested_args`，省掉
+  一轮试错。错误码：`NOT_FOUND` / `PATH_IS_DIRECTORY` / `PATH_DENIED` /
+  `BINARY_CONTENT` / `TOO_LARGE` / `READ_FAILED`。
+- 🔒 **敏感路径黑名单**：私钥与凭据文件**永不返回** ——
+  `id_rsa`/`id_dsa`/`id_ecdsa`/`id_ed25519`、`.env`（`.env.example` /
+  `.sample` / `.template` / `.dist` 除外）、`.netrc`、`.git-credentials`、
+  `credentials.json`、`*.pem` / `*.key` / `*.p12` / `*.pfx` / `*.jks` /
+  `*.keystore` / `*.ppk`，以及 `.git/objects` 整棵树。命中返回
+  `PATH_DENIED`，且**在读盘之前就拒**（连文件是否存在都不去碰）。
+  **这份名单不可配置** —— 它是这个面向 LLM 的读文件工具里唯一能挡住
+  「提示注入 → 读走 `~/.ssh/id_rsa`」的机制。名单只作用于读正文，
+  搜索结果不隐藏这些文件：文件名不是秘密，正文才是。
+- **单文件上限 8 MiB**，超过直接报错（`TOO_LARGE`）—— 不会把大文件读进内存。
+  返回内容另有 512 KiB 字节预算兜底，**按整行累加**：预算拦下时只会少返回
+  整行，不会从一行中间切开。
+- **超长行会被裁短**：超过 16384 字符的行裁到上限，裁了几行由 `clipped_lines`
+  上报（压缩过的单行 js / 单行 JSON 因此不会一口吃掉整个窗口）。裁过的行仍
+  算一行，`lines_returned` 照常计数。
 - **分页**：`start_line` 是 1 起的起始行号（默认 1），`max_lines` 是返回行数
-  （默认 200，`0` 表示余下全部）。响应里的 `total_lines` 与 `lines_returned`
-  用来判断还有没有更多；`start_line` 超出末尾返回空窗口而不是报错。
+  （默认 200，`0` 表示余下全部）。响应直接给 `next_start_line` ——
+  把上次的 `next_start_line` 原样传回 `start_line` 就是下一页，它是 `null`
+  表示读完了，不用自己算。`start_line` 超出末尾返回空窗口而不是报错。
 - **响应是两段 content**：第一段是元信息 JSON（`path` / `size` /
-  `total_lines` / `start_line` / `lines_returned` / `truncated` / `encoding`），
-  第二段是正文原文。正文单独成项是为了保持原样 —— 塞进 JSON 会把换行转义成
-  `\n`，读代码时既难读又容易在后续引用时出错。
+  `total_lines` / `start_line` / `lines_returned` / `next_start_line` /
+  `truncated` / `clipped_lines` / `encoding`），第二段是正文原文。正文单独
+  成项是为了保持原样 —— 塞进 JSON 会把换行转义成 `\n`，读代码时既难读又容易
+  在后续引用时出错。`truncated` 只表示「窗口外还有内容」，与 `clipped_lines`
+  是两件事。
 - **`encoding` 说明正文是怎么解出来的**：`utf-8` / `utf-16le` / `utf-16be`
   是确定的（合法 UTF-8 或带 BOM）；`ansi` 表示既不是合法 UTF-8 也没有 BOM，
   于是按**本机 ANSI 代码页**解（中文 Windows 即 GBK —— 老文档、老日志常见）；
@@ -406,8 +426,9 @@ gitignore），常见做法：
 - **二进制文件会被拒绝**（正文含 NUL 字节），返回错误而不是一堆乱码。
 - 想按内容找文件请用 `search_in_folder` 的 `content:"…"`（见上面的
   [正文检索与提速](#正文检索与提速)）；`read_file` 只读你指定的那一个文件。
-- ⚠️ 本工具能读 Everything 进程有权限读的**任意**绝对路径，不限于已索引的
-  文件。服务默认只监听 `127.0.0.1`（见「配置」），请勿把它暴露到网络上。
+- ⚠️ 除上面那份黑名单外，本工具能读 Everything 进程有权限读的**任意**绝对
+  路径，不限于已索引的文件。服务默认只监听 `127.0.0.1`（见「配置」），请勿
+  把它暴露到网络上。
 
 三个工具共用的入参规则：`folder` 必须是绝对路径（`C:\…` 或 `\\server\share\…`）。
 带引号、正斜杠、重复反斜杠、尾斜杠的写法会被自动规范化；通配符属于 `pattern`

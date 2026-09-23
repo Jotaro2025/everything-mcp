@@ -506,13 +506,33 @@ pub fn dispatch(name: &str, args: &Value) -> Result<ToolOutput, (i32, String)> {
                         "total_lines": c.total_lines,
                         "start_line": c.start_line,
                         "lines_returned": c.lines_returned,
+                        "next_start_line": c.next_start_line,
                         "truncated": c.truncated,
+                        "clipped_lines": c.clipped_lines,
                         "encoding": c.encoding,
                     }))
                     .unwrap_or_else(|_| "{\"error\":\"serialization failed\"}".into());
                     Ok((content_meta_and_body(&meta, &c.text), false))
                 }
-                Err(e) => Ok((content_text(&format!("read_file error: {}", e)), true)),
+                Err(e) => {
+                    // 结构化错误：给机器可读的 code，调用方据此决定换工具还是
+                    // 改参数，不必解析文案。
+                    let plugin::read::ReadError {
+                        code,
+                        message,
+                        path,
+                    } = e;
+                    let mut payload = json!({ "error": message, "code": code });
+                    // 目录是唯一有明确替代品的情况 —— 直接把建议的调用参数
+                    // 一并给出，省掉一轮试错。
+                    if code == plugin::read::ERR_PATH_IS_DIRECTORY {
+                        payload["suggested_tool"] = json!("list_folder");
+                        payload["suggested_args"] = json!({ "folder": path });
+                    }
+                    let text = serde_json::to_string_pretty(&payload)
+                        .unwrap_or_else(|_| format!("read_file error: {}", code));
+                    Ok((content_text(&text), true))
+                }
             }
         }
 
