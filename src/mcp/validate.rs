@@ -152,3 +152,31 @@ pub fn translate_globstar(pattern: &str) -> String {
     }
     p.to_string()
 }
+
+/// 校验全局搜索（search_everywhere）的 pattern —— 文件夹范围之外的额外护栏。
+///
+/// 全局搜索的暴露面是整个索引，pattern 再放任下去就是「列出全盘」：
+///   - 去掉空白后至少 2 个字符 —— 空 / 单字符 pattern 的命中量是灾难级的，
+///     全局场景下没有「列出全部」的合法需求（那属于 list_folder）；
+///   - 禁止 `content:` —— 正文检索必须收窄到文件夹（search_in_folder），
+///     全局 `content:` 等于读遍所有已索引磁盘上的所有文件，慢且危险。
+///     大小写、`case:content:` 之类的搜索函数链写法一并挡掉（统一小写查子串；
+///     Windows 文件名里不允许冒号，`content:` 出现在 pattern 里只可能是搜索函数）。
+///
+/// 入参应当已经过 [`validate_pattern`] + [`translate_globstar`]。
+pub fn validate_global_pattern(pattern: &str) -> Result<String, String> {
+    let p = pattern.trim();
+    if p.chars().count() < 2 {
+        return Err(format!(
+            "global 'pattern' must be at least 2 characters — a global search needs a name to look for (e.g. '*.vhd', '\"quarterly report\"'); received {:?}",
+            pattern
+        ));
+    }
+    if p.to_ascii_lowercase().contains("content:") {
+        return Err(format!(
+            "global 'pattern' must not use 'content:' — a full-disk content scan is too slow and too broad; use search_in_folder with a folder to narrow the scope; received {:?}",
+            pattern
+        ));
+    }
+    Ok(p.to_string())
+}

@@ -416,7 +416,11 @@ pub fn dispatch_rpc_http(body: &str, head: &RequestHead) -> (u16, String) {
         "tools/list" => {
             // ListToolsResult 继承 CacheableResult：modern 时代除 resultType 外
             // 还必须带 ttlMs / cacheScope，缺失会被客户端判为无效结果。
-            let result = protocol::with_result_type(protocol::make_tools_list(), modern);
+            // 全局搜索档位影响 search_everywhere 的描述前缀与注解（形状不变）。
+            let result = protocol::with_result_type(
+                protocol::make_tools_list(crate::options::global_search_mode()),
+                modern,
+            );
             let result = protocol::with_cache_control(result, modern, protocol::TOOLS_LIST_TTL_MS);
             protocol::ok_response(&id, result)
         }

@@ -6,7 +6,7 @@
 
 use serde_json::{json, Value};
 
-use crate::mcp::protocol::{INVALID_PARAMS, METHOD_NOT_FOUND};
+use crate::mcp::protocol::{GlobalSearchMode, INVALID_PARAMS, METHOD_NOT_FOUND};
 use crate::mcp::validate;
 use crate::plugin;
 
@@ -174,6 +174,10 @@ const INDEX_CHANGES_DEFAULT: u64 = 50;
 /// `index_changes` 的返回条数上限。日志一行一条，2000 条已是很长的排查
 /// 历史；再加限是为了不让一次调用把整天的日志啃穿。
 const INDEX_CHANGES_LIMIT: u64 = 2000;
+
+/// `search_everywhere` 的返回条数上限（1..=500）。全局命中集可能是几十万条，
+/// 窗口必须封顶 —— 0 也不再有「不限」的第二含义，越界直接报 INVALID_PARAMS。
+const GLOBAL_MAX_RESULTS: u64 = 500;
 
 /// 把 `action` 参数映射成 journal 的动作枚举。
 ///
@@ -660,6 +664,97 @@ pub fn dispatch(name: &str, args: &Value) -> Result<ToolOutput, (i32, String)> {
                     Ok((content_text(&text), false))
                 }
                 Err(e) => Ok((content_text(&format!("grep error: {}", e)), true)),
+            }
+        }
+
+        "search_everywhere" => {
+            // 全局按名搜索：整个索引（所有本地盘 + 已索引网络共享），不限文件夹。
+            // 顺序刻意如此：入参校验先行（纯入参问题，无主程序环境的 CI 也能跑），
+            // 再过 mcp_global_search 模式闸门，最后才触达搜索层。
+            let pattern = pattern_arg(args)?;
+            let pattern =
+                validate::validate_global_pattern(&pattern).map_err(|e| (INVALID_PARAMS, e))?;
+            let excludes = exclude_arg(args)?;
+            let match_regex = bool_arg(args, "match_regex", false)?;
+            let query = combine_query(&regex_term(&pattern, match_regex), &excludes);
+            let offset = u64_arg(args, "offset", 0)? as usize;
+            // 全局窗口必须封顶：0 不是「不限」而是写错（与 read_file 的
+            // max_lines 同一形态）。
+            let max_results = u64_arg(args, "max_results", 50)?;
+            if max_results == 0 || max_results > GLOBAL_MAX_RESULTS {
+                return Err((
+                    INVALID_PARAMS,
+                    format!(
+                        "'max_results' must be between 1 and {}; received {}",
+                        GLOBAL_MAX_RESULTS, max_results
+                    ),
+                ));
+            }
+            let timeout_ms = u64_arg(args, "timeout_ms", 10_000)? as u32;
+            let sort = sort_arg(args)?;
+            let descending = bool_arg(args, "descending", false)?;
+
+            // 模式闸门：只有 Deny 档在这里硬拒（结构化错误 + 开启指引）。
+            // Review / Allow 都放行到搜索层 —— Review 档的把关是客户端的
+            // 确认弹窗（工具注解驱动），服务端不重复设卡。
+            let mode = crate::options::global_search_mode();
+            if mode == GlobalSearchMode::Deny {
+                let payload = serde_json::to_string_pretty(&json!({
+                    "error": "global search is disabled on this server (global search mode = 'deny')",
+                    "code": "GLOBAL_SEARCH_DISABLED",
+                    "mode": mode.as_str(),
+                    "how_to_enable": "set Everything > Options > Plugins > MCP > global search to 'review' or 'allow' and click Apply; until then use search_in_folder with a folder",
+                }))
+                .unwrap_or_else(|_| "{\"error\":\"serialization failed\"}".into());
+                return Ok((content_text(&payload), true));
+            }
+
+            let options = plugin::search::SearchOptions {
+                scope: plugin::search::SearchScope::Global,
+                match_case: bool_arg(args, "match_case", false)?,
+                match_whole_word: bool_arg(args, "match_whole_word", false)?,
+                sort,
+                descending,
+            };
+
+            match plugin::search::search_everywhere(
+                &query,
+                offset,
+                max_results as usize,
+                timeout_ms,
+                options,
+            ) {
+                Ok(outcome) => {
+                    let entries: Vec<Value> = outcome
+                        .results
+                        .iter()
+                        .map(|r| {
+                            json!({
+                                "name": r.name,
+                                "path": r.path,
+                                "kind": if r.is_folder { "folder" } else { "file" },
+                                "size": r.size,
+                                "modified": r.modified,
+                                "created": r.created,
+                            })
+                        })
+                        .collect();
+                    let text = serde_json::to_string_pretty(&json!({
+                        "mode": mode.as_str(),
+                        "pattern": pattern,
+                        "exclude": excludes,
+                        "sort": sort.as_str(),
+                        "descending": descending,
+                        "offset": outcome.offset,
+                        "count": entries.len(),
+                        "total": outcome.total,
+                        "results": entries,
+                    }))
+                    .unwrap_or_else(|_| "{\"error\":\"serialization failed\"}".into());
+
+                    Ok((content_text(&text), false))
+                }
+                Err(e) => Ok((content_text(&format!("search error: {}", e)), true)),
             }
         }
 

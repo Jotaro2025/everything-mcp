@@ -16,10 +16,13 @@ an **MCP (Model Context Protocol)** server for LLMs (Claude Desktop, Cursor, …
   `serde` / `serde_json` and `windows-sys` are all statically linked, and so is
   the CRT (see `.cargo/config.toml`).
 - **Folder-first** — LLMs usually work inside a specific project directory, so
-  the tools are folder-scoped by design instead of scanning the whole disk.
-- **Settings page** — enable switch, bind address and port are configurable in
-  Everything's own options dialog; clicking Apply takes effect immediately,
-  without restarting Everything.
+  the tools are folder-scoped by design instead of scanning the whole disk. An
+  optional global name search (`search_everywhere`) covers the "I know what the
+  file is called but not which share it lives in" case — off by default,
+  governed by a three-mode Deny / Review / Allow switch (see Configuration).
+- **Settings page** — enable switch, bind address, port and the global-search
+  mode are configurable in Everything's own options dialog; clicking Apply
+  takes effect immediately, without restarting Everything.
 - **MCP Streamable HTTP** — listens on `127.0.0.1:8285` by default, one
   JSON-RPC message over HTTP per request.
 - **Dual-era MCP protocol** — one endpoint serves both client generations:
@@ -54,7 +57,7 @@ everything-mcp/
 ├── src/
 │   ├── lib.rs                   Plugin entry everything_plugin_proc + PM_* dispatch
 │   ├── options.rs              Settings page in Everything's options dialog
-│   │                            (enable/bind/port/restore defaults) + settings state
+│   │                            (enable/bind/port/global-search mode/restore defaults) + settings state
 │   ├── plugin/
 │   │   ├── mod.rs               Submodule summary + PM_* constants
 │   │   ├── diag.rs              Disk diagnostic log (%LOCALAPPDATA%\everything-mcp\plugin.log)
@@ -72,7 +75,7 @@ everything-mcp/
 │       ├── protocol.rs          JSON-RPC 2.0 + dual-era MCP types (2024-11-05 / 2026-07-28)
 │       ├── server.rs            HTTP server on std::net; per-request version
 │       │                         negotiation and Origin validation
-│       ├── tools.rs             Tool implementations (search_in_folder/list_folder/count/index_changes/read_file)
+│       ├── tools.rs             Tool implementations (search_in_folder / list_folder / count / index_changes / read_file / grep / search_everywhere)
 │       └── validate.rs          Argument validation & path normalization
 ├── installer/
 │   ├── build-installers.ps1     One-command packaging script (x64 + x86 installers)
@@ -206,12 +209,14 @@ when absent):
 | `mcp_enabled`  | int    | `0`           | 0 disables the MCP server (off until you opt in) |
 | `mcp_port`     | int    | `8285`        | HTTP listen port               |
 | `mcp_bind`     | string | `127.0.0.1`   | Bind address (localhost only)  |
+| `mcp_global_search` | int | `0`     | Global-search mode: `0` deny (default — `search_everywhere` calls return `GLOBAL_SEARCH_DISABLED`) / `1` review (usable, but the tool is annotated as needing user confirmation, so the client prompts first) / `2` allow (served directly, no prompt) |
 
 Settings live in `%APPDATA%\Everything\Plugins.ini`, in this plugin's own
 section `[everything_mcp64.dll]` (`[everything_mcp32.dll]` on 32-bit) — not in
 Everything's `Settings.ini`, and not shared with the official http_server
 plugin's section. They can also be edited in Everything's options dialog under
-Plugins → MCP (enable switch, bind address, port, restore defaults); clicking
+Plugins → MCP (enable switch, bind address, port, global-search mode, restore
+defaults); clicking
 Apply takes effect immediately — no Everything restart needed.
 
 ### Connecting an MCP client
@@ -237,7 +242,7 @@ plugin is enabled (the Plugins → MCP page in Everything's options dialog, or
 `mcp_enabled=1` under `[everything_mcp64.dll]` in
 `%APPDATA%\Everything\Plugins.ini`).
 
-Once connected, the LLM discovers six tools automatically:
+Once connected, the LLM discovers seven tools automatically:
 
 #### 1. `search_in_folder`
 
@@ -263,6 +268,9 @@ Recursively find files/folders under a given folder using Everything search synt
   faithfully and is passed through as-is.
 - Exclude matches with a `!` prefix (e.g. `ext:rs !test`), or use the
   `exclude` parameter (below).
+- **Don't know which folder?** Locate the file by name with
+  `search_everywhere` (section 7; needs to be enabled in the settings), then
+  come back with the full path for scoped searches.
 - `content:` works **out of the box** — you do not need content indexing on
   the Everything side first. But an unfiltered content search is slow enough
   to time out, so see
@@ -558,6 +566,56 @@ that one uses Everything's index to answer *which files* contain something
   results.
 - `case_insensitive` defaults to `false`; `exclude` works as in the other
   tools.
+
+#### 7. `search_everywhere`
+
+Search by **file name** across the entire Everything index — every local drive
+and indexed network share, no folder needed. It answers "I know what the file
+is called but not which share it lives in" (otherwise an agent can only
+`net view \\NAS` and probe shares one by one). Results come back with **full
+paths**, ready to hand to `search_in_folder` / `list_folder` for scoped
+follow-up work.
+
+```json
+{
+  "pattern": "*.vhd",
+  "exclude": ["\\\\old\\\\"],
+  "sort": "modified",
+  "descending": true,
+  "max_results": 50
+}
+```
+
+- **Off by default, governed by a three-mode global-search switch**
+  (Everything → Options → Plugins → MCP → global search):
+  - **Deny** (default): every call returns `GLOBAL_SEARCH_DISABLED` (a hard
+    server-side gate, effective immediately); the other six tools are
+    unaffected and stay folder-scoped. The error payload names the fix, so the
+    LLM can relay it to the user.
+  - **Review**: calls go through, but the tool is annotated as NOT read-only /
+    destructive (`destructiveHint: true`), so the client shows its permission
+    prompt first and the model does not call it on its own initiative. Nothing
+    on disk is modified either way — the annotation only drives the prompt.
+  - **Allow**: annotated read-only (`readOnlyHint: true`); calls are served
+    directly, without bothering the user.
+  The mode only changes the tool annotations and the POLICY paragraph in the
+  description; the tool-list shape never changes. Note the `tools/list` result
+  is cached for 5 minutes, so annotations can lag a switch by up to one TTL —
+  but the Deny gate is checked at call time and bites immediately.
+- **Two guard rails**: `pattern` must be at least 2 characters (a global empty
+  or single-character pattern matches a catastrophic number of entries), and
+  **`content:` is rejected** — a full-disk content scan is slow and broad, so
+  content search always stays folder-scoped in `search_in_folder`. Both come
+  back as `-32602 INVALID_PARAMS` before anything touches Everything.
+- Same argument shape as `search_in_folder`: `exclude` / `sort` / `descending`
+  / `match_case` / `match_whole_word` / `match_regex` / `offset` / `timeout_ms`
+  all mean the same thing; the difference is `max_results` caps at **500** (the
+  global window must be bounded), and `0` or out-of-range is a plain `-32602`,
+  not "unlimited" — unlike `search_in_folder`, where `max_results = 0` means
+  unlimited.
+- Each result carries `name` / `path` / `kind` / `size` / `modified` /
+  `created` (ISO 8601 UTC timestamps), with the same `count` / `total` pair
+  and `offset` paging.
 
 Argument rules shared by all three tools: `folder` must be an absolute path
 (`C:\…` or `\\server\share\…`). Quoted, forward-slash, doubled-backslash and

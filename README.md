@@ -15,9 +15,11 @@ Context Protocol）接口暴露给 LLM（如 Claude Desktop、Cursor 等）使�
   等外不引入任何额外 DLL。Rust 标准库与 `serde` / `serde_json` / `windows-sys`
   全部静态链接（CRT 也静态链接，见 `.cargo/config.toml`）。
 - **文件夹优先** —— LLM 通常在指定项目目录下工作，本插件提供的工具以「按文件夹
-  搜索」为主，避免全局扫描带来的噪声。
-- **图形设置页** —— Everything 选项对话框内直接配置启用开关、绑定地址、端口，
-  改动点「应用」即时生效，无需重启 Everything。
+  搜索」为主，避免全局扫描带来的噪声。另有可选的全局按名搜索
+  （`search_everywhere`）：默认关闭，按「拒绝 / 审核 / 允许」三档管控（见
+  「配置」），专治「知道文件叫什么、不知道它在哪个共享里」。
+- **图形设置页** —— Everything 选项对话框内直接配置启用开关、绑定地址、端口、
+  全局搜索档位，改动点「应用」即时生效，无需重启 Everything。
 - **MCP Streamable HTTP** —— 默认监听 `127.0.0.1:8285`，单条 JSON-RPC over HTTP。
 - **双时代 MCP 协议** —— 同一端点同时服务两代客户端：2024-11-05（`initialize`
   握手）与 2026-07-28（逐请求 `_meta` 版本声明 + `server/discover`）。版本不支持
@@ -45,7 +47,7 @@ everything-mcp/
 ├── .cargo/config.toml          target-feature=+crt-static（零第三方 DLL 的关键）
 ├── src/
 │   ├── lib.rs                  插件入口 everything_plugin_proc 与 PM_* 分发
-│   ├── options.rs              Everything 选项页（启用开关/绑定地址/端口/恢复默认）与设置状态机
+│   ├── options.rs              Everything 选项页（启用开关/绑定地址/端口/全局搜索档位/恢复默认）与设置状态机
 │   ├── plugin/
 │   │   ├── mod.rs              子模块汇总 + PM_* 常量
 │   │   ├── diag.rs             磁盘诊断日志（%LOCALAPPDATA%\everything-mcp\plugin.log）
@@ -62,7 +64,7 @@ everything-mcp/
 │       ├── mod.rs
 │       ├── protocol.rs         JSON-RPC 2.0 + MCP 双时代类型（2024-11-05 / 2026-07-28）
 │       ├── server.rs           基于 std::net 的 HTTP 服务，按请求协商协议版本、校验 Origin
-│       ├── tools.rs            工具实现（search_in_folder/list_folder/count/index_changes/read_file）
+│       ├── tools.rs            工具实现（search_in_folder / list_folder / count / index_changes / read_file / grep / search_everywhere）
 │       └── validate.rs         入参校验与路径规范化（folder 规范化、pattern 校验）
 ├── installer/
 │   ├── build-installers.ps1    一键打包脚本（x64 / x86 两个安装包）
@@ -185,12 +187,13 @@ Everything 官方插件页：<https://www.voidtools.com/support/everything/plugi
 | `mcp_enabled` | int    | `0`           | 0 关闭 MCP 服务（默认不启用，需勾选） |
 | `mcp_port`    | int    | `8285`        | HTTP 监听端口                 |
 | `mcp_bind`    | string | `127.0.0.1`   | 绑定地址（仅本机访问）        |
+| `mcp_global_search` | int | `0`        | 全局搜索档位：`0` 拒绝（默认，`search_everywhere` 调用一律返回 `GLOBAL_SEARCH_DISABLED`）/ `1` 审核（可用，但工具被标注为需用户确认，客户端先弹权限确认框）/ `2` 允许（直接可用，不弹确认） |
 
 设置存放于 `%APPDATA%\Everything\Plugins.ini` 的本插件专属小节
 `[everything_mcp64.dll]`（32 位系统上是 `[everything_mcp32.dll]`）——
 不是 Everything 的 `Settings.ini`，也不与 http_server 等官方插件共用小节。
 也可以直接在 Everything 选项对话框的「插件 → MCP」页修改（启用开关、绑定地址、
-端口、恢复默认），点「应用」后立即生效，无需重启 Everything。
+端口、全局搜索档位、恢复默认），点「应用」后立即生效，无需重启 Everything。
 
 ### MCP 客户端接入
 
@@ -213,7 +216,7 @@ Everything 官方插件页：<https://www.voidtools.com/support/everything/plugi
 或 `%APPDATA%\Everything\Plugins.ini` 的 `[everything_mcp64.dll]` 小节里
 `mcp_enabled=1`）。
 
-接入后 LLM 会自动发现以下六个工具：
+接入后 LLM 会自动发现以下七个工具：
 
 #### 1. `search_in_folder`
 
@@ -238,6 +241,8 @@ Everything 官方插件页：<https://www.voidtools.com/support/everything/plugi
   翻译，会原样传给 Everything。
 - 排除项用 `!` 前缀（如 `ext:rs !test`），或用 `exclude` 参数
   （见下）。
+- **不知道文件夹在哪？** 先用 `search_everywhere`（见第 7 节，需在设置里开启）
+  按名字全局定位，拿到完整路径再回来做限定范围的搜索。
 - `content:` 正文检索**开箱可用** —— 不需要先在 Everything 里建内容索引。
   但候选集不收窄会慢到超时，语法与提速办法见下面的
   [正文检索与提速](#正文检索与提速)。
@@ -479,6 +484,47 @@ gitignore），常见做法：
   （不报错、也不中断整次搜索）。黑名单在 grep 里同样生效：`.env` / 私钥的
   正文绝不会出现在结果里。
 - `case_insensitive` 默认 `false`（区分大小写）；`exclude` 与其它工具同义。
+
+#### 7. `search_everywhere`
+
+按**文件名**在整个 Everything 索引里搜索 —— 所有本地磁盘与已索引的网络共享，
+不需要指定文件夹。它是「知道文件叫什么、但不知道它在哪个共享里」这个场景的
+答案（否则 agent 只能 `net view \\NAS` 列共享、逐个试到命中）。返回**完整
+路径**，可以接着交给 `search_in_folder` / `list_folder` 做限定范围的后续操作。
+
+```json
+{
+  "pattern": "*.vhd",
+  "exclude": ["\\\\old\\\\"],
+  "sort": "modified",
+  "descending": true,
+  "max_results": 50
+}
+```
+
+- **默认关闭，按三档全局搜索开关管控**（Everything 选项 → 插件 → MCP →
+  全局搜索）：
+  - **拒绝**（默认）：调用一律返回 `GLOBAL_SEARCH_DISABLED`（服务端硬闸门，
+    立即生效），其余六个工具照常、仍限定在文件夹内。错误载荷里带开启方法，
+    LLM 可以直接转告用户。
+  - **审核**：调用放行，但工具被标注为「非只读 / 破坏性」（`destructiveHint:
+    true`），客户端据此先弹权限确认框，模型不会自作主张调用。无论是否放行，
+    磁盘都不会被改动 —— 这个标注只用来驱动确认弹窗。
+  - **允许**：标注为只读（`readOnlyHint: true`），调用直接放行，不再打扰用户。
+  三档只改变工具注解与描述里的 POLICY 段，工具清单形状不变。注意 `tools/list`
+  结果带 5 分钟缓存，切档后注解最多滞后一个 TTL，但「拒绝」档的硬闸在调用时
+  检查，立即生效。
+- **两道护栏**：`pattern` 至少 2 个字符（全局空 / 单字符 pattern 的命中量是
+  灾难级的），且**禁止 `content:`** —— 全局正文扫描又慢又广，正文检索永远
+  留给带 folder 的 `search_in_folder`。两道都在触达 Everything 之前返回
+  `-32602 INVALID_PARAMS`。
+- 入参与 `search_in_folder` 同构：`exclude` / `sort` / `descending` /
+  `match_case` / `match_whole_word` / `match_regex` / `offset` / `timeout_ms`
+  语义一致；区别是 `max_results` 上限 **500**（全局窗口必须封顶），`0` 或越界
+  直接 `-32602`，不是「不限」——这一点与 `search_in_folder` 的
+  `max_results = 0` 语义不同。
+- 结果每条带 `name` / `path` / `kind` / `size` / `modified` / `created`
+  （时间戳为 ISO 8601 UTC），同样有 `count` / `total` 配对，用 `offset` 翻页。
 
 三个工具共用的入参规则：`folder` 必须是绝对路径（`C:\…` 或 `\\server\share\…`）。
 带引号、正斜杠、重复反斜杠、尾斜杠的写法会被自动规范化；通配符属于 `pattern`

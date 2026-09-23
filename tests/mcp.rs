@@ -51,8 +51,8 @@ fn initialize_result_announces_protocol_version_and_tools_capability() {
 }
 
 #[test]
-fn tools_list_contains_six_tools_with_required_params() {
-    let list = protocol::make_tools_list();
+fn tools_list_contains_seven_tools_with_required_params() {
+    let list = protocol::make_tools_list(protocol::GlobalSearchMode::Deny);
     let tools = list["tools"].as_array().expect("tools must be an array");
     let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
     assert_eq!(
@@ -63,7 +63,8 @@ fn tools_list_contains_six_tools_with_required_params() {
             "count",
             "index_changes",
             "read_file",
-            "grep"
+            "grep",
+            "search_everywhere"
         ]
     );
 
@@ -129,11 +130,74 @@ fn tools_list_contains_six_tools_with_required_params() {
     assert_eq!(grep_props["head_limit"]["default"], 200);
     assert_eq!(grep_props["case_insensitive"]["default"], false);
     assert_eq!(grep_props["timeout_ms"]["default"], 10_000);
+
+    // search_everywhere：只要求 pattern；max_results 是硬窗口 1..500。
+    assert_eq!(tools[6]["inputSchema"]["required"], json!(["pattern"]));
+    let global_props = &tools[6]["inputSchema"]["properties"];
+    assert_eq!(global_props["max_results"]["default"], 50);
+    assert_eq!(global_props["max_results"]["minimum"], 1);
+    assert_eq!(global_props["max_results"]["maximum"], 500);
+    assert_eq!(global_props["offset"]["default"], 0);
+    assert_eq!(global_props["timeout_ms"]["default"], 10_000);
+    assert_eq!(global_props["sort"]["default"], "name");
+    assert_eq!(
+        global_props["sort"]["enum"],
+        json!(["name", "path", "size", "modified", "created"])
+    );
+}
+
+#[test]
+fn search_everywhere_annotations_and_policy_follow_the_global_mode() {
+    // 方案 3：三档模式改变的是 ToolAnnotations + 描述里的 POLICY 段。
+    // Review 档用 destructiveHint 驱动客户端的确认弹窗（并不真的改磁盘），
+    // Allow 档标只读以便客户端自动放行，Deny 档沿用 Review 的注解（不诱导
+    // 自动放行）并在描述里写明服务端会拒绝。
+    let entry = |m: protocol::GlobalSearchMode| protocol::make_tools_list(m)["tools"][6].clone();
+    let deny = entry(protocol::GlobalSearchMode::Deny);
+    let review = entry(protocol::GlobalSearchMode::Review);
+    let allow = entry(protocol::GlobalSearchMode::Allow);
+
+    // 形状不随模式变：名字与 inputSchema 恒定，切档不必宣告 listChanged。
+    for t in [&deny, &review, &allow] {
+        assert_eq!(t["name"], "search_everywhere");
+        assert_eq!(t["inputSchema"]["required"], json!(["pattern"]));
+    }
+
+    // Allow：只读注解 + 直接放行的说明。
+    assert_eq!(allow["annotations"]["readOnlyHint"], true);
+    assert_eq!(allow["annotations"]["destructiveHint"], false);
+    assert!(
+        allow["description"]
+            .as_str()
+            .unwrap()
+            .contains("global search' = allow")
+    );
+
+    // Review：非只读 + 破坏性（驱动确认弹窗），描述点名 USER 必须确认、磁盘不改。
+    assert_eq!(review["annotations"]["readOnlyHint"], false);
+    assert_eq!(review["annotations"]["destructiveHint"], true);
+    let desc = review["description"].as_str().unwrap();
+    assert!(desc.contains("the USER must confirm"), "{desc}");
+    assert!(desc.contains("Nothing on disk is ever modified"), "{desc}");
+
+    // Deny：同 Review 注解 + 说明服务端会硬拒。
+    assert_eq!(deny["annotations"]["readOnlyHint"], false);
+    assert_eq!(deny["annotations"]["destructiveHint"], true);
+    assert!(deny["description"]
+        .as_str()
+        .unwrap()
+        .contains("GLOBAL_SEARCH_DISABLED"));
+
+    // 幂等 / 开放世界提示三档一致。
+    for t in [&deny, &review, &allow] {
+        assert_eq!(t["annotations"]["idempotentHint"], true);
+        assert_eq!(t["annotations"]["openWorldHint"], true);
+    }
 }
 
 #[test]
 fn index_changes_description_and_schema_document_the_gotchas() {
-    let list = protocol::make_tools_list();
+    let list = protocol::make_tools_list(protocol::GlobalSearchMode::Deny);
     let tool = &list["tools"][3];
     let desc = tool["description"].as_str().unwrap();
 
@@ -171,7 +235,7 @@ fn index_changes_description_and_schema_document_the_gotchas() {
 
 #[test]
 fn search_description_warns_against_shell_glob_and_documents_truncation() {
-    let list = protocol::make_tools_list();
+    let list = protocol::make_tools_list(protocol::GlobalSearchMode::Deny);
     let search = &list["tools"][0];
 
     // 描述里必须点明三件评测中被踩过的坑：不是 glob、排除语法、截断可见。
@@ -194,7 +258,7 @@ fn search_description_warns_against_shell_glob_and_documents_truncation() {
 
 #[test]
 fn read_file_description_documents_the_contract() {
-    let list = protocol::make_tools_list();
+    let list = protocol::make_tools_list(protocol::GlobalSearchMode::Deny);
     let tool = &list["tools"][4];
     assert_eq!(tool["name"], "read_file");
     let desc = tool["description"].as_str().unwrap();
@@ -400,7 +464,7 @@ fn read_file_rejects_binary_content() {
 
 #[test]
 fn grep_description_documents_the_contract() {
-    let list = protocol::make_tools_list();
+    let list = protocol::make_tools_list(protocol::GlobalSearchMode::Deny);
     let tool = &list["tools"][5];
     assert_eq!(tool["name"], "grep");
     let desc = tool["description"].as_str().unwrap();
@@ -516,7 +580,7 @@ fn read_file_denies_private_keys_and_env_files() {
 
 #[test]
 fn list_folder_description_documents_zero_folder_size() {
-    let list = protocol::make_tools_list();
+    let list = protocol::make_tools_list(protocol::GlobalSearchMode::Deny);
     let desc = list["tools"][1]["description"].as_str().unwrap();
     assert!(desc.contains("size 0"), "desc: {desc}");
     assert!(desc.contains("recursive"));
@@ -524,7 +588,7 @@ fn list_folder_description_documents_zero_folder_size() {
 
 #[test]
 fn count_description_documents_fast_path() {
-    let list = protocol::make_tools_list();
+    let list = protocol::make_tools_list(protocol::GlobalSearchMode::Deny);
     let desc = list["tools"][2]["description"].as_str().unwrap();
     assert!(desc.contains("without fetching names"), "desc: {desc}");
 }
@@ -632,10 +696,10 @@ fn dispatch_ping_returns_empty_result() {
 }
 
 #[test]
-fn dispatch_tools_list_returns_six_tools() {
+fn dispatch_tools_list_returns_seven_tools() {
     let resp = dispatch(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#);
     let list = resp["result"]["tools"].as_array().unwrap();
-    assert_eq!(list.len(), 6);
+    assert_eq!(list.len(), 7);
 }
 
 #[test]
@@ -744,6 +808,54 @@ fn exclude_of_wrong_shape_is_invalid_params_before_search() {
         assert_eq!(err.0, protocol::INVALID_PARAMS, "{}", name);
         assert!(err.1.contains("every item"));
     }
+}
+
+#[test]
+fn search_everywhere_arg_validation_before_touching_anything() {
+    // 全部在触达 Everything host 与模式闸门之前返回 —— 无主程序环境的 CI 也能跑。
+    // 缺 pattern / 写成非字符串：全局搜索必须有名字可找，空串落进 ≥2 字符护栏。
+    let err = tools::dispatch("search_everywhere", &json!({})).unwrap_err();
+    assert_eq!(err.0, protocol::INVALID_PARAMS);
+    assert!(err.1.contains("pattern"), "{}", err.1);
+    let err = tools::dispatch("search_everywhere", &json!({"pattern": 42})).unwrap_err();
+    assert_eq!(err.0, protocol::INVALID_PARAMS);
+
+    // 两道护栏：≥2 字符、禁 content:（正文检索必须收窄到文件夹）。
+    let err = tools::dispatch("search_everywhere", &json!({"pattern": "a"})).unwrap_err();
+    assert_eq!(err.0, protocol::INVALID_PARAMS);
+    assert!(err.1.contains("at least 2 characters"), "{}", err.1);
+    let err =
+        tools::dispatch("search_everywhere", &json!({"pattern": "content:secret"})).unwrap_err();
+    assert_eq!(err.0, protocol::INVALID_PARAMS);
+    assert!(err.1.contains("content:"), "{}", err.1);
+
+    // max_results 是硬窗口：0 与 501 都是写错，不是「不限」。
+    for bad in [0, 501] {
+        let err = tools::dispatch(
+            "search_everywhere",
+            &json!({"pattern": "ab", "max_results": bad}),
+        )
+        .unwrap_err();
+        assert_eq!(err.0, protocol::INVALID_PARAMS, "max_results={bad}");
+        assert!(err.1.contains("between 1 and 500"), "{}", err.1);
+    }
+}
+
+#[test]
+fn search_everywhere_deny_gate_returns_global_search_disabled() {
+    // 默认档（Deny）：合法入参过了校验后被模式闸门硬拒 —— 返回工具级错误
+    // （is_error=true）而非 JSON-RPC 错误，载荷是结构化 JSON，LLM 一眼看出
+    // 原因、开启方法与退回 search_in_folder 的提示。测试进程里的设置状态
+    // 就是默认档（Deny），无需装机环境。
+    let out = tools::dispatch("search_everywhere", &json!({"pattern": "*.iso"})).unwrap();
+    assert!(out.1, "deny 档必须是工具错误: {}", out_text(&out));
+    let err = out_error(&out);
+    assert_eq!(err["code"], "GLOBAL_SEARCH_DISABLED");
+    assert_eq!(err["mode"], "deny");
+    assert!(err["how_to_enable"]
+        .as_str()
+        .unwrap()
+        .contains("search_in_folder"));
 }
 
 // ====================================================================
@@ -907,7 +1019,7 @@ fn modern_tools_list_result_carries_result_type() {
     );
     assert_eq!(status, 200);
     assert_eq!(resp["result"]["resultType"], "complete");
-    assert_eq!(resp["result"]["tools"].as_array().unwrap().len(), 6);
+    assert_eq!(resp["result"]["tools"].as_array().unwrap().len(), 7);
 }
 
 #[test]
@@ -916,7 +1028,7 @@ fn legacy_tools_list_has_no_result_type() {
     // 客户端按桥接规则把缺失当作 complete。
     let resp = dispatch(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#);
     assert!(resp["result"].get("resultType").is_none());
-    assert_eq!(resp["result"]["tools"].as_array().unwrap().len(), 6);
+    assert_eq!(resp["result"]["tools"].as_array().unwrap().len(), 7);
 }
 
 #[test]
@@ -1339,7 +1451,7 @@ fn end_to_end_over_real_tcp() {
     assert_eq!(resp["result"]["resultType"], "complete");
     assert_eq!(resp["result"]["ttlMs"], json!(protocol::TOOLS_LIST_TTL_MS));
     assert_eq!(resp["result"]["cacheScope"], "public");
-    assert_eq!(resp["result"]["tools"].as_array().unwrap().len(), 6);
+    assert_eq!(resp["result"]["tools"].as_array().unwrap().len(), 7);
     // 清单里应当能看到新工具，且按现有顺序排在最后。
     let names: Vec<&str> = resp["result"]["tools"]
         .as_array()
@@ -1349,6 +1461,8 @@ fn end_to_end_over_real_tcp() {
         .collect();
     assert_eq!(names[3], "index_changes");
     assert_eq!(resp["result"]["tools"][3]["name"], "index_changes");
+    assert_eq!(names[6], "search_everywhere");
+    assert_eq!(resp["result"]["tools"][6]["name"], "search_everywhere");
 
     // modern 未知方法 → 404。
     let (head, _) = http_post(

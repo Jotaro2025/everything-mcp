@@ -7,9 +7,12 @@
 //! （http_server.c 同样直接用 IsDlgButtonChecked / GetDlgItemInt）。
 //!
 //! 设置项（键名与 Everything.ini 中一致，读取/写回对称）：
-//!   - `mcp_enabled`：是否启用 MCP 服务（**默认 0 = 不启用**）
-//!   - `mcp_bind`    ：监听地址（默认 127.0.0.1，仅本机）
-//!   - `mcp_port`    ：监听端口（默认 8285）
+//!   - `mcp_enabled`       ：是否启用 MCP 服务（**默认 0 = 不启用**）
+//!   - `mcp_bind`          ：监听地址（默认 127.0.0.1，仅本机）
+//!   - `mcp_port`          ：监听端口（默认 8285）
+//!   - `mcp_global_search` ：全局搜索档位 —— 0 拒绝（默认）/ 1 审核 / 2 允许，
+//!     见 [`GlobalSearchMode`]。设置页用三个互斥复选框呈现（SDK 没有单选框
+//!     工厂，点选即自动取消另外两个，行为等同单选组）。
 //!
 //! 生命周期（全部消息都在 Everything 主线程上到达）：
 //!   PM_START              options::init —— 读设置并按需启动/保持关闭
@@ -35,6 +38,7 @@ use windows_sys::Win32::UI::Controls::{
 use windows_sys::Win32::UI::WindowsAndMessaging::{GetClientRect, GetDlgItemInt, SetDlgItemInt};
 
 use crate::mcp;
+use crate::mcp::protocol::GlobalSearchMode;
 use crate::plugin::diag;
 use crate::plugin::ffi_types::Utf8Buf;
 use crate::plugin::host::Host;
@@ -53,6 +57,7 @@ pub const DEFAULT_BIND: &str = "127.0.0.1";
 const KEY_ENABLED: &[u8] = b"mcp_enabled\0";
 const KEY_PORT: &[u8] = b"mcp_port\0";
 const KEY_BIND: &[u8] = b"mcp_bind\0";
+const KEY_GLOBAL_SEARCH: &[u8] = b"mcp_global_search\0";
 
 /// 设置页控件 ID（页面内唯一即可；IDOK/IDCANCEL 在父对话框，不会冲突）。
 const ID_ENABLED: i32 = 1;
@@ -61,6 +66,10 @@ const ID_BIND_EDIT: i32 = 3;
 const ID_PORT_STATIC: i32 = 4;
 const ID_PORT_EDIT: i32 = 5;
 const ID_RESTORE_DEFAULTS: i32 = 6;
+const ID_GLOBAL_STATIC: i32 = 7;
+const ID_GLOBAL_DENY: i32 = 8;
+const ID_GLOBAL_REVIEW: i32 = 9;
+const ID_GLOBAL_ALLOW: i32 = 10;
 
 const WM_COMMAND: u32 = 0x0111;
 const EN_CHANGE: u32 = 0x0300;
@@ -76,7 +85,7 @@ const DLG_SEPARATOR: i32 = 6;
 
 /// 选项页最小尺寸（逻辑像素）—— PM_GET_OPTIONS_PAGE_MINMAX 报告给主程序。
 const PAGE_MIN_WIDE: i32 = 200;
-const PAGE_MIN_HIGH: i32 = 130;
+const PAGE_MIN_HIGH: i32 = 155;
 
 /// Everything 选项对话框里 Apply 按钮的固定 ID（http_server.c 的
 /// http_server_enable_options_apply 用的同一个值）。
@@ -147,6 +156,8 @@ struct OptionsState {
     bind: String,
     /// 监听端口。
     port: u16,
+    /// 全局搜索档位（search_everywhere 的策略）。
+    global_search: GlobalSearchMode,
     /// 当前实际在监听的 (bind, port)；None 表示未监听。
     /// 用于判断 Apply 时是否需要重启服务。
     running: Option<(String, u16)>,
@@ -166,9 +177,16 @@ impl Default for OptionsState {
             enabled: false,
             bind: DEFAULT_BIND.to_string(),
             port: DEFAULT_PORT,
+            global_search: GlobalSearchMode::default(),
             running: None,
         }
     }
+}
+
+/// 当前全局搜索档位。MCP 工作线程在 tools/list（决定 search_everywhere 的
+/// 描述前缀与注解）与 tools/call（Deny 档硬拒）时读取。
+pub fn global_search_mode() -> GlobalSearchMode {
+    state().global_search
 }
 
 // ============================================================
@@ -176,12 +194,13 @@ impl Default for OptionsState {
 // ============================================================
 
 /// PM_START：载入读到的设置并应用（启用则启动监听，否则保持关闭）。
-pub fn init(enabled: bool, bind: String, port: u16) {
+pub fn init(enabled: bool, bind: String, port: u16, global_search: GlobalSearchMode) {
     {
         let mut st = state();
         st.enabled = enabled;
         st.bind = bind;
         st.port = port;
+        st.global_search = global_search;
     }
     apply();
 }
@@ -244,9 +263,14 @@ pub fn load_page(data: *mut c_void) -> *mut c_void {
     let tooltip_hwnd = page.tooltip_hwnd;
     let labels = labels();
 
-    let (enabled, port, bind) = {
+    let (enabled, port, bind, global_search) = {
         let st = state();
-        (st.enabled as i32, st.port as i64, cstr_bytes(&st.bind))
+        (
+            st.enabled as i32,
+            st.port as i64,
+            cstr_bytes(&st.bind),
+            st.global_search,
+        )
     };
 
     unsafe {
@@ -295,6 +319,55 @@ pub fn load_page(data: *mut c_void) -> *mut c_void {
             cstr_bytes(labels.port_help).as_ptr(),
         );
 
+        // 全局搜索档位：拒绝 / 审核 / 允许 三选一。
+        // SDK 没有单选框工厂，用三个互斥复选框呈现 —— page_proc 里点选一个
+        // 即自动取消另外两个，行为等同单选组（见 set_global_mode）。
+        create_static(
+            page_hwnd,
+            ID_GLOBAL_STATIC,
+            SS_LEFTNOWORDWRAP | WS_GROUP,
+            cstr_bytes(labels.global_label).as_ptr(),
+        );
+        create_checkbox(
+            page_hwnd,
+            ID_GLOBAL_DENY,
+            WS_GROUP,
+            (global_search == GlobalSearchMode::Deny) as i32,
+            cstr_bytes(labels.global_deny).as_ptr(),
+        );
+        add_tooltip(
+            tooltip_hwnd,
+            page_hwnd,
+            ID_GLOBAL_DENY,
+            cstr_bytes(labels.global_deny_help).as_ptr(),
+        );
+        create_checkbox(
+            page_hwnd,
+            ID_GLOBAL_REVIEW,
+            0,
+            (global_search == GlobalSearchMode::Review) as i32,
+            cstr_bytes(labels.global_review).as_ptr(),
+        );
+        add_tooltip(
+            tooltip_hwnd,
+            page_hwnd,
+            ID_GLOBAL_REVIEW,
+            cstr_bytes(labels.global_review_help).as_ptr(),
+        );
+        create_checkbox(
+            page_hwnd,
+            ID_GLOBAL_ALLOW,
+            0,
+            (global_search == GlobalSearchMode::Allow) as i32,
+            cstr_bytes(labels.global_allow).as_ptr(),
+        );
+        add_tooltip(
+            tooltip_hwnd,
+            page_hwnd,
+            ID_GLOBAL_ALLOW,
+            cstr_bytes(labels.global_allow_help).as_ptr(),
+        );
+
         // 恢复默认按钮
         create_button(
             page_hwnd,
@@ -327,6 +400,7 @@ pub fn save_page(data: *mut c_void) -> *mut c_void {
     let page_hwnd = page.page_hwnd;
 
     let enabled = unsafe { is_checked(page_hwnd, ID_ENABLED) };
+    let global_search = unsafe { read_global_mode(page_hwnd) };
     let port = unsafe { GetDlgItemInt(page_hwnd, ID_PORT_EDIT, core::ptr::null_mut(), 0) };
     let mut bind = get_dlg_text(page_hwnd, ID_BIND_EDIT);
     if bind.trim().is_empty() {
@@ -344,6 +418,7 @@ pub fn save_page(data: *mut c_void) -> *mut c_void {
             st.enabled = enabled;
             st.bind = bind;
             st.port = port as u16;
+            st.global_search = global_search;
         }
         apply()
     };
@@ -426,6 +501,28 @@ pub fn size_page(data: *mut c_void) -> *mut c_void {
         75,
         DLG_EDIT_HIGH,
     );
+    y += DLG_EDIT_HIGH + DLG_SEPARATOR;
+
+    // 全局搜索三选一：标签 + 三个互斥复选框横排。
+    set_rect(
+        page_hwnd,
+        ID_GLOBAL_STATIC,
+        x,
+        y + 3,
+        static_wide,
+        DLG_STATIC_HIGH,
+    );
+    let mut cx = x + static_wide;
+    for (id, text) in [
+        (ID_GLOBAL_DENY, labels.global_deny),
+        (ID_GLOBAL_REVIEW, labels.global_review),
+        (ID_GLOBAL_ALLOW, labels.global_allow),
+    ] {
+        // 复选框自带方框与文字间距，宽度 = 文字宽 + 24。
+        let wide = expand_min_wide(page_hwnd, text, 30) + 24;
+        set_rect(page_hwnd, id, cx, y, wide, DLG_CHECKBOX_HIGH);
+        cx += wide + 6;
+    }
 
     // 恢复默认按钮贴在页面底部右角。
     let button_wide = expand_min_wide(page_hwnd, labels.restore, 75 - 24) + 24;
@@ -466,6 +563,11 @@ pub fn page_proc(data: *mut c_void) -> *mut c_void {
             unsafe { update_page(page_hwnd) };
             enable_apply(p.options_hwnd);
         }
+        ID_GLOBAL_DENY | ID_GLOBAL_REVIEW | ID_GLOBAL_ALLOW => {
+            // 互斥复选框（等同单选组）：点谁谁唯一选中，再通知 Apply。
+            unsafe { set_global_mode(page_hwnd, id) };
+            enable_apply(p.options_hwnd);
+        }
         ID_BIND_EDIT | ID_PORT_EDIT => {
             if notify == EN_CHANGE {
                 enable_apply(p.options_hwnd);
@@ -495,6 +597,7 @@ pub fn save_settings(data: *mut c_void) -> *mut c_void {
         Some(f) => unsafe {
             f(data, KEY_ENABLED.as_ptr(), st.enabled as i32);
             f(data, KEY_PORT.as_ptr(), st.port as i32);
+            f(data, KEY_GLOBAL_SEARCH.as_ptr(), st.global_search.as_int());
         },
         None => diag::write("PM_SAVE_SETTINGS: plugin_set_setting_int unavailable"),
     }
@@ -504,8 +607,11 @@ pub fn save_settings(data: *mut c_void) -> *mut c_void {
     }
 
     diag::write(&format!(
-        "PM_SAVE_SETTINGS: enabled={} bind={} port={}",
-        st.enabled as i32, st.bind, st.port
+        "PM_SAVE_SETTINGS: enabled={} bind={} port={} global_search={}",
+        st.enabled as i32,
+        st.bind,
+        st.port,
+        st.global_search.as_str()
     ));
     1 as *mut c_void
 }
@@ -564,6 +670,58 @@ unsafe fn is_checked(page_hwnd: HWND, id: i32) -> bool {
     state == BST_CHECKED
 }
 
+/// 读三个互斥复选框 → 全局搜索档位。一个都没勾按最保守的 Deny 处理。
+///
+/// # Safety
+/// `page_hwnd` 必须是有效的页面窗口句柄，且三个复选框已创建。
+unsafe fn read_global_mode(page_hwnd: HWND) -> GlobalSearchMode {
+    if unsafe { is_checked(page_hwnd, ID_GLOBAL_ALLOW) } {
+        GlobalSearchMode::Allow
+    } else if unsafe { is_checked(page_hwnd, ID_GLOBAL_REVIEW) } {
+        GlobalSearchMode::Review
+    } else {
+        GlobalSearchMode::Deny
+    }
+}
+
+/// 把三选一组设置成指定档位：只勾中 `id` 对应的项（等同单选行为）。
+/// 复选框默认是点击即翻转，这里强制回写状态 —— 否则再点一次选中项
+/// 会把它取消，出现「一个都没选」的中间态。
+///
+/// # Safety
+/// `page_hwnd` 必须是有效的页面窗口句柄，且三个复选框已创建。
+unsafe fn set_global_mode(page_hwnd: HWND, id: i32) {
+    unsafe {
+        CheckDlgButton(
+            page_hwnd,
+            ID_GLOBAL_DENY,
+            if id == ID_GLOBAL_DENY {
+                BST_CHECKED
+            } else {
+                BST_UNCHECKED
+            },
+        );
+        CheckDlgButton(
+            page_hwnd,
+            ID_GLOBAL_REVIEW,
+            if id == ID_GLOBAL_REVIEW {
+                BST_CHECKED
+            } else {
+                BST_UNCHECKED
+            },
+        );
+        CheckDlgButton(
+            page_hwnd,
+            ID_GLOBAL_ALLOW,
+            if id == ID_GLOBAL_ALLOW {
+                BST_CHECKED
+            } else {
+                BST_UNCHECKED
+            },
+        );
+    }
+}
+
 /// 按启用复选框置灰/取消置灰依赖控件。
 ///
 /// # Safety
@@ -576,15 +734,20 @@ unsafe fn update_page(page_hwnd: HWND) {
             f(page_hwnd, ID_BIND_EDIT, enable);
             f(page_hwnd, ID_PORT_STATIC, enable);
             f(page_hwnd, ID_PORT_EDIT, enable);
+            f(page_hwnd, ID_GLOBAL_STATIC, enable);
+            f(page_hwnd, ID_GLOBAL_DENY, enable);
+            f(page_hwnd, ID_GLOBAL_REVIEW, enable);
+            f(page_hwnd, ID_GLOBAL_ALLOW, enable);
         }
     }
 }
 
-/// 「恢复默认」按钮：不启用 + 127.0.0.1:8285。
+/// 「恢复默认」按钮：不启用 + 127.0.0.1:8285 + 全局搜索拒绝。
 fn restore_defaults(page_hwnd: HWND) {
     unsafe {
         CheckDlgButton(page_hwnd, ID_ENABLED, BST_UNCHECKED);
         SetDlgItemInt(page_hwnd, ID_PORT_EDIT, DEFAULT_PORT as u32, 0);
+        set_global_mode(page_hwnd, ID_GLOBAL_DENY);
     }
     if let Some(f) = Host::get().os_set_dlg_text {
         let bind = cstr_bytes(DEFAULT_BIND);
@@ -684,6 +847,13 @@ struct Labels {
     bind_help: &'static str,
     port: &'static str,
     port_help: &'static str,
+    global_label: &'static str,
+    global_deny: &'static str,
+    global_deny_help: &'static str,
+    global_review: &'static str,
+    global_review_help: &'static str,
+    global_allow: &'static str,
+    global_allow_help: &'static str,
     restore: &'static str,
     restore_help: &'static str,
 }
@@ -696,8 +866,15 @@ const LABELS_EN: Labels = Labels {
     bind_help: "IP address to listen on. 127.0.0.1 = this computer only (recommended). 0.0.0.0 = all network interfaces (allow other devices on your network).",
     port: "Port:",
     port_help: "TCP port for the MCP HTTP endpoint. MCP clients connect to http://<address>:<port>/.",
+    global_label: "Global search:",
+    global_deny: "Deny",
+    global_deny_help: "Disable the search_everywhere tool. Calls return GLOBAL_SEARCH_DISABLED. All other tools stay folder-scoped. (Default)",
+    global_review: "Review",
+    global_review_help: "search_everywhere works, but is marked as needing user confirmation: the MCP client shows a permission prompt before calling it. Nothing is modified on disk either way — the call only reads the index.",
+    global_allow: "Allow",
+    global_allow_help: "search_everywhere works directly without a confirmation prompt: it searches all indexed locations by file name and returns full paths.",
     restore: "Restore Defaults",
-    restore_help: "Reset to 127.0.0.1:8285 with the server disabled.",
+    restore_help: "Reset to 127.0.0.1:8285 with the server disabled and global search set to Deny.",
 };
 
 const LABELS_ZH: Labels = Labels {
@@ -708,8 +885,15 @@ const LABELS_ZH: Labels = Labels {
     bind_help: "监听的 IP 地址。127.0.0.1 表示仅本机访问（推荐）；0.0.0.0 表示监听所有网卡（允许局域网内其他设备访问）。",
     port: "端口：",
     port_help: "MCP HTTP 服务监听的 TCP 端口。MCP 客户端通过 http://<地址>:<端口>/ 连接。",
+    global_label: "全局搜索：",
+    global_deny: "拒绝",
+    global_deny_help: "禁用 search_everywhere 工具，调用一律返回 GLOBAL_SEARCH_DISABLED；其余工具仍限定在文件夹内搜索。（默认）",
+    global_review: "审核",
+    global_review_help: "search_everywhere 可用，但被标注为「需用户确认」：MCP 客户端在调用前先弹权限确认框。无论是否放行都不会改动磁盘 —— 调用只读索引。",
+    global_allow: "允许",
+    global_allow_help: "search_everywhere 直接可用，不再弹确认框：按文件名搜索全部已索引位置，返回完整路径。",
     restore: "恢复默认",
-    restore_help: "恢复为 127.0.0.1:8285 且不启用服务。",
+    restore_help: "恢复为 127.0.0.1:8285、不启用服务、全局搜索为「拒绝」。",
 };
 
 /// 按主程序界面语言取文案（探测一次后缓存）。

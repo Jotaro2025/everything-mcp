@@ -9,7 +9,7 @@
 //!   - PM_START：安装主线程消息窗口、读设置并按需启动 MCP HTTP 服务
 //!     （db 引用与 query 懒创建于第一次搜索，见 plugin::state）
 //!   - PM_ADD_OPTIONS_PAGES..PM_KILL_OPTIONS_PAGE：Everything 选项对话框里
-//!     的插件设置页（启用开关、绑定地址、端口），见 options 模块
+//!     的插件设置页（启用开关、绑定地址、端口、全局搜索档位），见 options 模块
 //!   - PM_SAVE_SETTINGS：把设置写回 Plugins.ini（下次启动 PM_START 时
 //!     经 plugin::ini_settings 兜底读回，原因见该模块文档）
 //!   - PM_STOP / PM_KILL：关闭服务、释放引用
@@ -120,9 +120,11 @@ unsafe fn everything_plugin_proc_impl(msg: u32, data: *mut c_void) -> *mut c_voi
             //     用户在 Everything 选项 → 插件 → MCP 设置页勾选启用）
             //   - mcp_port：HTTP 监听端口（默认 8285）
             //   - mcp_bind：监听地址（默认 127.0.0.1）
+            //   - mcp_global_search：全局搜索档位（默认 0 拒绝 / 1 审核 / 2 允许）
             let mut enabled = read_setting_int(data, "mcp_enabled\0", 0) != 0;
             let mut port_raw = read_setting_int(data, "mcp_port\0", 8285);
             let mut bind = read_setting_string(data, "mcp_bind\0", "127.0.0.1\0");
+            let mut global_raw = read_setting_int(data, "mcp_global_search\0", 0);
 
             // host 在 PM_START 读不到插件自己的设置（返回默认值，原因见
             // plugin::ini_settings 文档）。host 说未启用时，用自己解析的
@@ -136,6 +138,9 @@ unsafe fn everything_plugin_proc_impl(msg: u32, data: *mut c_void) -> *mut c_voi
                     if let Some(b) = p.bind {
                         bind = b;
                     }
+                    if let Some(g) = p.global_search {
+                        global_raw = g;
+                    }
                 }
             }
 
@@ -144,7 +149,16 @@ unsafe fn everything_plugin_proc_impl(msg: u32, data: *mut c_void) -> *mut c_voi
             } else {
                 options::DEFAULT_PORT
             };
-            plugin::diag::write(&format!("PM_START: enabled={} port={} bind={}", enabled, port, bind));
+            // 越界/负数一律归到默认档（拒绝）。
+            let global_search =
+                mcp::protocol::GlobalSearchMode::from_int(global_raw as i64).unwrap_or_default();
+            plugin::diag::write(&format!(
+                "PM_START: enabled={} port={} bind={} global_search={}",
+                enabled,
+                port,
+                bind,
+                global_search.as_str()
+            ));
 
             Host::debug("everything_mcp: PM_START");
 
@@ -165,7 +179,7 @@ unsafe fn everything_plugin_proc_impl(msg: u32, data: *mut c_void) -> *mut c_voi
 
             // 载入设置并应用：启用则启动监听，否则保持关闭。
             // 之后用户在设置页的改动也走同一条应用路径（options::apply）。
-            options::init(enabled, bind, port);
+            options::init(enabled, bind, port, global_search);
 
             1 as *mut c_void
         }

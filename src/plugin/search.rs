@@ -105,6 +105,9 @@ pub enum SearchScope {
     /// 递归搜整棵子树 —— 路径前缀 `"<folder>\"` 语义。
     /// search_in_folder / count 用这个。
     Recursive,
+    /// 整个索引（不加任何路径前缀）。search_everywhere 用这个 ——
+    /// 受 `mcp_global_search` 三档开关约束，见 tools.rs 的模式闸门。
+    Global,
 }
 
 /// 结果排序键。映射到 `property_get_builtin_type` 的内置属性类型 ID。
@@ -193,7 +196,11 @@ impl SearchOptions {
 ///   - 同时避免误伤同前缀的兄弟目录 —— `everything-mcp` 不会命中
 ///     `everything-mcp-old` 里的文件；
 ///   - 文件夹自身的路径没有尾反斜杠，因此不会把文件夹本身搜出来。
+/// Global：`<pattern>` 原样 —— 不加任何路径前缀，搜整个索引。
 fn build_search_string(folder: &str, pattern: &str, scope: SearchScope) -> String {
+    if scope == SearchScope::Global {
+        return pattern.to_string();
+    }
     // Everything 路径里几乎不会有双引号，但安全起见去掉，避免破坏引号包裹。
     let folder = folder.replace('"', "");
     let mut s = String::new();
@@ -212,6 +219,7 @@ fn build_search_string(folder: &str, pattern: &str, scope: SearchScope) -> Strin
             s.push_str(&f);
             s.push_str("\" ");
         }
+        SearchScope::Global => unreachable!("handled above"),
     }
     s.push_str(pattern);
     s
@@ -263,6 +271,27 @@ pub fn count_in_folder(folder: &str, pattern: &str, timeout_ms: u32) -> Result<u
     count_results(q.query)
 }
 
+/// 在整个 Everything 索引上按 pattern 搜索（不限文件夹）。
+///
+/// 与 search_in_folder 的差别只有范围：搜索串不带任何路径前缀，因此会命中
+/// 所有已索引位置（本地磁盘 + 网络共享）。**调用前必须过 tools.rs 的
+/// `mcp_global_search` 模式闸门** —— 这一层只管搜，不管权限。
+/// `options.scope` 在这里被强制为 [`SearchScope::Global`]。
+pub fn search_everywhere(
+    pattern: &str,
+    offset: usize,
+    max_results: usize,
+    timeout_ms: u32,
+    options: SearchOptions,
+) -> Result<SearchOutcome, String> {
+    let options = SearchOptions {
+        scope: SearchScope::Global,
+        ..options
+    };
+    let q = submit_query("", pattern, options, timeout_ms)?;
+    read_results(q.query, offset, max_results)
+}
+
 /// 一次已提交且已完成的查询。
 ///
 /// 三个字段必须一起活到结果（或计数）读完：
@@ -294,7 +323,8 @@ fn submit_query(
     let host = Host::get();
 
     // 安全护栏：阻止搜索空目录或异常短路径导致的全部磁盘扫描。
-    if folder.is_empty() {
+    // Global 范围本来就没有 folder（空串是唯一合法值），不受此限。
+    if folder.is_empty() && options.scope != SearchScope::Global {
         return Err("folder must not be empty".into());
     }
 
@@ -867,6 +897,19 @@ mod tests {
         assert_eq!(
             build_search_string(r"D:\", "ext:rs", SearchScope::Recursive),
             r#""D:\" ext:rs"#
+        );
+    }
+
+    #[test]
+    fn global_scope_has_no_folder_prefix() {
+        // Global 原样传 pattern —— 不加路径前缀，folder 参数直接忽略。
+        assert_eq!(
+            build_search_string("", "*.vhd", SearchScope::Global),
+            "*.vhd"
+        );
+        assert_eq!(
+            build_search_string(r"C:\ignored", r"ext:pdf !\old\", SearchScope::Global),
+            r"ext:pdf !\old\"
         );
     }
 

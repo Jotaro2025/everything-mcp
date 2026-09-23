@@ -21,6 +21,10 @@ pub struct PersistedSettings {
     pub enabled: bool,
     pub port: Option<u16>,
     pub bind: Option<String>,
+    /// `mcp_global_search` 原始整数（0 拒绝 / 1 审核 / 2 允许）。缺键或不是
+    /// 数字时为 None；越界值不在这里管，交给 `GlobalSearchMode::from_int`
+    /// 归到默认档。
+    pub global_search: Option<i32>,
 }
 
 /// 读持久化设置：先 `%APPDATA%\Everything\Plugins.ini`（app_data=1 时主程序
@@ -68,6 +72,7 @@ fn parse_section(content: &str) -> Option<PersistedSettings> {
     let mut enabled: Option<bool> = None;
     let mut port: Option<u16> = None;
     let mut bind: Option<String> = None;
+    let mut global_search: Option<i32> = None;
 
     for line in content.lines() {
         let line = line.trim();
@@ -95,6 +100,7 @@ fn parse_section(content: &str) -> Option<PersistedSettings> {
                     bind = Some(value.to_string());
                 }
             }
+            "mcp_global_search" => global_search = value.parse::<i32>().ok(),
             _ => {}
         }
     }
@@ -104,6 +110,7 @@ fn parse_section(content: &str) -> Option<PersistedSettings> {
         enabled,
         port,
         bind,
+        global_search,
     })
 }
 
@@ -113,11 +120,12 @@ mod tests {
 
     #[test]
     fn parses_our_section_with_all_keys() {
-        let content = "; comment\r\n[etp_server64.dll]\r\nenabled=0\r\n\r\n[everything_mcp64.dll]\r\nmcp_enabled=1\r\nmcp_port=8285\r\nmcp_bind=127.0.0.1\r\n\r\n[http_server64.dll]\r\nport=80\r\n";
+        let content = "; comment\r\n[etp_server64.dll]\r\nenabled=0\r\n\r\n[everything_mcp64.dll]\r\nmcp_enabled=1\r\nmcp_port=8285\r\nmcp_bind=127.0.0.1\r\nmcp_global_search=1\r\n\r\n[http_server64.dll]\r\nport=80\r\n";
         let s = parse_section(content).expect("section present");
         assert!(s.enabled);
         assert_eq!(s.port, Some(8285));
         assert_eq!(s.bind.as_deref(), Some("127.0.0.1"));
+        assert_eq!(s.global_search, Some(1));
     }
 
     #[test]
@@ -146,6 +154,19 @@ mod tests {
         let s = parse_section(content).unwrap();
         assert_eq!(s.port, None);
         assert_eq!(s.bind, None);
+        assert_eq!(s.global_search, None);
+    }
+
+    #[test]
+    fn missing_or_non_numeric_global_search_is_none() {
+        // 缺键 → None；非数字 → None（交给 from_int/默认档兜底）。
+        let content = "[everything_mcp64.dll]\nmcp_enabled=1\n";
+        assert_eq!(parse_section(content).unwrap().global_search, None);
+        let content = "[everything_mcp64.dll]\nmcp_enabled=1\nmcp_global_search=abc\n";
+        assert_eq!(parse_section(content).unwrap().global_search, None);
+        // 0（拒绝）是合法值，不能被当成「没设」。
+        let content = "[everything_mcp64.dll]\nmcp_enabled=1\nmcp_global_search=0\n";
+        assert_eq!(parse_section(content).unwrap().global_search, Some(0));
     }
 
     #[test]

@@ -226,9 +226,158 @@ pub fn make_discover_result() -> Value {
                 "version": "1.1.2"
             }
         },
-        "instructions": "Folder-scoped Everything file search. Use search_in_folder with an absolute folder path plus Everything search syntax; list_folder for immediate children; count for totals only; index_changes to read the index journal (created/modified/deleted/renamed); it needs journal_log enabled in Everything and returns an actionable error when it is not. search_in_folder results carry size and modified/created timestamps, can be sorted (sort=name|path|size|modified|created, descending=true for newest/largest first), and support case/whole-word/regex matching. Results are capped by max_results and carry a separate 'total' count of all matches found — when count < total, page through with 'offset'.",
+        "instructions": "Folder-scoped Everything file search. Use search_in_folder with an absolute folder path plus Everything search syntax; list_folder for immediate children; count for totals only; index_changes to read the index journal (created/modified/deleted/renamed); it needs journal_log enabled in Everything and returns an actionable error when it is not. search_everywhere finds files/folders by NAME across the whole index without a folder — for when you know what it is called but not where it lives; it is gated by the server's global-search policy ('deny' rejects every call with GLOBAL_SEARCH_DISABLED, 'review' requires the user to confirm first, 'allow' serves calls directly) and its pattern must be at least 2 characters with no 'content:'. search_in_folder results carry size and modified/created timestamps, can be sorted (sort=name|path|size|modified|created, descending=true for newest/largest first), and support case/whole-word/regex matching. Results are capped by max_results and carry a separate 'total' count of all matches found — when count < total, page through with 'offset'.",
         "ttlMs": DISCOVER_TTL_MS,
         "cacheScope": CACHE_SCOPE_PUBLIC
+    })
+}
+
+// ====================================================================
+// 全局搜索模式（Everything 设置页「全局搜索」的三档）
+// ====================================================================
+
+/// search_everywhere 的服务端策略档位（`mcp_global_search` 设置项）。
+///
+///   - [`GlobalSearchMode::Deny`]（默认）：调用被服务端硬拒
+///     （`GLOBAL_SEARCH_DISABLED`）—— 能力不存在，除非装机者显式打开；
+///   - [`GlobalSearchMode::Review`]：调用放行，但工具注解标成「非只读 +
+///     破坏性」、描述里写明需要用户确认 —— 把关方是**客户端的权限弹窗**
+///     （ToolAnnotations 本来就是给客户端决定确认 UX 用的提示）；
+///   - [`GlobalSearchMode::Allow`]：调用放行，注解标只读幂等，
+///     严谨的客户端可自动放行、不再打扰用户。
+///
+/// Review 档的确认发生在客户端侧：注解只是 hints，认真的客户端会弹确认框，
+/// 忽略注解的客户端会直接放行 —— 服务端真正强制的只有 Deny 这一档，
+/// 这也是三档里唯一有硬闸门的。持久化取值：0/1/2。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GlobalSearchMode {
+    /// 0 —— 拒绝（默认）：调用即报 GLOBAL_SEARCH_DISABLED。
+    #[default]
+    Deny,
+    /// 1 —— 审核：放行调用，靠注解 + 描述让客户端弹确认框。
+    Review,
+    /// 2 —— 允许：放行调用，注解标只读，可自动放行。
+    Allow,
+}
+
+impl GlobalSearchMode {
+    /// Plugins.ini 里的持久化取值（`mcp_global_search`）。
+    pub fn as_int(self) -> i32 {
+        match self {
+            GlobalSearchMode::Deny => 0,
+            GlobalSearchMode::Review => 1,
+            GlobalSearchMode::Allow => 2,
+        }
+    }
+
+    /// 从持久化取值解析。未知取值返回 None（调用方退回默认的 Deny）。
+    pub fn from_int(v: i64) -> Option<Self> {
+        match v {
+            0 => Some(GlobalSearchMode::Deny),
+            1 => Some(GlobalSearchMode::Review),
+            2 => Some(GlobalSearchMode::Allow),
+            _ => None,
+        }
+    }
+
+    /// 规范名（回显给调用方 / 写进工具描述与诊断日志）。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            GlobalSearchMode::Deny => "deny",
+            GlobalSearchMode::Review => "review",
+            GlobalSearchMode::Allow => "allow",
+        }
+    }
+}
+
+/// search_everywhere 的工具条目 —— 描述前缀与 ToolAnnotations 随模式变。
+///
+/// 注解就是本插件的「审核」机制：Allow 档标只读幂等，客户端可自动放行；
+/// Review 档标成非只读 + 破坏性 —— 规范里这两个提示的用途正是让客户端把
+/// 调用当危险操作弹确认框。它并不真的改磁盘（纯查询），destructiveHint 只是
+/// 驱动确认弹窗的手段，描述里写明这一点。Deny 档同 Review 的注解
+///（不诱导自动放行），描述里直接说明服务端会拒绝。
+fn search_everywhere_entry(mode: GlobalSearchMode) -> Value {
+    let policy = match mode {
+        GlobalSearchMode::Allow => "POLICY (server setting 'global search' = allow): calls are served directly; the annotations below mark this tool read-only, so clients that trust read-only tools may auto-approve it.",
+        GlobalSearchMode::Review => "POLICY (server setting 'global search' = review): before this tool runs, the USER must confirm — the annotations below deliberately mark it as NOT read-only / destructive so the client shows its permission prompt, and you (the model) must not call it unless the user explicitly asked for a global search. Nothing on disk is ever modified; the flag only drives the confirmation prompt.",
+        GlobalSearchMode::Deny => "POLICY (server setting 'global search' = deny): this tool is DISABLED — every call returns a GLOBAL_SEARCH_DISABLED error without searching anything. If a global search is needed, ask the user to set Everything > Options > Plugins > MCP > global search to 'review' or 'allow'.",
+    };
+    let (read_only, destructive) = match mode {
+        GlobalSearchMode::Allow => (true, false),
+        GlobalSearchMode::Review | GlobalSearchMode::Deny => (false, true),
+    };
+    serde_json::json!({
+        "name": "search_everywhere",
+        "description": format!(
+            "{} Search file/folder NAMES across the ENTIRE Everything index — every local drive and indexed network share — without naming a folder. Use it when you know what a file is called but not where it lives (e.g. a folder somewhere on a NAS share), then hand the returned full paths to search_in_folder / list_folder for anything scoped. It exposes the whole machine's file names to the caller — hence the per-server policy above. Same Everything search syntax as search_in_folder's pattern ('*.vhd', '\"quarterly report\"', 'ext:pdf;docx dm:thisyear', 'backup !\\\\old\\\\') with two guard rails: 'pattern' must be at least 2 characters, and 'content:' is rejected (content search stays folder-scoped in search_in_folder). Each result carries the full path plus size and modified/created (ISO 8601 UTC); 'max_results' (1..500, default 50) caps the window and 'total' reports all matches — page with 'offset' like search_in_folder.",
+            policy
+        ),
+        "annotations": {
+            "title": "Search Everywhere",
+            "readOnlyHint": read_only,
+            "destructiveHint": destructive,
+            "idempotentHint": true,
+            "openWorldHint": true,
+        },
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "pattern": {
+                    "type": "string",
+                    "description": "Everything search pattern matched against file/folder names across the whole index, e.g. '*.vhd' (extension), '\"quarterly report\"' (name phrase), 'ext:pdf;docx dm:thisyear' (functions), 'backup !\\\\old\\\\' ('!' excludes). At least 2 characters. 'content:' is rejected — use search_in_folder for content search."
+                },
+                "exclude": {
+                    "type": ["string", "array"],
+                    "items": { "type": "string" },
+                    "description": "Terms to exclude, appended as Everything NOT operators. Accepts a string or an array of strings. Quoted path fragments match well: ['\\\\old\\\\', '\\\\.git\\\\', '\\\\node_modules\\\\']. Default: none."
+                },
+                "sort": {
+                    "type": "string",
+                    "enum": ["name", "path", "size", "modified", "created"],
+                    "description": "Sort key for the results. 'modified'/'created' sort by file time, 'size' by byte size. Default: 'name'.",
+                    "default": "name"
+                },
+                "descending": {
+                    "type": "boolean",
+                    "description": "Sort descending (e.g. 'sort':'modified' + 'descending':true = newest first). Default: false (ascending).",
+                    "default": false
+                },
+                "match_case": {
+                    "type": "boolean",
+                    "description": "Case-sensitive matching. Default: false.",
+                    "default": false
+                },
+                "match_whole_word": {
+                    "type": "boolean",
+                    "description": "Match whole words only. Default: false.",
+                    "default": false
+                },
+                "match_regex": {
+                    "type": "boolean",
+                    "description": "Treat the pattern as a regular expression (Everything's 'regex:' syntax, applied to the pattern term). Default: false.",
+                    "default": false
+                },
+                "offset": {
+                    "type": "integer",
+                    "description": "Index of the first result to return, for paging: when 'count' < 'total', re-query with 'offset' advanced by 'count'. Default 0.",
+                    "default": 0
+                },
+                "max_results": {
+                    "type": "integer",
+                    "description": "Maximum number of results to return (1..500). Default 50.",
+                    "default": 50,
+                    "minimum": 1,
+                    "maximum": 500
+                },
+                "timeout_ms": {
+                    "type": "integer",
+                    "description": "Maximum time in milliseconds to wait for results (default 10000).",
+                    "default": 10000
+                }
+            },
+            "required": ["pattern"]
+        }
     })
 }
 
@@ -237,8 +386,13 @@ pub fn make_discover_result() -> Value {
 /// 结果按 era 中性构造（2024-11-05 原形状）；modern 时代的必填字段
 /// （resultType、CacheableResult 的 ttlMs / cacheScope）由调用方过
 /// [`with_result_type`] 与 [`with_cache_control`] 补齐。
-pub fn make_tools_list() -> Value {
-    serde_json::json!({
+///
+/// `mode` 是全局搜索的当前档位 —— 只影响 search_everywhere 的描述前缀与
+/// ToolAnnotations（工具清单的形状不变，`listChanged` 仍可宣告 false）。
+/// 注意 tools/list 结果带 5 分钟 TTL 缓存：切档后注解最多滞后一个 TTL，
+/// 但 Deny 档的硬闸门在调用时检查，立即生效。
+pub fn make_tools_list(mode: GlobalSearchMode) -> Value {
+    let mut result = serde_json::json!({
         "tools": [
             {
                 "name": "search_in_folder",
@@ -447,7 +601,13 @@ pub fn make_tools_list() -> Value {
                 }
             }
         ]
-    })
+    });
+    // search_everywhere 的描述前缀与注解随档位变，单独构造后追加 ——
+    // 上面六个条目保持纯静态形状，方便逐字段断言。
+    if let Some(arr) = result["tools"].as_array_mut() {
+        arr.push(search_everywhere_entry(mode));
+    }
+    result
 }
 
 /// 构造一个标准的 JSON-RPC 成功响应。
