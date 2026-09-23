@@ -235,9 +235,9 @@ Everything 官方插件页：<https://www.voidtools.com/support/everything/plugi
   翻译，会原样传给 Everything。
 - 排除项用 `!` 前缀（如 `ext:rs !test`），或用 `exclude` 参数
   （见下）。
-- `content:` 正文检索需要 Everything 端开启内容索引（默认关闭；
-  开启后首次建索引会明显变慢）。权限位已随插件放开，开关在
-  Everything 选项里。
+- `content:` 正文检索**开箱可用** —— 不需要先在 Everything 里建内容索引。
+  但候选集不收窄会慢到超时，语法与提速办法见下面的
+  [正文检索与提速](#正文检索与提速)。
 - 空字符串 `""` 表示列出该文件夹下所有文件。
 - **每条结果带 `modified` / `created`**（修改 / 创建时间，ISO 8601 UTC，
   形如 `2026-09-23T11:18:31Z`；索引项没有该时间时为 `null`。Everything
@@ -248,7 +248,9 @@ Everything 官方插件页：<https://www.voidtools.com/support/everything/plugi
   `"sort": "size", "descending": true`。
 - **匹配开关**：`match_case`（区分大小写）、`match_whole_word`（全字）、
   `match_regex`（正则，内部用 Everything 的 `regex:` 搜索函数实现），
-  默认都是 `false`。也可以直接在 pattern 里写 `case:` / `ww:` / `regex:`。
+  默认都是 `false`。也可以直接在 pattern 里写 `case:` / `ww:` / `regex:`，
+  但 **`case:` 后面不能有空格**：写 `case:content:"x"` 生效，写
+  `case: content:"x"` 会被静默忽略、按不区分大小写返回结果。
 - **翻页**：`offset` 指定从第几条开始返回（默认 0）。`max_results = 0`
   表示无上限（大目录慎用）。响应里 `count` 是实际返回条数（受
   `max_results` 截断），`total` 是命中总数 —— 两者不等即说明还有更多，
@@ -269,6 +271,50 @@ gitignore），常见做法：
 
 排除项按字面匹配路径片段，带首尾反斜杠（`\obj\`）才不会误伤名字里
 含 `obj` 的文件。等效的 pattern 写法是 `*.cs !\obj\ !\.git\`。
+
+##### 正文检索与提速
+
+`content:` 是 Everything 的正文检索函数。插件已把它需要的
+`allow_read_access` 权限位放开，**不需要先在 Everything 里建内容索引**就能
+用 —— 没建索引时 Everything 按需打开候选文件读内容，结果是对的，只是慢。
+慢的根源是候选集大小，所以提速按这个顺序做。
+
+**1. 先收窄范围（最有效，零配置）。** 用 `ext:` 限后缀、把 `folder` 指到
+子目录、用 `exclude` 排掉 `\target\` `\.git\` `\node_modules\`，或用
+`dm:lastweek` 只搜最近改过的文件。实测同一个仓库：
+
+| pattern | 结果 |
+| --- | --- |
+| `content:"db_query_search2"`（仓库根目录，含 `target/`） | 默认 10s 超时 |
+| `ext:rs content:"db_query_search2"` | 立刻返回 9 个文件 |
+
+**2. 调大 `timeout_ms`。** 收窄后仍超时就加大（默认 10000，没有上限校验）。
+
+**3. 开内容索引（一劳永逸，但只对建了索引的目录有效）。** 在 Everything 里
+走 工具 → 选项 → 索引 → 文件夹，选中目录并勾上「索引文件内容」（1.5 的较新
+构建把这些选项挪到了「高级」页，找不到就在选项对话框里搜 `content`）。
+对应的 ini 键是 `content_indexing_enabled`、`content_indexing_include_only_files`
+和 `content_indexing_max_size`。两个坑：
+
+- **务必把源码后缀加进 `content_indexing_include_only_files`。** 它的默认值
+  只有 `*.doc;*.docx;*.pdf;*.txt;*.xls;*.xlsx`，不含 `.rs` / `.cs` / `.py` /
+  `.md` —— 不加的话这些文件仍走按需读取，索引白开。
+- 建索引时 Everything 要读一遍所有候选文件，**首次会明显变慢**；改完 ini
+  要**重启 Everything** 才生效（运行中的实例会在退出时用内存里的旧值把
+  ini 盖回去）。
+
+正文检索的可用写法（均在 1.5.0.1422b 实测）：
+
+| 写法 | 含义 |
+| --- | --- |
+| `content:"fn main"` | 正文含该文本（不区分大小写） |
+| `case:content:"Fn Main"` | 区分大小写的正文检索 —— `case:` 后不能有空格 |
+| `utf8content:"fn main"` | 按 UTF-8 读正文（代码 / 脚本） |
+| `ansicontent:"系统日志"` | 按 ANSI/GBK 读正文（老中文文档） |
+| `regex:content:"\d{3}-\d{2}-\d{4}"` | 正则匹配正文 |
+
+`casecontent:"…"` 这种连写形式在 1.5.0.1422b 里**不生效**（恒返回 0 条），
+要区分大小写请用 `case:content:`，或直接用工具参数 `match_case: true`。
 
 #### 2. `list_folder`
 

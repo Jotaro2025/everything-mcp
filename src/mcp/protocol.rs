@@ -242,7 +242,7 @@ pub fn make_tools_list() -> Value {
         "tools": [
             {
                 "name": "search_in_folder",
-                "description": "Search files/folders recursively under a specific folder using Everything search syntax. Prefer this over global search when working within a project directory. This is not shell glob: use '*.rs', not '**/*.rs' (a leading '**/' is stripped for you); exclude matches with a '!' prefix (e.g. 'ext:rs !test') or the 'exclude' parameter (e.g. ['\\obj\\', '\\.git\\'] to drop build/VCS noise); 'content:\"fn main\"' searches file contents. Each result carries 'size' plus 'modified'/'created' (ISO 8601 UTC). The response reports both 'count' (entries returned, capped by max_results) and 'total' (all matches found) — when they differ, page through with 'offset'. Results are sorted by 'sort' (default name ascending).",
+                "description": "Search files/folders recursively under a specific folder using Everything search syntax. Prefer this over global search when working within a project directory. This is not shell glob: use '*.rs', not '**/*.rs' (a leading '**/' is stripped for you); exclude matches with a '!' prefix (e.g. 'ext:rs !test') or the 'exclude' parameter (e.g. ['\\obj\\', '\\.git\\'] to drop build/VCS noise); 'content:\"fn main\"' searches file contents (it works with no content index on the Everything side, but an unfiltered content search over a large tree is slow enough to time out — narrow it with 'ext:', a subfolder or 'exclude', or raise 'timeout_ms'). Each result carries 'size' plus 'modified'/'created' (ISO 8601 UTC). The response reports both 'count' (entries returned, capped by max_results) and 'total' (all matches found) — when they differ, page through with 'offset'. Results are sorted by 'sort' (default name ascending).",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -252,7 +252,7 @@ pub fn make_tools_list() -> Value {
                         },
                         "pattern": {
                             "type": "string",
-                            "description": "Everything search pattern. Examples: '*.rs' (extension), 'readme' (substring), 'ext:md;txt' (multiple extensions), '\"exact phrase\"', 'content:\"fn main\"' (content search), 'ext:rs !test' (the '!' prefix excludes matches). Empty pattern lists all files. Shell globs like '**/*.rs' are not supported — the folder scope already restricts the tree."
+                            "description": "Everything search pattern. Examples: '*.rs' (extension), 'readme' (substring), 'ext:md;txt' (multiple extensions), '\"exact phrase\"', 'content:\"fn main\"' (content search — slow unless the scope is narrow, see the tool description), 'ext:rs !test' (the '!' prefix excludes matches). Case-sensitive content search is 'case:content:\"...\"' with no space after 'case:'. Empty pattern lists all files. Shell globs like '**/*.rs' are not supported — the folder scope already restricts the tree."
                         },
                         "exclude": {
                             "type": ["string", "array"],

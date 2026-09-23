@@ -260,10 +260,11 @@ Recursively find files/folders under a given folder using Everything search synt
   faithfully and is passed through as-is.
 - Exclude matches with a `!` prefix (e.g. `ext:rs !test`), or use the
   `exclude` parameter (below).
-- `content:` needs file-content indexing enabled on the Everything side
-  (off by default; the first index build after enabling it is markedly
-  slower). The plugin already passes the required permission bits — the
-  switch lives in Everything's options.
+- `content:` works **out of the box** — you do not need content indexing on
+  the Everything side first. But an unfiltered content search is slow enough
+  to time out, so see
+  [Content search and making it fast](#content-search-and-making-it-fast)
+  below for the syntax and the speedups.
 - An empty string `""` lists everything under the folder.
 - **Every result carries `modified` / `created`** (modification / creation
   time, ISO 8601 UTC, e.g. `2026-09-23T11:18:31Z`; `null` when the index
@@ -276,7 +277,10 @@ Recursively find files/folders under a given folder using Everything search synt
 - **Match switches**: `match_case` (case-sensitive), `match_whole_word`
   (whole words) and `match_regex` (regular expression, implemented via
   Everything's `regex:` search function) — all default `false`. You can
-  also write `case:` / `ww:` / `regex:` directly in the pattern.
+  also write `case:` / `ww:` / `regex:` directly in the pattern, but
+  **`case:` must not be followed by a space**: `case:content:"x"` applies,
+  while `case: content:"x"` is silently ignored and the search comes back
+  case-insensitive.
 - **Paging**: `offset` is the index of the first result to return
   (default 0). `max_results = 0` means unlimited (careful with huge
   folders). The response reports `count` (entries returned, capped by
@@ -298,6 +302,59 @@ results by default (Everything knows nothing about gitignore), so:
 Exclude terms match path fragments literally — keep the surrounding
 backslashes (`\obj\`) so that files merely *named* `obj…` are not
 dropped. The equivalent pattern spelling is `*.cs !\obj\ !\.git\`.
+
+##### Content search and making it fast
+
+`content:` is Everything's file-content search function. The plugin already
+passes the `allow_read_access` permission bit it needs, so it works
+**without building a content index first** — with no index, Everything opens
+candidate files on demand and the results are still correct, just slow. The
+slowness comes from the size of the candidate set, so speed it up in this
+order.
+
+**1. Narrow the scope first (most effective, zero setup).** Limit the
+extension with `ext:`, point `folder` at a subdirectory, drop `\target\`,
+`\.git\` and `\node_modules\` with `exclude`, or restrict to recently
+modified files with `dm:lastweek`. Measured on one repository:
+
+| pattern | result |
+| --- | --- |
+| `content:"db_query_search2"` (repo root, including `target/`) | times out at the default 10s |
+| `ext:rs content:"db_query_search2"` | returns 9 files immediately |
+
+**2. Raise `timeout_ms`.** If it still times out after narrowing, increase it
+(default 10000, no upper bound is enforced).
+
+**3. Turn on content indexing (permanent, but only for the indexed
+folders).** In Everything, go to Tools → Options → Indexes → Folders, select
+the folder and tick "Index file content" (newer 1.5 builds moved these
+options to the Advanced page — search for `content` in the options dialog if
+you cannot find them). The ini keys are `content_indexing_enabled`,
+`content_indexing_include_only_files` and `content_indexing_max_size`. Two
+traps:
+
+- **Add your source extensions to `content_indexing_include_only_files`.**
+  Its default is only `*.doc;*.docx;*.pdf;*.txt;*.xls;*.xlsx` — no `.rs`,
+  `.cs`, `.py` or `.md`. Without them those files still go through on-demand
+  reading, so the index buys you nothing.
+- Building the index makes Everything read every candidate file once, so
+  **the first build is markedly slower**; and an ini edit only takes effect
+  after **restarting Everything** (a running instance writes its in-memory
+  values back over the file on exit).
+
+Content-search spellings that work (all measured on 1.5.0.1422b):
+
+| spelling | meaning |
+| --- | --- |
+| `content:"fn main"` | content contains the text (case-insensitive) |
+| `case:content:"Fn Main"` | case-sensitive content search — no space after `case:` |
+| `utf8content:"fn main"` | read content as UTF-8 (code / scripts) |
+| `ansicontent:"系统日志"` | read content as ANSI/GBK (older Chinese documents) |
+| `regex:content:"\d{3}-\d{2}-\d{4}"` | regex match against content |
+
+The run-together `casecontent:"…"` spelling does **not** work on
+1.5.0.1422b (it always returns 0 hits) — use `case:content:` instead, or
+the tool's `match_case: true` parameter.
 
 #### 2. `list_folder`
 
