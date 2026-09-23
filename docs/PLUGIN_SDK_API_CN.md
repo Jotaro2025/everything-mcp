@@ -709,19 +709,26 @@ db_release(db);
 
 ## 9. 数据库快照（`db_snapshot_*`）
 
-⚠️ 这些函数示例插件没用，签名未验证。语义推断：快照是 DB 在某个时刻的**只读冻结视图**，用于在查询过程中不受索引变化影响，或导出全量数据。
+⚠️ 这些函数示例插件没用。**签名已对官方 SDK 帖核实**（`viewtopic.php?t=16535`，
+void 2025-05-27）。语义：快照是索引 DB 在某个时刻的**只读冻结视图**，用于在查询
+过程中不受索引变化影响，或导出全量数据。
 
 | 函数 | 签名 | 来源 | 说明 |
 |---|---|---|---|
-| `db_snapshot_create` | ⚠️ 推断 `db_snapshot_t* (db_t *db)` | ❓ | 创建当前 DB 的快照。 |
-| `db_snapshot_destroy` | ⚠️ 推断 `void (db_snapshot_t *s)` | ❓ | 销毁快照。 |
-| `db_snapshot_get_size` | ⚠️ 推断 `QWORD (db_snapshot_t *s)` | ❓ | 快照大小（字节数）。 |
-| `db_snapshot_is_out_of_date` | ⚠️ 推断 `int (db_snapshot_t *s)` | ❓ | 快照是否已过期（DB 已变化）。 |
-| `db_snapshot_file_open` | ⚠️ 推断 `db_snapshot_file_t* (db_snapshot_t *s, const utf8_t *path)` | ❓ | 打开快照里的某个文件视图。 |
-| `db_snapshot_file_close` | ⚠️ 推断 `void (db_snapshot_file_t *f)` | ❓ | 关闭。 |
-| `db_snapshot_file_read` | ⚠️ 推断 `uintptr_t (db_snapshot_file_t *f, void *buf, uintptr_t len)` | ❓ | 从快照读文件内容。 |
+| `db_snapshot_create` | `db_snapshot_t* (db_t *db, const db_remap_array_t *remap_array)` | 官方帖 | 创建索引快照。主线程调用，失败返回 NULL。 |
+| `db_snapshot_destroy` | `void (db_snapshot_t *s)` | 官方帖 | 销毁快照。 |
+| `db_snapshot_get_size` | `uintptr_t (db_snapshot_t *s)` | 官方帖 | 快照大小（字节数）。 |
+| `db_snapshot_is_out_of_date` | `int (const db_snapshot_t *s, db_t *db, const db_remap_array_t *remap_array)` | 官方帖 | journal id / journal 项被删，或 remap 变化时返回 1。 |
+| `db_snapshot_file_open` | `db_snapshot_file_t* (db_snapshot_t *s)` | 官方帖 | 打开快照的读句柄。 |
+| `db_snapshot_file_close` | `void (db_snapshot_file_t *f)` | 官方帖 | 关闭。 |
+| `db_snapshot_file_read` | `uintptr_t (db_snapshot_file_t *f, void *buf, uintptr_t len)` | 官方帖 | 顺序读快照数据，返回读到字节数，读到尾返回 0。 |
 
-**MCP 场景一般用不到**，除非要做文件内容预览。建议先用 `db_query_*`，需要时再探索。
+**这不是「读文件正文」的接口。** `db_snapshot_file_open` 只吃快照句柄、**没有
+filename 参数**，配上 `get_size` + 顺序读到 EOF 的形态，用途是把索引 DB 全量导出，
+与检索命中的文件内容无关。要读文件正文请用 `utf8_basic_string_get_text_plain_file`
+（见 12.4）。
+
+**MCP 场景一般用不到**，除非要做全量索引导出。建议先用 `db_query_*`，需要时再探索。
 
 ---
 
@@ -922,6 +929,16 @@ Export Directory 的 RVA 为 0），host 函数一律经 1.3 节的
 | `utf8_string_copy_utf8_string` | `utf8_t* (utf8_t *buf, const utf8_t *s)` | ✅ | 拷贝到已分配缓冲。 |
 | `utf8_basic_string_get_text_plain_file` | `utf8_basic_string_t* (const utf8_t *filename)` | ✅ | 读整个文本文件为 basic_string（host 分配）。 |
 | `utf8_basic_string_free` | `void (utf8_basic_string_t *s)` | ✅ | 释放 basic_string。 |
+
+> **`utf8_basic_string_get_text_plain_file` 实测结论（2026-09-23，1.5.0.1422b）：**
+> 函数存在、能调用、能取到正确正文，但**只按 UTF-8 解码** —— GBK/ANSI 正文
+> 经它出来整篇是 `U+FFFD` 替换字符（实测码点：`FFFD FFFD FFFD 0131 ...`）。
+> 它也读不了被别的进程独占打开的文件（该场景返回 NULL，对应 `os error 32`），
+> 且不比自读多覆盖长路径（303 字符路径 `std::fs` 直读正常）。
+> 结论：读文件正文不要用它，直接 `std::fs` + 自解码（UTF-16 BOM → UTF-8 →
+> 本机 ANSI 代码页）覆盖面更大，见 `src/plugin/read.rs` 的模块注释。
+> 它有主线程亲和性嫌疑（官方 http_server 只在 PM_START 里调用过），调用需
+> marshal 到主线程，这也是不选它的附带理由。
 
 ### 12.5 解析与比较
 

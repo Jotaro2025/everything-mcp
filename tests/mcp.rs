@@ -51,13 +51,19 @@ fn initialize_result_announces_protocol_version_and_tools_capability() {
 }
 
 #[test]
-fn tools_list_contains_four_tools_with_required_params() {
+fn tools_list_contains_five_tools_with_required_params() {
     let list = protocol::make_tools_list();
     let tools = list["tools"].as_array().expect("tools must be an array");
     let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
     assert_eq!(
         names,
-        vec!["search_in_folder", "list_folder", "count", "index_changes"]
+        vec![
+            "search_in_folder",
+            "list_folder",
+            "count",
+            "index_changes",
+            "read_file"
+        ]
     );
 
     // search_in_folder 的 folder / pattern 必填，其余可带默认值。
@@ -102,6 +108,12 @@ fn tools_list_contains_four_tools_with_required_params() {
         tools[3]["inputSchema"]["properties"]["max_results"]["default"],
         50
     );
+
+    // read_file：只要求 path；start_line / max_lines 带默认值。
+    assert_eq!(tools[4]["inputSchema"]["required"], json!(["path"]));
+    let read_props = &tools[4]["inputSchema"]["properties"];
+    assert_eq!(read_props["start_line"]["default"], 1);
+    assert_eq!(read_props["max_lines"]["default"], 200);
 }
 
 #[test]
@@ -163,6 +175,139 @@ fn search_description_warns_against_shell_glob_and_documents_truncation() {
         .unwrap();
     assert!(pattern_desc.contains("**/*.rs"));
     assert!(pattern_desc.contains("ext:rs !test"));
+}
+
+#[test]
+fn read_file_description_documents_the_contract() {
+    let list = protocol::make_tools_list();
+    let tool = &list["tools"][4];
+    assert_eq!(tool["name"], "read_file");
+    let desc = tool["description"].as_str().unwrap();
+
+    // 描述要点明边界，否则 LLM 会拿它当搜索用、或读目录、或读巨型文件。
+    assert!(desc.contains("search_in_folder"), "desc: {desc}");
+    assert!(desc.contains("list_folder"), "desc: {desc}");
+    assert!(desc.contains("8 MiB"), "desc should state the size limit");
+    assert!(desc.contains("start_line"), "desc should document paging");
+    assert!(desc.contains("encoding"), "desc should document the encoding field");
+    assert!(desc.contains("NUL"), "desc should say binary files are rejected");
+    // 与 content: 检索的分工必须写清楚 —— 这是最容易混的一处。
+    assert!(desc.contains("content:"), "desc: {desc}");
+
+    let props = &tool["inputSchema"]["properties"];
+    assert!(props["path"]["description"]
+        .as_str()
+        .unwrap()
+        .contains("Absolute path"));
+}
+
+#[test]
+fn read_file_arg_validation_before_touching_the_disk() {
+    // 缺 path / 类型错 / 相对路径 / 通配符 —— 全部必须在读盘之前报错。
+    let err = tools::dispatch("read_file", &json!({})).unwrap_err();
+    assert_eq!(err.0, protocol::INVALID_PARAMS);
+    assert!(err.1.contains("path"));
+
+    let err = tools::dispatch("read_file", &json!({"path": 42})).unwrap_err();
+    assert_eq!(err.0, protocol::INVALID_PARAMS);
+
+    let err = tools::dispatch("read_file", &json!({"path": "src\\lib.rs"})).unwrap_err();
+    assert_eq!(err.0, protocol::INVALID_PARAMS);
+    assert!(err.1.contains("absolute"), "{}", err.1);
+
+    let err = tools::dispatch("read_file", &json!({"path": "D:\\a\\*.rs"})).unwrap_err();
+    assert_eq!(err.0, protocol::INVALID_PARAMS);
+    assert!(err.1.contains("pattern"), "{}", err.1);
+
+    // start_line 是 1 起的 —— 0 属于写错，不该静默当 1 处理。
+    let err = tools::dispatch(
+        "read_file",
+        &json!({"path": "D:\\a\\b.rs", "start_line": 0}),
+    )
+    .unwrap_err();
+    assert_eq!(err.0, protocol::INVALID_PARAMS);
+    assert!(err.1.contains("1-based"), "{}", err.1);
+
+    let err = tools::dispatch(
+        "read_file",
+        &json!({"path": "D:\\a\\b.rs", "max_lines": "all"}),
+    )
+    .unwrap_err();
+    assert_eq!(err.0, protocol::INVALID_PARAMS);
+    assert!(err.1.contains("max_lines"), "{}", err.1);
+}
+
+/// 取工具结果的文本（单条 content）。
+fn out_text(out: &tools::ToolOutput) -> String {
+    out.0["content"][0]["text"].as_str().unwrap().to_string()
+}
+
+#[test]
+fn read_file_reads_a_real_file_and_windows_lines() {
+    // 测试进程里没有主程序 host → 走 std::fs 直读回退路径。
+    // 覆盖真实读取、行窗口、元信息与两段式 content。
+    let path = std::env::temp_dir().join("everything_mcp_read_file_test.txt");
+    let body = "alpha\nbravo\ncharlie\ndelta\n";
+    std::fs::write(&path, body).unwrap();
+
+    let out = tools::dispatch(
+        "read_file",
+        &json!({"path": path.to_string_lossy(), "start_line": 2, "max_lines": 2}),
+    )
+    .unwrap();
+    assert!(!out.1, "read must succeed: {}", out_text(&out));
+
+    let items = out.0["content"].as_array().unwrap();
+    assert_eq!(items.len(), 2, "元信息 + 正文两段");
+    let meta: Value = serde_json::from_str(items[0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(meta["total_lines"], 4);
+    assert_eq!(meta["start_line"], 2);
+    assert_eq!(meta["lines_returned"], 2);
+    assert_eq!(meta["truncated"], true, "还有 delta 没返回");
+    assert_eq!(meta["encoding"], "utf-8");
+    assert_eq!(meta["size"], body.len());
+    // 正文单独成项、保持原样（不是 JSON 转义过的一行）。
+    assert_eq!(items[1]["text"], "bravo\ncharlie");
+
+    // max_lines=0 = 余下全部，此时不再截断。
+    let out = tools::dispatch(
+        "read_file",
+        &json!({"path": path.to_string_lossy(), "start_line": 1, "max_lines": 0}),
+    )
+    .unwrap();
+    let meta: Value =
+        serde_json::from_str(out.0["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(meta["lines_returned"], 4);
+    assert_eq!(meta["truncated"], false);
+
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn read_file_reports_folders_and_missing_files_as_tool_errors() {
+    // 目录 / 不存在的文件是运行时问题（is_error），不是协议错误 ——
+    // 与 folder 参数的 INVALID_PARAMS 分工不同。
+    let dir = std::env::temp_dir();
+    let out = tools::dispatch("read_file", &json!({"path": dir.to_string_lossy()})).unwrap();
+    assert!(out.1, "folder must be a tool error");
+    assert!(out_text(&out).contains("list_folder"), "{}", out_text(&out));
+
+    let missing = dir.join("everything_mcp_definitely_missing_file.txt");
+    let out = tools::dispatch("read_file", &json!({"path": missing.to_string_lossy()})).unwrap();
+    assert!(out.1);
+    assert!(out_text(&out).contains("read_file error"), "{}", out_text(&out));
+}
+
+#[test]
+fn read_file_rejects_binary_content() {
+    let path = std::env::temp_dir().join("everything_mcp_binary_probe.bin");
+    std::fs::write(&path, [0x00u8, 0x01, 0x02, 0xFF, 0x00]).unwrap();
+
+    let out = tools::dispatch("read_file", &json!({"path": path.to_string_lossy()})).unwrap();
+    assert!(out.1, "binary must be rejected");
+    assert!(out_text(&out).contains("binary"), "{}", out_text(&out));
+
+    let _ = std::fs::remove_file(&path);
 }
 
 #[test]
@@ -283,10 +428,10 @@ fn dispatch_ping_returns_empty_result() {
 }
 
 #[test]
-fn dispatch_tools_list_returns_four_tools() {
+fn dispatch_tools_list_returns_five_tools() {
     let resp = dispatch(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#);
     let list = resp["result"]["tools"].as_array().unwrap();
-    assert_eq!(list.len(), 4);
+    assert_eq!(list.len(), 5);
 }
 
 #[test]
@@ -558,7 +703,7 @@ fn modern_tools_list_result_carries_result_type() {
     );
     assert_eq!(status, 200);
     assert_eq!(resp["result"]["resultType"], "complete");
-    assert_eq!(resp["result"]["tools"].as_array().unwrap().len(), 4);
+    assert_eq!(resp["result"]["tools"].as_array().unwrap().len(), 5);
 }
 
 #[test]
@@ -567,7 +712,7 @@ fn legacy_tools_list_has_no_result_type() {
     // 客户端按桥接规则把缺失当作 complete。
     let resp = dispatch(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#);
     assert!(resp["result"].get("resultType").is_none());
-    assert_eq!(resp["result"]["tools"].as_array().unwrap().len(), 4);
+    assert_eq!(resp["result"]["tools"].as_array().unwrap().len(), 5);
 }
 
 #[test]
@@ -990,7 +1135,7 @@ fn end_to_end_over_real_tcp() {
     assert_eq!(resp["result"]["resultType"], "complete");
     assert_eq!(resp["result"]["ttlMs"], json!(protocol::TOOLS_LIST_TTL_MS));
     assert_eq!(resp["result"]["cacheScope"], "public");
-    assert_eq!(resp["result"]["tools"].as_array().unwrap().len(), 4);
+    assert_eq!(resp["result"]["tools"].as_array().unwrap().len(), 5);
     // 清单里应当能看到新工具，且按现有顺序排在最后。
     let names: Vec<&str> = resp["result"]["tools"]
         .as_array()

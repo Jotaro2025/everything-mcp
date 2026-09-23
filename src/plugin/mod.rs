@@ -12,6 +12,7 @@ pub mod host;
 pub mod ini_settings;
 pub mod journal;
 pub mod main_thread;
+pub mod read;
 pub mod search;
 pub mod state;
 pub mod timefmt;

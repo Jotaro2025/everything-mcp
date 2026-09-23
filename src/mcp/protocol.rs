@@ -371,6 +371,30 @@ pub fn make_tools_list() -> Value {
                         }
                     }
                 }
+            },
+            {
+                "name": "read_file",
+                "description": "Read the contents of one text file, optionally a window of lines. The companion to search_in_folder: search to locate files, then read_file to read one. 'path' must be an absolute path to a single existing file — no wildcards (use search_in_folder for patterns) and no folders (use list_folder); files above 8 MiB are refused. Lines are returned verbatim starting at 'start_line' (1-based); the response reports 'total_lines' and 'lines_returned', so page by raising 'start_line'. 'truncated' is true when content remains beyond the window (either the line window or the 512 KiB response cap). 'encoding' reports how the bytes were decoded: 'utf-8' / 'utf-16le' / 'utf-16be' are certain (valid UTF-8 or an explicit BOM), while 'ansi' means no UTF-8 validity and no BOM, so the machine's ANSI code page was assumed (correct for GBK text on a Chinese Windows, a guess elsewhere) and 'utf-8-lossy' means undecodable bytes were replaced — treat 'ansi' and 'utf-8-lossy' bodies with suspicion. Binary files (containing NUL bytes) are rejected rather than returned as garbage. This does not search file contents — use search_in_folder with 'content:\"...\"' for that.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Absolute path to the file to read, e.g. D:\\\\source\\\\repos\\\\myproject\\\\README.md. Wildcards are rejected — use search_in_folder to find files by pattern."
+                        },
+                        "start_line": {
+                            "type": "integer",
+                            "description": "1-based line number to start from (default 1). A value past the end of the file returns an empty window rather than an error.",
+                            "default": 1
+                        },
+                        "max_lines": {
+                            "type": "integer",
+                            "description": "Maximum number of lines to return (default 200). 0 means all remaining lines, still capped by the 512 KiB response limit.",
+                            "default": 200
+                        }
+                    },
+                    "required": ["path"]
+                }
             }
         ]
     })

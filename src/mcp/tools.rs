@@ -476,6 +476,46 @@ pub fn dispatch(name: &str, args: &Value) -> Result<ToolOutput, (i32, String)> {
             }
         }
 
+        "read_file" => {
+            // 纯入参问题（缺参数 / 相对路径 / 通配符）在触达磁盘之前就报
+            // INVALID_PARAMS —— 与 folder 参数的处理一致，CI 上无主程序也能跑。
+            let path = match args.get("path").and_then(Value::as_str) {
+                Some(p) => plugin::read::validate_path(p).map_err(|e| (INVALID_PARAMS, e))?,
+                None => {
+                    return Err((
+                        INVALID_PARAMS,
+                        "'path' is required and must be a string: the absolute path of the file to read".into(),
+                    ))
+                }
+            };
+            let start_line = u64_arg(args, "start_line", 1)? as usize;
+            let max_lines =
+                u64_arg(args, "max_lines", plugin::read::DEFAULT_MAX_LINES as u64)? as usize;
+            if start_line == 0 {
+                return Err((
+                    INVALID_PARAMS,
+                    "'start_line' is 1-based; use 1 for the first line".into(),
+                ));
+            }
+
+            match plugin::read::read_file(&path, start_line, max_lines) {
+                Ok(c) => {
+                    let meta = serde_json::to_string_pretty(&json!({
+                        "path": c.path,
+                        "size": c.size,
+                        "total_lines": c.total_lines,
+                        "start_line": c.start_line,
+                        "lines_returned": c.lines_returned,
+                        "truncated": c.truncated,
+                        "encoding": c.encoding,
+                    }))
+                    .unwrap_or_else(|_| "{\"error\":\"serialization failed\"}".into());
+                    Ok((content_meta_and_body(&meta, &c.text), false))
+                }
+                Err(e) => Ok((content_text(&format!("read_file error: {}", e)), true)),
+            }
+        }
+
         other => Err((METHOD_NOT_FOUND, format!("unknown tool: {}", other))),
     }
 }
@@ -485,6 +525,19 @@ fn content_text(text: &str) -> Value {
     json!({
         "content": [
             { "type": "text", "text": text }
+        ]
+    })
+}
+
+/// 构造两段式 `content` 数组：先是元信息，再是正文原文。
+///
+/// 正文单独成项而不是塞进 JSON —— 否则换行会变成 `\n` 转义，
+/// 读代码时既难读也容易在后续引用时出错。
+fn content_meta_and_body(meta: &str, body: &str) -> Value {
+    json!({
+        "content": [
+            { "type": "text", "text": meta },
+            { "type": "text", "text": body }
         ]
     })
 }

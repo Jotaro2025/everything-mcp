@@ -52,6 +52,7 @@ everything-mcp/
 │   │   ├── ffi_types.rs        #[repr(C)] 类型（Utf8Buf/DbHandle/FileInfoFd...）
 │   │   ├── host.rs             host 函数指针表 + HOST/HOST_LOCK
 │   │   ├── journal.rs          索引日志（index-journal-*.txt）解析与查询
+│   │   ├── read.rs             read_file：单文件正文读取（行窗口 / 大小上限）
 │   │   ├── search.rs           异步搜索 → 同步等待的高层封装（主线程 marshaling）
 │   │   ├── main_thread.rs      主线程窗口 + PostMessage 任务分发
 │   │   └── state.rs            运行期状态（懒创建的 db/query、关闭标志）
@@ -59,7 +60,7 @@ everything-mcp/
 │       ├── mod.rs
 │       ├── protocol.rs         JSON-RPC 2.0 + MCP 双时代类型（2024-11-05 / 2026-07-28）
 │       ├── server.rs           基于 std::net 的 HTTP 服务，按请求协商协议版本、校验 Origin
-│       ├── tools.rs            工具实现（search_in_folder/list_folder/count/index_changes）
+│       ├── tools.rs            工具实现（search_in_folder/list_folder/count/index_changes/read_file）
 │       └── validate.rs         入参校验与路径规范化（folder 规范化、pattern 校验）
 ├── installer/
 │   ├── build-installers.ps1    一键打包脚本（x64 / x86 两个安装包）
@@ -210,7 +211,7 @@ Everything 官方插件页：<https://www.voidtools.com/support/everything/plugi
 或 `%APPDATA%\Everything\Plugins.ini` 的 `[everything_mcp64.dll]` 小节里
 `mcp_enabled=1`）。
 
-接入后 LLM 会自动发现以下四个工具：
+接入后 LLM 会自动发现以下五个工具：
 
 #### 1. `search_in_folder`
 
@@ -372,6 +373,41 @@ gitignore），常见做法：
   不会把整份日志穿完。
 - 深度受 Everything 侧的日志保留策略限制：日志按天一个文件，本工具最多
   回溯 92 天、单文件最多 64 MiB。
+
+#### 5. `read_file`
+
+读**一个**文本文件的内容，可选只返回其中一段行窗口。它是 `search_in_folder`
+的搭档：先搜出文件，再读它的内容 —— 检索本身只返回路径与元数据，不返回正文。
+
+```json
+{ "path": "D:\\source\\repos\\my-project\\README.md", "start_line": 1, "max_lines": 200 }
+```
+
+- `path` 必须是**绝对路径**且指向**单个已存在的文件**。通配符（`*` / `?`）
+  会被拒绝并提示改用 `search_in_folder`，目录会被拒绝并提示改用
+  `list_folder`，相对路径直接报错。这些纯入参问题都在读盘之前返回
+  `-32602 INVALID_PARAMS`；文件不存在、是二进制、超过大小上限则作为工具错误
+  返回（`isError: true`）。
+- **单文件上限 8 MiB**，超过直接报错 —— 不会把大文件读进内存。返回内容另有
+  512 KiB 字节上限兜底（压缩过的单行文件、超长单行日志），触顶时
+  `truncated` 为 `true`。
+- **分页**：`start_line` 是 1 起的起始行号（默认 1），`max_lines` 是返回行数
+  （默认 200，`0` 表示余下全部）。响应里的 `total_lines` 与 `lines_returned`
+  用来判断还有没有更多；`start_line` 超出末尾返回空窗口而不是报错。
+- **响应是两段 content**：第一段是元信息 JSON（`path` / `size` /
+  `total_lines` / `start_line` / `lines_returned` / `truncated` / `encoding`），
+  第二段是正文原文。正文单独成项是为了保持原样 —— 塞进 JSON 会把换行转义成
+  `\n`，读代码时既难读又容易在后续引用时出错。
+- **`encoding` 说明正文是怎么解出来的**：`utf-8` / `utf-16le` / `utf-16be`
+  是确定的（合法 UTF-8 或带 BOM）；`ansi` 表示既不是合法 UTF-8 也没有 BOM，
+  于是按**本机 ANSI 代码页**解（中文 Windows 即 GBK —— 老文档、老日志常见）；
+  `utf-8-lossy` 表示有字节解不出来、已替换成 `\uFFFD`。看到 `ansi` 或
+  `utf-8-lossy` 时正文可能是猜的，引用前留意一下。
+- **二进制文件会被拒绝**（正文含 NUL 字节），返回错误而不是一堆乱码。
+- 想按内容找文件请用 `search_in_folder` 的 `content:"…"`（见上面的
+  [正文检索与提速](#正文检索与提速)）；`read_file` 只读你指定的那一个文件。
+- ⚠️ 本工具能读 Everything 进程有权限读的**任意**绝对路径，不限于已索引的
+  文件。服务默认只监听 `127.0.0.1`（见「配置」），请勿把它暴露到网络上。
 
 三个工具共用的入参规则：`folder` 必须是绝对路径（`C:\…` 或 `\\server\share\…`）。
 带引号、正斜杠、重复反斜杠、尾斜杠的写法会被自动规范化；通配符属于 `pattern`

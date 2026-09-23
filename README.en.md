@@ -61,6 +61,7 @@ everything-mcp/
 │   │   ├── ffi_types.rs         #[repr(C)] types (Utf8Buf/DbHandle/FileInfoFd...)
 │   │   ├── host.rs              Host function pointer table + HOST/HOST_LOCK
 │   │   ├── journal.rs           Index journal (index-journal-*.txt) parsing & querying
+│   │   ├── read.rs              read_file: single-file content read (line window, size cap)
 │   │   ├── search.rs            Async search → sync wait wrapper (main-thread marshaling)
 │   │   ├── main_thread.rs       Main-thread window + PostMessage task dispatch
 │   │   └── state.rs             Runtime state (lazily created db/query, shutdown flag)
@@ -69,7 +70,7 @@ everything-mcp/
 │       ├── protocol.rs          JSON-RPC 2.0 + dual-era MCP types (2024-11-05 / 2026-07-28)
 │       ├── server.rs            HTTP server on std::net; per-request version
 │       │                         negotiation and Origin validation
-│       ├── tools.rs             Tool implementations (search_in_folder/list_folder/count/index_changes)
+│       ├── tools.rs             Tool implementations (search_in_folder/list_folder/count/index_changes/read_file)
 │       └── validate.rs          Argument validation & path normalization
 ├── installer/
 │   ├── build-installers.ps1     One-command packaging script (x64 + x86 installers)
@@ -234,7 +235,7 @@ plugin is enabled (the Plugins → MCP page in Everything's options dialog, or
 `mcp_enabled=1` under `[everything_mcp64.dll]` in
 `%APPDATA%\Everything\Plugins.ini`).
 
-Once connected, the LLM discovers four tools automatically:
+Once connected, the LLM discovers five tools automatically:
 
 #### 1. `search_in_folder`
 
@@ -424,6 +425,54 @@ modified, deleted, renamed or moved, **most recent first**. It answers
   reads only a small piece of the file tail rather than the whole log.
 - History depth follows Everything's own retention: one log file per day,
   and this tool reads back at most 92 days, up to 64 MiB per file.
+
+#### 5. `read_file`
+
+Read the contents of **one** text file, optionally just a window of lines.
+It is the companion to `search_in_folder`: search to locate files, then read
+one — a search itself returns only paths and metadata, never content.
+
+```json
+{ "path": "D:\\source\\repos\\my-project\\README.md", "start_line": 1, "max_lines": 200 }
+```
+
+- `path` must be an **absolute path** to a **single existing file**.
+  Wildcards (`*` / `?`) are rejected with a pointer to `search_in_folder`, a
+  folder is rejected with a pointer to `list_folder`, and a relative path is
+  an error. Those pure argument problems come back as `-32602
+  INVALID_PARAMS` before anything touches the disk; a missing file, a binary
+  file or one over the size limit comes back as a tool error (`isError:
+  true`).
+- **8 MiB per file**, refused above that — a large file is never read into
+  memory. The response is additionally capped at 512 KiB of text (minified
+  single-line files, very long log lines); when either cap bites,
+  `truncated` is `true`.
+- **Paging**: `start_line` is the 1-based first line to return (default 1)
+  and `max_lines` the number of lines (default 200; `0` means all
+  remaining). `total_lines` and `lines_returned` in the response tell you
+  whether more remains; a `start_line` past the end returns an empty window
+  rather than an error.
+- **The response has two content items**: a metadata JSON object (`path` /
+  `size` / `total_lines` / `start_line` / `lines_returned` / `truncated` /
+  `encoding`) followed by the text itself. The body is a separate item so it
+  stays verbatim — inside JSON every newline would become `\n`, which is
+  both harder to read and easy to mangle when quoting later.
+- **`encoding` reports how the bytes were decoded**: `utf-8` / `utf-16le` /
+  `utf-16be` are certain (valid UTF-8, or an explicit BOM); `ansi` means the
+  bytes were neither valid UTF-8 nor BOM-prefixed, so **the machine's ANSI
+  code page** was assumed (that is GBK on a Chinese Windows, which is what
+  older documents and logs use); `utf-8-lossy` means some bytes were
+  undecodable and became `\uFFFD`. Treat an `ansi` or `utf-8-lossy` body as a
+  guess before quoting it.
+- **Binary files are rejected** (content containing NUL bytes) with an
+  error instead of a page of garbage.
+- To find files *by their contents* use `search_in_folder` with
+  `content:"…"` (see
+  [Content search and making it fast](#content-search-and-making-it-fast));
+  `read_file` only reads the one file you name.
+- ⚠️ This tool can read **any** absolute path the Everything process can
+  read, not only indexed files. The server listens on `127.0.0.1` by default
+  (see Configuration) — do not expose it to a network.
 
 Argument rules shared by all three tools: `folder` must be an absolute path
 (`C:\…` or `\\server\share\…`). Quoted, forward-slash, doubled-backslash and
