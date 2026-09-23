@@ -200,7 +200,7 @@ pub fn make_initialize_result(params: &Value) -> Value {
         },
         "serverInfo": {
             "name": "everything-mcp",
-            "version": "1.1.1"
+            "version": "1.1.2"
         }
     });
     with_result_type(result, is_modern_version(version))
@@ -223,7 +223,7 @@ pub fn make_discover_result() -> Value {
         "_meta": {
             "io.modelcontextprotocol/serverInfo": {
                 "name": "everything-mcp",
-                "version": "1.1.1"
+                "version": "1.1.2"
             }
         },
         "instructions": "Folder-scoped Everything file search. Use search_in_folder with an absolute folder path plus Everything search syntax; list_folder for immediate children; count for totals only; index_changes to read the index journal (created/modified/deleted/renamed); it needs journal_log enabled in Everything and returns an actionable error when it is not. Search results are truncated by max_results and carry a separate 'total' count of all matches found.",
@@ -308,7 +308,7 @@ pub fn make_tools_list() -> Value {
             },
             {
                 "name": "index_changes",
-                "description": "Query the Everything index journal: which files/folders were created, modified, deleted, renamed or moved, most recent first. This answers 'what changed recently' from Everything's change history — it does not describe the current index state (use search_in_folder for that). Requires 'journal_log' to be enabled in Everything (Tools > Options > Index > Journal > Log changes); when it is off the tool returns an error that says so. Results are capped by max_results and carry 'truncated' when more matching history exists further back. Each entry's 'action_text' holds Everything's original localized action label, so an unfamiliar locale still reads sensibly. NOTE: Everything appends journal rows to its log file with a delay of roughly a minute (measured 40-70s), so a change made moments ago is usually NOT in the results yet — re-query before concluding that nothing happened, and don't treat an empty result as proof the change did not occur.",
+                "description": "Query the Everything index journal: which files/folders were created, modified, deleted, renamed or moved, most recent first. This answers 'what changed recently' from Everything's change history — it does not describe the current index state (use search_in_folder for that). Requires 'journal_log' to be enabled in Everything (Tools > Options > Index > Journal > Log changes); when it is off the tool returns an error that says so. Results are capped by max_results and carry 'truncated' when more matching history exists further back. Each entry's 'action_text' holds Everything's original localized action label, so an unfamiliar locale still reads sensibly. NOTE: Everything appends journal rows to its log file with a delay — measured from about 8 s up to 70 s — so a change made moments ago may not be in the results yet. Re-query after a short wait, and never read an empty result as proof that nothing happened.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {

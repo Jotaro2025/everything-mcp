@@ -134,8 +134,8 @@ powershell -ExecutionPolicy Bypass -File build-installers.ps1
 
 | 安装包                              | 架构 | 内嵌插件 dll           |
 | ----------------------------------- | ---- | ---------------------- |
-| `everything-mcp-1.1.1-x64-setup.exe` | x64  | `everything_mcp64.dll` |
-| `everything-mcp-1.1.1-x86-setup.exe` | x86  | `everything_mcp32.dll` |
+| `everything-mcp-1.1.2-x64-setup.exe` | x64  | `everything_mcp64.dll` |
+| `everything-mcp-1.1.2-x86-setup.exe` | x86  | `everything_mcp32.dll` |
 
 安装：运行对应架构的安装包 → Everything 弹出「设置插件」对话框 → 点「安装」。
 两个安装包可以一起分发，`Plugins\` 下 `everything_mcp64.dll` 与
@@ -290,9 +290,9 @@ gitignore），常见做法：
   `journal_log=1`，然后重启 Everything）。**没开时这个工具返回带确切
   开关位置的友好错误提示**，而不是静默返回空结果 —— 所以第一次调用前
   要先确认开关已打开。
-- **日志写入有延迟，实测约 40–70 秒**：Everything 不是实时把变更写进文本
-  日志的，刚刚发生的改动通常还查不到。**空结果不等于「什么都没发生」** ——
-  拿到空结果时请稍等一分钟左右再查一次，或先用 `search_in_folder` /
+- **日志写入有延迟，实测约 8–70 秒**：Everything 不是实时把变更写进文本
+  日志的，刚刚发生的改动可能还查不到。**空结果不等于「什么都没发生」** ——
+  拿到空结果时请稍等一分钟再查一次，或先用 `search_in_folder` /
   `count` 确认文件的当前状态。
 - `action` 取 `created` / `modified` / `deleted` / `renamed` / `moved` /
   `any`（默认 `any`）。Everything 区分「重命名」（同一文件夹内）与

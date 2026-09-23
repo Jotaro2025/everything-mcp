@@ -146,8 +146,8 @@ Outputs (in `installer\dist\`):
 
 | Installer                            | Arch | Embedded plugin dll   |
 | ------------------------------------ | ---- | --------------------- |
-| `everything-mcp-1.1.1-x64-setup.exe` | x64  | `everything_mcp64.dll` |
-| `everything-mcp-1.1.1-x86-setup.exe` | x86  | `everything_mcp32.dll` |
+| `everything-mcp-1.1.2-x64-setup.exe` | x64  | `everything_mcp64.dll` |
+| `everything-mcp-1.1.2-x86-setup.exe` | x86  | `everything_mcp32.dll` |
 
 To install, run the installer for your architecture; Everything then shows its
 "Setup Plugin" dialog, where you click Install. Both installers can be
@@ -320,10 +320,10 @@ modified, deleted, renamed or moved, **most recent first**. It answers
   **When the switch is off this tool returns an error naming the exact
   fix instead of an empty result** — so confirm it is on before the first
   call.
-- **Log writes are delayed, measured at roughly 40–70 seconds**: Everything
+- **Log writes are delayed, measured at roughly 8–70 seconds**: Everything
   does not append to the text log in real time, so something that just
-  happened usually is not in there yet. **An empty result does not mean
-  "nothing happened"** — when you get one, wait about a minute and query
+  happened may not be in there yet. **An empty result does not mean
+  "nothing happened"** — when you get one, wait a minute and query
   again, or confirm the file's current state with `search_in_folder` /
   `count` first.
 - `action` takes `created` / `modified` / `deleted` / `renamed` / `moved` /
