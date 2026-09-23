@@ -8,6 +8,7 @@
 
 pub mod diag;
 pub mod ffi_types;
+pub mod grep;
 pub mod host;
 pub mod ini_settings;
 pub mod journal;

@@ -395,6 +395,54 @@ pub fn make_tools_list() -> Value {
                     },
                     "required": ["path"]
                 }
+            },
+            {
+                "name": "grep",
+                "description": "Search file CONTENTS by regular expression and return the matching lines with their line numbers. This is the line-level companion to search_in_folder: that one uses Everything's index to answer WHICH files contain something (paths only), while grep reads the candidate files and reports the matching lines themselves. Candidates are still picked by the Everything index, so 'filter' decides how much actually gets read — an unfiltered grep over a large tree reads every file. Two internal caps bound that work (2000 candidate files, 64 MiB read) and 'truncated' plus 'candidates' / 'files_scanned' / 'bytes_scanned' tell you which cap bit. 'pattern' is a Rust regex matched against each line individually, so '^' and '$' anchor to line boundaries and a pattern containing a literal newline can never match. 'filter' takes the same Everything syntax as search_in_folder's pattern ('ext:rs;toml', 'dm:lastweek', '!\\\\target\\\\') and is applied before any file is read — use it. 'output_mode' picks the shape: 'content' (default) returns {path, line, text} hits, 'filesWithMatches' returns just the paths, 'count' returns per-file hit counts. 'head_limit' caps matches (content) or files (other modes); default 200, max 2000. Matched lines longer than 16384 characters are cut and counted in 'clipped_lines'. Binary files, files above 8 MiB and denylisted paths (private keys, .env, credentials, .git/objects) are skipped silently — grep never returns content from them. Results are ordered by file modification time, newest first. Prefer this over search_in_folder + read_file when you need to know WHERE inside the files something is.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "pattern": {
+                            "type": "string",
+                            "description": "Rust regular expression matched against each line separately, e.g. 'fn\\\\s+main' or 'TODO|FIXME'. Case-sensitive unless 'case_insensitive' is set."
+                        },
+                        "folder": {
+                            "type": "string",
+                            "description": "Absolute path to the folder to search in, e.g. D:\\\\source\\\\repos\\\\myproject. Always recurse into subfolders."
+                        },
+                        "filter": {
+                            "type": "string",
+                            "description": "Everything-syntax filter on file names/paths, applied BEFORE any file is read: 'ext:rs;toml', 'dm:lastweek', '!\\\\target\\\\', '\"src\"'. Strongly recommended — without it every file under 'folder' is read. This is not the regex; 'pattern' is."
+                        },
+                        "output_mode": {
+                            "type": "string",
+                            "enum": ["content", "filesWithMatches", "count"],
+                            "description": "content (default): matching lines with line numbers; filesWithMatches: only the paths of files containing a match; count: per-file match counts.",
+                            "default": "content"
+                        },
+                        "head_limit": {
+                            "type": "integer",
+                            "description": "Maximum matches (content) or files (other modes); default 200, max 2000.",
+                            "default": 200
+                        },
+                        "case_insensitive": {
+                            "type": "boolean",
+                            "description": "Match case-insensitively (default false).",
+                            "default": false
+                        },
+                        "exclude": {
+                            "type": ["string", "array"],
+                            "items": { "type": "string" },
+                            "description": "Terms to exclude from the candidate files, appended as Everything NOT operators (same as search_in_folder's 'exclude'). Quoted path fragments match well: ['\\\\target\\\\', '\\\\.git\\\\']. Default: none."
+                        },
+                        "timeout_ms": {
+                            "type": "integer",
+                            "description": "Maximum time in milliseconds to wait for the Everything candidate query (default 10000). Reading the candidates afterwards is not covered by it.",
+                            "default": 10000
+                        }
+                    },
+                    "required": ["pattern", "folder"]
+                }
             }
         ]
     })

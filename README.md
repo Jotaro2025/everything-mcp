@@ -50,6 +50,7 @@ everything-mcp/
 │   │   ├── mod.rs              子模块汇总 + PM_* 常量
 │   │   ├── diag.rs             磁盘诊断日志（%LOCALAPPDATA%\everything-mcp\plugin.log）
 │   │   ├── ffi_types.rs        #[repr(C)] 类型（Utf8Buf/DbHandle/FileInfoFd...）
+│   │   ├── grep.rs             grep：Everything 选候选 + 正则逐行匹配
 │   │   ├── host.rs             host 函数指针表 + HOST/HOST_LOCK
 │   │   ├── journal.rs          索引日志（index-journal-*.txt）解析与查询
 │   │   ├── read.rs             read_file：单文件正文读取（行窗口 / 大小上限）
@@ -212,7 +213,7 @@ Everything 官方插件页：<https://www.voidtools.com/support/everything/plugi
 或 `%APPDATA%\Everything\Plugins.ini` 的 `[everything_mcp64.dll]` 小节里
 `mcp_enabled=1`）。
 
-接入后 LLM 会自动发现以下五个工具：
+接入后 LLM 会自动发现以下六个工具：
 
 #### 1. `search_in_folder`
 
@@ -429,6 +430,44 @@ gitignore），常见做法：
 - ⚠️ 除上面那份黑名单外，本工具能读 Everything 进程有权限读的**任意**绝对
   路径，不限于已索引的文件。服务默认只监听 `127.0.0.1`（见「配置」），请勿
   把它暴露到网络上。
+
+#### 6. `grep`
+
+按正则逐行搜文件内容，返回**命中行与行号**。它是 `search_in_folder` 的行级
+搭档：后者用 Everything 索引回答「哪些文件的正文里有这个词」（只到文件粒度，
+给路径），`grep` 把候选文件读进来逐行匹配，告诉你在第几行。
+
+```json
+{
+  "folder": "D:\\source\\repos\\my-project",
+  "pattern": "fn\\s+main",
+  "filter": "ext:rs",
+  "output_mode": "content",
+  "head_limit": 200
+}
+```
+
+- **`pattern` 是正则，`filter` 是 Everything 语法** —— 这两个最容易混。
+  `pattern` 逐行匹配（每行独立，所以 `^` / `$` 锚的是行首行尾；含字面换行的
+  模式永远匹配不到）；`filter` 是交给 Everything 的候选筛选串，语法与
+  `search_in_folder` 的 `pattern` 完全一样（`ext:rs;toml`、`dm:lastweek`、
+  `!\target\`），**在任何文件被读取之前生效**。
+- **一定要给 `filter`。** 不给的话 `folder` 下每个文件都会被读一遍 —— 这跟
+  不限范围的 `content:` 检索是同一个坑。两道内部闸门兜底：候选文件上限
+  2000 个、读取总量上限 64 MiB；触顶时 `truncated` 为 `true`，而 `candidates`
+  / `files_scanned` / `bytes_scanned` 会告诉你卡在哪一道上。
+- **`output_mode`** 决定返回形状：
+  - `content`（默认）：`matches` 数组，每项 `{ path, line, text }`；
+  - `filesWithMatches`：`files` 数组，只给有命中的文件路径；
+  - `count`：`counts` 数组，每项 `{ path, count }`。
+- `head_limit` 限制命中条数（`content`）或文件数（其余模式），默认 200、
+  上限 2000。命中行超过 16384 字符会被裁短，裁了几行由 `clipped_lines` 上报。
+- 结果是**按文件修改时间倒序**的：最近改过的文件先出 —— 刚动过的代码最可能
+  是你要找的。
+- **二进制文件、超过 8 MiB 的文件、命中敏感路径黑名单的文件会被静默跳过**
+  （不报错、也不中断整次搜索）。黑名单在 grep 里同样生效：`.env` / 私钥的
+  正文绝不会出现在结果里。
+- `case_insensitive` 默认 `false`（区分大小写）；`exclude` 与其它工具同义。
 
 三个工具共用的入参规则：`folder` 必须是绝对路径（`C:\…` 或 `\\server\share\…`）。
 带引号、正斜杠、重复反斜杠、尾斜杠的写法会被自动规范化；通配符属于 `pattern`

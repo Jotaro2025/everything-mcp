@@ -59,6 +59,7 @@ everything-mcp/
 │   │   ├── mod.rs               Submodule summary + PM_* constants
 │   │   ├── diag.rs              Disk diagnostic log (%LOCALAPPDATA%\everything-mcp\plugin.log)
 │   │   ├── ffi_types.rs         #[repr(C)] types (Utf8Buf/DbHandle/FileInfoFd...)
+│   │   ├── grep.rs              grep: Everything picks candidates, regex matches lines
 │   │   ├── host.rs              Host function pointer table + HOST/HOST_LOCK
 │   │   ├── journal.rs           Index journal (index-journal-*.txt) parsing & querying
 │   │   ├── read.rs              read_file: single-file content read (line window, size cap)
@@ -236,7 +237,7 @@ plugin is enabled (the Plugins → MCP page in Everything's options dialog, or
 `mcp_enabled=1` under `[everything_mcp64.dll]` in
 `%APPDATA%\Everything\Plugins.ini`).
 
-Once connected, the LLM discovers five tools automatically:
+Once connected, the LLM discovers six tools automatically:
 
 #### 1. `search_in_folder`
 
@@ -497,6 +498,50 @@ one — a search itself returns only paths and metadata, never content.
 - ⚠️ Apart from that denylist, this tool can read **any** absolute path the
   Everything process can read, not only indexed files. The server listens on
   `127.0.0.1` by default (see Configuration) — do not expose it to a network.
+
+#### 6. `grep`
+
+Search file contents by regular expression and return the **matching lines with
+their line numbers**. It is the line-level companion to `search_in_folder`:
+that one uses Everything's index to answer *which files* contain something
+(paths only), while `grep` reads the candidate files and tells you *which line*.
+
+```json
+{
+  "folder": "D:\\source\\repos\\my-project",
+  "pattern": "fn\\s+main",
+  "filter": "ext:rs",
+  "output_mode": "content",
+  "head_limit": 200
+}
+```
+
+- **`pattern` is the regex; `filter` is Everything syntax** — the two are easy
+  to mix up. `pattern` is matched against each line separately (so `^` / `$`
+  anchor to line boundaries, and a pattern containing a literal newline can
+  never match); `filter` is the candidate filter handed to Everything, with
+  exactly the same syntax as `search_in_folder`'s `pattern` (`ext:rs;toml`,
+  `dm:lastweek`, `!\target\`), and it applies **before any file is read**.
+- **Always pass `filter`.** Without it, every file under `folder` gets read —
+  the same trap as an unscoped `content:` search. Two internal caps bound the
+  damage: at most 2000 candidate files and 64 MiB read. When either bites,
+  `truncated` is `true`, and `candidates` / `files_scanned` / `bytes_scanned`
+  tell you which one it was.
+- **`output_mode`** picks the shape:
+  - `content` (default): a `matches` array of `{ path, line, text }`;
+  - `filesWithMatches`: a `files` array of paths only;
+  - `count`: a `counts` array of `{ path, count }`.
+- `head_limit` caps matches (`content`) or files (other modes); default 200,
+  max 2000. Matched lines longer than 16384 characters are cut, and
+  `clipped_lines` reports how many.
+- Results are ordered by file **modification time, newest first** — the file
+  you just touched is the likeliest target.
+- **Binary files, files above 8 MiB and denylisted paths are skipped
+  silently** (no error, and the search is not aborted). The denylist applies
+  here too: content from `.env` files or private keys never shows up in
+  results.
+- `case_insensitive` defaults to `false`; `exclude` works as in the other
+  tools.
 
 Argument rules shared by all three tools: `folder` must be an absolute path
 (`C:\…` or `\\server\share\…`). Quoted, forward-slash, doubled-backslash and

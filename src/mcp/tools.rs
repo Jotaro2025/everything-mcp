@@ -536,6 +536,122 @@ pub fn dispatch(name: &str, args: &Value) -> Result<ToolOutput, (i32, String)> {
             }
         }
 
+        "grep" => {
+            // 入参校验先行：这些都在触达 Everything 之前完成（CI 无主程序也能跑）。
+            let folder = require_folder(args)?;
+            let pattern = match args.get("pattern").and_then(Value::as_str) {
+                Some(p) if !p.trim().is_empty() => p.to_string(),
+                Some(_) => {
+                    return Err((
+                        INVALID_PARAMS,
+                        "'pattern' must not be empty: it is a regular expression matched per line".into(),
+                    ))
+                }
+                None => {
+                    return Err((
+                        INVALID_PARAMS,
+                        "'pattern' is required and must be a string: a regular expression matched per line".into(),
+                    ))
+                }
+            };
+            // 'filter' 是交给 Everything 的候选筛选串，不是正则 —— 与 pattern 分工不同。
+            let filter = optional_text_arg(args, "filter")?.unwrap_or_default();
+            let excludes = exclude_arg(args)?;
+            let candidate_filter = combine_query(&filter, &excludes);
+
+            // 正则能不能编译属于纯入参问题 —— 在触达 Everything 之前就报。
+            plugin::grep::validate_regex(&pattern).map_err(|e| (INVALID_PARAMS, e))?;
+
+            let mode = match args.get("output_mode") {
+                None | Some(Value::Null) => plugin::grep::OutputMode::Content,
+                Some(Value::String(s)) => plugin::grep::OutputMode::parse(s).ok_or_else(|| {
+                    (
+                        INVALID_PARAMS,
+                        format!(
+                            "'output_mode' must be one of content|filesWithMatches|count; received {:?}",
+                            s
+                        ),
+                    )
+                })?,
+                Some(v) => {
+                    return Err((
+                        INVALID_PARAMS,
+                        format!("'output_mode' must be a string; received {}", v),
+                    ))
+                }
+            };
+
+            let head_limit =
+                u64_arg(args, "head_limit", plugin::grep::DEFAULT_HEAD_LIMIT as u64)? as usize;
+            if head_limit == 0 || head_limit > plugin::grep::MAX_HEAD_LIMIT {
+                return Err((
+                    INVALID_PARAMS,
+                    format!(
+                        "'head_limit' must be between 1 and {}; received {}",
+                        plugin::grep::MAX_HEAD_LIMIT,
+                        head_limit
+                    ),
+                ));
+            }
+            let case_insensitive = bool_arg(args, "case_insensitive", false)?;
+            let timeout_ms =
+                u64_arg(args, "timeout_ms", plugin::grep::DEFAULT_TIMEOUT_MS as u64)? as u32;
+
+            match plugin::grep::grep(
+                &folder,
+                &pattern,
+                &candidate_filter,
+                mode,
+                head_limit,
+                case_insensitive,
+                timeout_ms,
+            ) {
+                Ok(o) => {
+                    let mut out = json!({
+                        "folder": folder,
+                        "pattern": pattern,
+                        "filter": candidate_filter,
+                        "output_mode": o.mode.as_str(),
+                        "head_limit": o.head_limit,
+                        "candidates": o.candidates,
+                        "candidates_truncated": o.candidates_truncated,
+                        "files_scanned": o.files_scanned,
+                        "bytes_scanned": o.bytes_scanned,
+                        "files_with_matches": o.files_with_matches,
+                        "clipped_lines": o.clipped_lines,
+                        "count": o.payload.len(),
+                        "truncated": o.truncated,
+                    });
+                    // 载荷键随模式变：matches / files / counts。
+                    match &o.payload {
+                        plugin::grep::GrepPayload::Content(hits) => {
+                            out["matches"] = json!(hits
+                                .iter()
+                                .map(|h| json!({
+                                    "path": h.path,
+                                    "line": h.line,
+                                    "text": h.text,
+                                }))
+                                .collect::<Vec<_>>());
+                        }
+                        plugin::grep::GrepPayload::Files(files) => {
+                            out["files"] = json!(files);
+                        }
+                        plugin::grep::GrepPayload::Counts(counts) => {
+                            out["counts"] = json!(counts
+                                .iter()
+                                .map(|(path, count)| json!({ "path": path, "count": count }))
+                                .collect::<Vec<_>>());
+                        }
+                    }
+                    let text = serde_json::to_string_pretty(&out)
+                        .unwrap_or_else(|_| "{\"error\":\"serialization failed\"}".into());
+                    Ok((content_text(&text), false))
+                }
+                Err(e) => Ok((content_text(&format!("grep error: {}", e)), true)),
+            }
+        }
+
         other => Err((METHOD_NOT_FOUND, format!("unknown tool: {}", other))),
     }
 }

@@ -51,7 +51,7 @@ fn initialize_result_announces_protocol_version_and_tools_capability() {
 }
 
 #[test]
-fn tools_list_contains_five_tools_with_required_params() {
+fn tools_list_contains_six_tools_with_required_params() {
     let list = protocol::make_tools_list();
     let tools = list["tools"].as_array().expect("tools must be an array");
     let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
@@ -62,7 +62,8 @@ fn tools_list_contains_five_tools_with_required_params() {
             "list_folder",
             "count",
             "index_changes",
-            "read_file"
+            "read_file",
+            "grep"
         ]
     );
 
@@ -114,6 +115,18 @@ fn tools_list_contains_five_tools_with_required_params() {
     let read_props = &tools[4]["inputSchema"]["properties"];
     assert_eq!(read_props["start_line"]["default"], 1);
     assert_eq!(read_props["max_lines"]["default"], 200);
+
+    // grep：pattern + folder 必填，其余带默认值。
+    assert_eq!(tools[5]["inputSchema"]["required"], json!(["pattern", "folder"]));
+    let grep_props = &tools[5]["inputSchema"]["properties"];
+    assert_eq!(grep_props["output_mode"]["default"], "content");
+    assert_eq!(
+        grep_props["output_mode"]["enum"],
+        json!(["content", "filesWithMatches", "count"])
+    );
+    assert_eq!(grep_props["head_limit"]["default"], 200);
+    assert_eq!(grep_props["case_insensitive"]["default"], false);
+    assert_eq!(grep_props["timeout_ms"]["default"], 10_000);
 }
 
 #[test]
@@ -362,6 +375,92 @@ fn read_file_rejects_binary_content() {
 }
 
 #[test]
+fn grep_description_documents_the_contract() {
+    let list = protocol::make_tools_list();
+    let tool = &list["tools"][5];
+    assert_eq!(tool["name"], "grep");
+    let desc = tool["description"].as_str().unwrap();
+
+    // 与 search_in_folder 的分工（文件粒度 vs 行粒度）必须写清楚。
+    assert!(desc.contains("search_in_folder"), "desc: {desc}");
+    assert!(desc.contains("line"), "desc should mention line numbers");
+    assert!(desc.contains("head_limit"), "desc: {desc}");
+    assert!(desc.contains("truncated"), "desc should document truncation");
+    assert!(desc.contains("newest first"), "desc should state the ordering");
+    // 二进制 / 超大 / 黑名单都要写明是「跳过」而不是报错。
+    assert!(desc.contains("skipped"), "desc: {desc}");
+    assert!(desc.contains("denylisted"), "desc should name the denylist");
+
+    // pattern 是正则、filter 是 Everything 语法 —— 这处最容易混，必须点破。
+    let props = &tool["inputSchema"]["properties"];
+    let filter_desc = props["filter"]["description"].as_str().unwrap();
+    assert!(
+        filter_desc.contains("not the regex"),
+        "filter 说明要点明它不是正则: {filter_desc}"
+    );
+    assert!(props["pattern"]["description"]
+        .as_str()
+        .unwrap()
+        .contains("regular expression"));
+}
+
+#[test]
+fn grep_arg_validation_before_touching_everything() {
+    // 全部在触达 Everything host 之前返回 —— 无主程序环境的 CI 也能跑。
+    let err = tools::dispatch("grep", &json!({"pattern": "x"})).unwrap_err();
+    assert_eq!(err.0, protocol::INVALID_PARAMS);
+    assert!(err.1.contains("folder"));
+
+    let err = tools::dispatch("grep", &json!({"folder": "C:\\"})).unwrap_err();
+    assert_eq!(err.0, protocol::INVALID_PARAMS);
+    assert!(err.1.contains("pattern"));
+
+    let err = tools::dispatch("grep", &json!({"folder": "C:\\", "pattern": "  "})).unwrap_err();
+    assert_eq!(err.0, protocol::INVALID_PARAMS);
+    assert!(err.1.contains("must not be empty"), "{}", err.1);
+
+    let err = tools::dispatch("grep", &json!({"folder": "C:\\", "pattern": 42})).unwrap_err();
+    assert_eq!(err.0, protocol::INVALID_PARAMS);
+
+    // 坏正则是纯入参问题，不该等到 Everything 才发现
+    let err = tools::dispatch("grep", &json!({"folder": "C:\\", "pattern": "a("})).unwrap_err();
+    assert_eq!(err.0, protocol::INVALID_PARAMS);
+    assert!(err.1.contains("invalid regex"), "{}", err.1);
+
+    let err = tools::dispatch(
+        "grep",
+        &json!({"folder": "C:\\", "pattern": "x", "output_mode": "summary"}),
+    )
+    .unwrap_err();
+    assert_eq!(err.0, protocol::INVALID_PARAMS);
+    assert!(err.1.contains("filesWithMatches"), "{}", err.1);
+
+    let err = tools::dispatch(
+        "grep",
+        &json!({"folder": "C:\\", "pattern": "x", "output_mode": 3}),
+    )
+    .unwrap_err();
+    assert_eq!(err.0, protocol::INVALID_PARAMS);
+
+    for bad in [0, 99_999] {
+        let err = tools::dispatch(
+            "grep",
+            &json!({"folder": "C:\\", "pattern": "x", "head_limit": bad}),
+        )
+        .unwrap_err();
+        assert_eq!(err.0, protocol::INVALID_PARAMS, "head_limit={bad}");
+        assert!(err.1.contains("head_limit"), "{}", err.1);
+    }
+
+    let err = tools::dispatch(
+        "grep",
+        &json!({"folder": "C:\\", "pattern": "x", "case_insensitive": "yes"}),
+    )
+    .unwrap_err();
+    assert_eq!(err.0, protocol::INVALID_PARAMS);
+}
+
+#[test]
 fn read_file_denies_private_keys_and_env_files() {
     // 敏感路径在读盘之前就被拒 —— 这些文件甚至不需要真实存在。
     for path in [
@@ -509,10 +608,10 @@ fn dispatch_ping_returns_empty_result() {
 }
 
 #[test]
-fn dispatch_tools_list_returns_five_tools() {
+fn dispatch_tools_list_returns_six_tools() {
     let resp = dispatch(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#);
     let list = resp["result"]["tools"].as_array().unwrap();
-    assert_eq!(list.len(), 5);
+    assert_eq!(list.len(), 6);
 }
 
 #[test]
@@ -784,7 +883,7 @@ fn modern_tools_list_result_carries_result_type() {
     );
     assert_eq!(status, 200);
     assert_eq!(resp["result"]["resultType"], "complete");
-    assert_eq!(resp["result"]["tools"].as_array().unwrap().len(), 5);
+    assert_eq!(resp["result"]["tools"].as_array().unwrap().len(), 6);
 }
 
 #[test]
@@ -793,7 +892,7 @@ fn legacy_tools_list_has_no_result_type() {
     // 客户端按桥接规则把缺失当作 complete。
     let resp = dispatch(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#);
     assert!(resp["result"].get("resultType").is_none());
-    assert_eq!(resp["result"]["tools"].as_array().unwrap().len(), 5);
+    assert_eq!(resp["result"]["tools"].as_array().unwrap().len(), 6);
 }
 
 #[test]
@@ -1216,7 +1315,7 @@ fn end_to_end_over_real_tcp() {
     assert_eq!(resp["result"]["resultType"], "complete");
     assert_eq!(resp["result"]["ttlMs"], json!(protocol::TOOLS_LIST_TTL_MS));
     assert_eq!(resp["result"]["cacheScope"], "public");
-    assert_eq!(resp["result"]["tools"].as_array().unwrap().len(), 5);
+    assert_eq!(resp["result"]["tools"].as_array().unwrap().len(), 6);
     // 清单里应当能看到新工具，且按现有顺序排在最后。
     let names: Vec<&str> = resp["result"]["tools"]
         .as_array()

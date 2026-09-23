@@ -231,11 +231,36 @@ fn decode_ansi(raw: &[u8], code_page: u32) -> Option<String> {
 }
 
 /// 一行按字符裁到 [`MAX_LINE_CHARS`]（走字符边界，不切多字节序列）。
-fn clip_line(line: &str) -> (String, bool) {
+///
+/// grep 也要用，所以是 `pub(crate)`。
+pub(crate) fn clip_line(line: &str) -> (String, bool) {
     match line.char_indices().nth(MAX_LINE_CHARS) {
         Some((idx, _)) => (line[..idx].to_string(), true),
         None => (line.to_string(), false),
     }
+}
+
+/// 供 grep 用：读文件并解码成文本，任何不可用的情况都返回 `None`（跳过该文件）。
+///
+/// 与 [`read_file`] 的关键区别是**不报错**：grep 扫的是一批文件，二进制、
+/// 超大、读不了、命中黑名单的都应该只是跳过 —— 一个坏文件不该让整次搜索失败。
+///
+/// 黑名单在这里同样生效，而且更要紧：grep 绝不能把 `.env` / 私钥的正文带出来。
+pub fn read_text_for_matching(path: &str) -> Option<String> {
+    if sensitive::is_sensitive_path(path) {
+        return None;
+    }
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_file() || meta.len() > MAX_FILE_BYTES {
+        return None;
+    }
+    let raw = std::fs::read(path).ok()?;
+    let (text, _) = decode_bytes(&raw);
+    // 二进制（含 NUL）不参与正文匹配。
+    if text.as_bytes().contains(&0) {
+        return None;
+    }
+    Some(text)
 }
 
 /// 按行窗口取出的正文。
