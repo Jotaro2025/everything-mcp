@@ -157,10 +157,96 @@ pub fn validate_path(path: &str) -> Result<String, String> {
     Ok(p.to_string())
 }
 
-/// 读文件正文，返回 (文本, 判定出的编码)。
-fn read_text(path: &str) -> Result<(String, &'static str), std::io::Error> {
-    let raw = std::fs::read(path)?;
-    Ok(decode_bytes(&raw))
+/// 扩展名硬表：即使内容嗅探看不出问题也拒绝。
+///
+/// 存在的理由：短压缩头、小 PDF 这类文件可能整份都是可打印 ASCII，嗅探会放过
+/// 它们 —— 实测一个 37 字节的 `%PDF-1.4` 文件被当成正文返回过。名单只收
+/// **本身就是二进制容器**的格式；`.json`/`.xml`/`.svg`/`.log`/`.csv`/`.ipynb`
+/// 这些是文本，一个都不收（`.dat` 也故意不收：它两种都有，交给嗅探判断）。
+const BINARY_EXTENSIONS: &[&str] = &[
+    // 文档 / 电子表格 / 演示
+    "doc", "docx", "xls", "xlsx", "ppt", "pptx", "odt", "ods", "odp", "pdf", "rtf", "epub",
+    // 压缩包 / 镜像
+    "zip", "7z", "rar", "gz", "tgz", "bz2", "xz", "zst", "tar", "cab", "iso", "jar", "war",
+    "apk", "nupkg", "whl", "egg", "pyz",
+    // 可执行 / 目标文件 / 库
+    "exe", "dll", "so", "dylib", "lib", "a", "o", "obj", "bin", "class", "pyc", "pyo", "wasm",
+    "msi", "sys", "ocx", "com", "scr", "pdb",
+    // 图片 / 音视频 / 字体
+    "png", "jpg", "jpeg", "gif", "bmp", "ico", "webp", "tif", "tiff", "heic", "psd", "mp3",
+    "mp4", "avi", "mkv", "mov", "wav", "flac", "ogg", "webm", "wmv", "ttf", "otf", "woff",
+    "woff2", "eot",
+    // 数据库
+    "db", "sqlite", "sqlite3", "mdb", "pak",
+];
+
+/// 内容嗅探的采样窗口。
+const SNIFF_BYTES: usize = 4096;
+
+/// 采样里非可打印字节的占比阈值（百分数）。
+const SNIFF_NON_PRINTABLE_PERCENT: usize = 30;
+
+/// 单个字节是否「不可打印」。
+///
+/// `>= 0x80` 一律算可打印 —— 那是 UTF-8 多字节序列和 GBK 双字节的组成部分，
+/// 按字节判会把所有中文正文误判成二进制。
+fn is_non_printable(byte: u8) -> bool {
+    !(byte == b'\t' || byte == b'\n' || byte == b'\r' || (0x20..0x7F).contains(&byte) || byte >= 0x80)
+}
+
+/// 内容嗅探：前 4 KiB 里有 NUL，或非可打印字节超过 30%。
+fn looks_binary(raw: &[u8]) -> bool {
+    let sample = &raw[..raw.len().min(SNIFF_BYTES)];
+    if sample.is_empty() {
+        return false;
+    }
+    if sample.contains(&0) {
+        return true;
+    }
+    let non_printable = sample.iter().filter(|b| is_non_printable(**b)).count();
+    non_printable * 100 > sample.len() * SNIFF_NON_PRINTABLE_PERCENT
+}
+
+/// 判定是否为二进制，返回原因（`"extension"` / `"content"`）。
+///
+/// 顺序有讲究：**扩展名先判**，然后是 BOM 豁免，最后才是内容嗅探。
+/// BOM 豁免是必须的 —— 带 BOM 的 UTF-16 正文原始字节里全是 NUL，不豁免就会被
+/// 嗅探判成二进制，而我们特意支持 UTF-16。
+fn binary_reason(raw: &[u8], path: &str) -> Option<&'static str> {
+    let ext = Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase());
+    if let Some(ext) = ext {
+        if BINARY_EXTENSIONS.contains(&ext.as_str()) {
+            return Some("extension");
+        }
+    }
+    if raw.starts_with(&[0xFF, 0xFE]) || raw.starts_with(&[0xFE, 0xFF]) {
+        return None;
+    }
+    looks_binary(raw).then_some("content")
+}
+
+/// 二进制的统一错误文案。
+fn binary_message(path: &str, reason: &str) -> String {
+    match reason {
+        "extension" => {
+            let ext = Path::new(path)
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            format!(
+                "{:?} is a binary file (.{}) and has no text to read; read_file only returns text",
+                path, ext
+            )
+        }
+        _ => format!(
+            "{:?} looks like binary content (a NUL byte or over {}% non-printable bytes in the first {} bytes); read_file only returns text",
+            path, SNIFF_NON_PRINTABLE_PERCENT, SNIFF_BYTES
+        ),
+    }
 }
 
 /// 把磁盘字节解码成文本，并回显判定出的编码。
@@ -255,7 +341,8 @@ pub(crate) fn clip_line(line: &str) -> (String, bool) {
 /// 与 [`read_file`] 的关键区别是**不报错**：grep 扫的是一批文件，二进制、
 /// 超大、读不了、命中黑名单的都应该只是跳过 —— 一个坏文件不该让整次搜索失败。
 ///
-/// 黑名单在这里同样生效，而且更要紧：grep 绝不能把 `.env` / 私钥的正文带出来。
+/// 二进制判定与 `read_file` 同一套（扩展名硬表 + 内容嗅探），黑名单也一样 ——
+/// 而且黑名单在这里更要紧：grep 绝不能把 `.env` / 私钥的正文带出来。
 pub fn read_text_for_matching(path: &str) -> Option<String> {
     if sensitive::is_sensitive_path(path) {
         return None;
@@ -265,11 +352,10 @@ pub fn read_text_for_matching(path: &str) -> Option<String> {
         return None;
     }
     let raw = std::fs::read(path).ok()?;
-    let (text, _) = decode_bytes(&raw);
-    // 二进制（含 NUL）不参与正文匹配。
-    if text.as_bytes().contains(&0) {
+    if binary_reason(&raw, path).is_some() {
         return None;
     }
+    let (text, _) = decode_bytes(&raw);
     Some(text)
 }
 
@@ -396,24 +482,22 @@ pub fn read_file(
         ));
     }
 
-    let (text, encoding) = read_text(&path).map_err(|e| {
+    let raw = std::fs::read(&path).map_err(|e| {
         ReadError::at(
             ERR_READ_FAILED,
             format!("cannot read {:?}: {}", path, e),
             &path,
         )
     })?;
-    // 二进制文件会带 NUL 字节 —— 报错而不是把乱码塞给调用方。
-    if text.as_bytes().contains(&0) {
+    // 二进制在解码之前就判掉（按原始字节嗅探，比解码后再找 NUL 更准）。
+    if let Some(reason) = binary_reason(&raw, &path) {
         return Err(ReadError::at(
             ERR_BINARY_CONTENT,
-            format!(
-                "{:?} looks like a binary file (contains NUL bytes); read_file only returns text",
-                path
-            ),
+            binary_message(&path, reason),
             &path,
         ));
     }
+    let (text, encoding) = decode_bytes(&raw);
 
     let window = build_window(&text, start_line, max_lines);
     Ok(FileContent {
@@ -586,6 +670,97 @@ mod tests {
         assert!(read_file(&p, 1, MAX_MAX_LINES).is_ok());
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn binary_reason_rejects_binary_extensions_even_when_ascii() {
+        // 关键用例：内容全是可打印 ASCII，嗅探看不出问题，只能靠扩展名拦。
+        let ascii_pdf = b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\n%%EOF\n";
+        assert!(!looks_binary(ascii_pdf), "这份 PDF 的字节确实不像二进制");
+        assert_eq!(binary_reason(ascii_pdf, r"D:\a\report.pdf"), Some("extension"));
+        // 大小写与多级后缀都要认
+        assert_eq!(binary_reason(b"x", r"D:\a\IMG.PNG"), Some("extension"));
+        assert_eq!(binary_reason(b"x", r"D:\a\book.docx"), Some("extension"));
+        assert_eq!(binary_reason(b"x", r"D:\a\pkg.tar.gz"), Some("extension"));
+        for name in ["a.zip", "a.exe", "a.dll", "a.xlsx", "a.mp4", "a.ttf", "a.sqlite"] {
+            assert_eq!(binary_reason(b"x", name), Some("extension"), "{name}");
+        }
+    }
+
+    #[test]
+    fn binary_reason_keeps_text_formats_readable() {
+        // 这些是文本，一个都不该被扩展名表拦住
+        for name in [
+            "a.json", "a.xml", "a.svg", "a.log", "a.csv", "a.tsv", "a.ipynb", "a.dat", "a.yml",
+            "a.toml", "a.rs", "a.py", "a.md", "a.sql", "a.ini", "a.env.example",
+        ] {
+            assert_eq!(binary_reason(b"hello\nworld\n", name), None, "{name} 应可读");
+        }
+    }
+
+    #[test]
+    fn binary_reason_sniffs_nul_and_control_heavy_content() {
+        // NUL → 二进制
+        assert_eq!(binary_reason(b"ab\0cd", "a.txt"), Some("content"));
+        // 无 NUL 但控制字符占 40% → 二进制（PI 那条 30% 阈值的用例）
+        let mut ctrl = Vec::new();
+        for _ in 0..200 {
+            ctrl.extend_from_slice(&[0x01, 0x02, b'a', b'b', b'c']);
+        }
+        assert!(!ctrl.contains(&0), "这份样本没有 NUL");
+        assert_eq!(binary_reason(&ctrl, "a.txt"), Some("content"));
+        // 少量控制字符（正常正文里的制表/换行）不算
+        assert_eq!(binary_reason(b"col1\tcol2\r\nv1\tv2\r\n", "a.tsv"), None);
+    }
+
+    #[test]
+    fn binary_reason_keeps_multibyte_text_readable() {
+        // 中文 UTF-8：每个汉字 3 个 >= 0x80 的字节，按字节判必须算可打印
+        assert_eq!(binary_reason("中文正文，含全角标点。".as_bytes(), "a.txt"), None);
+        // GBK 双字节
+        assert_eq!(binary_reason(&[0xD6, 0xD0, 0xCE, 0xC4], "a.txt"), None);
+        // 大段中文 + 少量 ASCII 混排
+        let mixed = format!("{}fn main() {{}}\n", "中文注释".repeat(200));
+        assert_eq!(binary_reason(mixed.as_bytes(), "a.rs"), None);
+    }
+
+    #[test]
+    fn binary_reason_exempts_utf16_with_bom() {
+        // UTF-16 正文原始字节里全是 NUL —— 不豁免就会被自己的嗅探判成二进制
+        let utf16 = [0xFF, 0xFE, b'h', 0x00, b'i', 0x00, b'!', 0x00];
+        assert!(looks_binary(&utf16), "原始字节确实有 NUL");
+        assert_eq!(binary_reason(&utf16, "a.txt"), None, "带 BOM 要放行");
+        assert_eq!(binary_reason(&[0xFE, 0xFF, 0x00, b'h'], "a.txt"), None);
+    }
+
+    #[test]
+    fn binary_message_names_the_reason() {
+        let by_ext = binary_message(r"D:\a\report.pdf", "extension");
+        assert!(by_ext.contains(".pdf"), "{by_ext}");
+        assert!(by_ext.contains("binary"), "{by_ext}");
+        let by_content = binary_message(r"D:\a\x.txt", "content");
+        assert!(by_content.contains("binary content"), "{by_content}");
+        assert!(by_content.contains("30%"), "{by_content}");
+    }
+
+    #[test]
+    fn read_file_rejects_ascii_only_pdf_by_extension() {
+        // 端到端：这份文件在改动前会被当正文返回（实测过）
+        let path = std::env::temp_dir().join("everything_mcp_ascii_probe.pdf");
+        std::fs::write(&path, b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\n%%EOF\n").unwrap();
+        let err = read_file(&path.to_string_lossy(), 1, 10).unwrap_err();
+        assert_eq!(err.code, ERR_BINARY_CONTENT);
+        assert!(err.message.contains(".pdf"), "{}", err.message);
+        // 同一份内容换个文本后缀就能读 —— 证明拦的是扩展名不是内容
+        let txt = std::env::temp_dir().join("everything_mcp_ascii_probe.txt");
+        std::fs::write(&txt, b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\n%%EOF\n").unwrap();
+        assert!(read_file(&txt.to_string_lossy(), 1, 10).is_ok());
+        // grep 那条路同样跳过二进制
+        assert!(read_text_for_matching(&path.to_string_lossy()).is_none());
+        assert!(read_text_for_matching(&txt.to_string_lossy()).is_some());
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&txt);
     }
 
     #[test]

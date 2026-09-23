@@ -491,8 +491,19 @@ one — a search itself returns only paths and metadata, never content.
   older documents and logs use); `utf-8-lossy` means some bytes were
   undecodable and became `\uFFFD`. Treat an `ansi` or `utf-8-lossy` body as a
   guess before quoting it.
-- **Binary files are rejected** (content containing NUL bytes) with an
-  error instead of a page of garbage.
+- **Binary files are rejected** by two independent checks: **extension**
+  (documents, archives, executables, media, fonts and databases —
+  `.pdf`/`.docx`/`.xlsx`/`.zip`/`.exe`/`.dll`/`.png`/`.mp4`/`.ttf`/`.sqlite`
+  and friends) and **content sniff** (a NUL byte, or over 30% non-printable
+  bytes in the first 4 KiB). Text formats (`.json`/`.xml`/`.svg`/`.log`/
+  `.csv`/`.md`/`.dat`) are never in the extension table, so they are not
+  blocked by accident, and a UTF-16 file with a BOM is exempt from the
+  sniff because its raw bytes are full of NULs. Both checks were added after
+  a measurement: with only the old "contains NUL" rule, a 37-byte all-ASCII
+  PDF was returned as file content.
+- `truncated` means **content remains beyond this window** (its companion is
+  `next_start_line`); it is not a signal that something was cut mid-line —
+  that is `clipped_lines`. The two are independent.
 - To find files *by their contents* use `search_in_folder` with
   `content:"…"` (see
   [Content search and making it fast](#content-search-and-making-it-fast));
