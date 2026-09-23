@@ -29,14 +29,24 @@ use super::sensitive;
 pub const MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
 
 /// 单次返回的字节上限。窗口按行累加，碰到它就停下 —— 不会从行中间切开。
-pub const MAX_WINDOW_BYTES: usize = 512 * 1024;
+///
+/// 取值与 PI-Desktop 的 `BUDGET_SEARCH.max_bytes` 一致（128 KiB）：它是这个
+/// 工具真正的闸门，行数只是粗筛。grep 的输出预算也用它。
+pub const MAX_WINDOW_BYTES: usize = 128 * 1024;
 
 /// 单行字符上限。超长行（压缩过的 js、单行 JSON、base64 内联）会被裁到这里，
 /// 裁了几行由 `clipped_lines` 上报。取 16384 与主流 agent 客户端一致。
+///
+/// 注意它换算成字节最坏是 64 KiB（4 字节字符），仍小于 [`MAX_WINDOW_BYTES`]，
+/// 所以「裁过的一行一定放得进窗口」这个不变量成立 —— 否则会卡在 0 行死循环。
 pub const MAX_LINE_CHARS: usize = 16_384;
 
-/// 默认返回的最大行数。
-pub const DEFAULT_MAX_LINES: usize = 200;
+/// 默认返回的最大行数。与 PI-Desktop 的 `DEFAULT_READ_LINES` 一致。
+pub const DEFAULT_MAX_LINES: usize = 2000;
+
+/// `max_lines` 的上限。与 PI-Desktop 的 `BUDGET_SEARCH.max_lines` 一致。
+/// 真正的闸门是 [`MAX_WINDOW_BYTES`]，这个上限只是防止调用方写个天文数字。
+pub const MAX_MAX_LINES: usize = 4000;
 
 // ====================================================================
 // 错误码 —— 调用方据此决定下一步（换工具 / 换路径 / 缩窗口），
@@ -275,12 +285,15 @@ struct Window {
     clipped_lines: usize,
 }
 
-/// 从 `start_line`（1 起）开始取最多 `max_lines` 行（0 = 不限），
-/// 同时受 [`MAX_WINDOW_BYTES`] 与 [`MAX_LINE_CHARS`] 约束。
+/// 从 `start_line`（1 起）开始取最多 `max_lines` 行，同时受
+/// [`MAX_WINDOW_BYTES`] 与 [`MAX_LINE_CHARS`] 约束。
 ///
 /// 逐行累加字节数而不是先拼好再截断：这样字节预算只会拦下**整行**，
 /// 不会从一行中间切开（旧实现用 `String::truncate` 会切在半行上，
 /// 调用方拿到残行却没有任何标记）。
+///
+/// `max_lines` 必须 ≥ 1 —— 调用方（[`read_file`] / MCP 层）负责校验，
+/// 这里不做「0 = 不限」这种第二含义。
 fn build_window(text: &str, start_line: usize, max_lines: usize) -> Window {
     let lines: Vec<&str> = text.lines().collect();
     let total = lines.len();
@@ -292,7 +305,7 @@ fn build_window(text: &str, start_line: usize, max_lines: usize) -> Window {
     let mut clipped = 0usize;
     let mut idx = start;
     while idx < total {
-        if max_lines != 0 && count >= max_lines {
+        if count >= max_lines {
             break;
         }
         let (piece, was_clipped) = clip_line(lines[idx]);
@@ -323,14 +336,23 @@ fn build_window(text: &str, start_line: usize, max_lines: usize) -> Window {
 
 /// 读取文件内容（`read_file` 工具的入口）。
 ///
-/// `start_line` 是 1 起的起始行号；`max_lines` 为 0 表示不限行数
-/// （仍受 [`MAX_WINDOW_BYTES`] 约束）。
+/// `start_line` 是 1 起的起始行号；`max_lines` 必须在
+/// `1..=`[`MAX_MAX_LINES`] 之间（仍受 [`MAX_WINDOW_BYTES`] 约束）。
 pub fn read_file(
     path: &str,
     start_line: usize,
     max_lines: usize,
 ) -> Result<FileContent, ReadError> {
     let path = validate_path(path).map_err(|m| ReadError::new(ERR_INVALID_ARGUMENT, m))?;
+    if max_lines == 0 || max_lines > MAX_MAX_LINES {
+        return Err(ReadError::new(
+            ERR_INVALID_ARGUMENT,
+            format!(
+                "'max_lines' must be between 1 and {}; received {}",
+                MAX_MAX_LINES, max_lines
+            ),
+        ));
+    }
 
     // 黑名单先于 stat：拒绝一个路径不该先去碰它，也不该靠「文件不存在」
     // 与否泄漏它是否存在。
@@ -429,7 +451,7 @@ mod tests {
     fn build_window_slices_by_one_based_line_number() {
         let text = "a\nb\nc\nd\ne";
         // 全部
-        let w = build_window(text, 1, 0);
+        let w = build_window(text, 1, 100);
         assert_eq!(w.text, "a\nb\nc\nd\ne");
         assert_eq!((w.total_lines, w.lines_returned, w.truncated), (5, 5, false));
         // 中间一段
@@ -447,7 +469,7 @@ mod tests {
 
     #[test]
     fn build_window_tolerates_crlf_and_missing_trailing_newline() {
-        let w = build_window("a\r\nb\r\n", 1, 0);
+        let w = build_window("a\r\nb\r\n", 1, 100);
         assert_eq!((w.text.as_str(), w.total_lines, w.lines_returned), ("a\nb", 2, 2));
     }
 
@@ -455,7 +477,7 @@ mod tests {
     fn build_window_clips_long_lines_and_counts_them() {
         let long = "x".repeat(MAX_LINE_CHARS + 500);
         let text = format!("short\n{long}\nshort2");
-        let w = build_window(&text, 1, 0);
+        let w = build_window(&text, 1, MAX_MAX_LINES);
         assert_eq!(w.clipped_lines, 1);
         assert_eq!(w.lines_returned, 3, "裁短的行仍然算一行");
         let mid = w.text.lines().nth(1).unwrap();
@@ -466,7 +488,7 @@ mod tests {
     fn build_window_clip_is_char_boundary_safe() {
         // 每个字符 3 字节：裁剪点必然落在字符中间，必须回退到边界而不是 panic
         let long = "中".repeat(MAX_LINE_CHARS + 10);
-        let w = build_window(&long, 1, 0);
+        let w = build_window(&long, 1, 100);
         assert_eq!(w.clipped_lines, 1);
         assert_eq!(w.text.chars().count(), MAX_LINE_CHARS);
         assert!(w.text.chars().all(|c| c == '中'));
@@ -474,10 +496,10 @@ mod tests {
 
     #[test]
     fn build_window_stops_on_byte_budget_without_cutting_a_line() {
-        // 每行 100 字节，预算 512 KiB → 只能放进 5242 行左右，且必须是整行
+        // 每行 100 字节，预算 128 KiB → 只能放进约 1300 行，且必须是整行
         let line = "y".repeat(99);
         let text = vec![line.clone(); 6000].join("\n");
-        let w = build_window(&text, 1, 0);
+        let w = build_window(&text, 1, MAX_MAX_LINES);
         assert!(w.truncated, "预算拦下时 truncated 应为真");
         assert!(w.text.len() <= MAX_WINDOW_BYTES);
         assert_eq!(w.lines_returned, w.text.lines().count());
@@ -544,6 +566,26 @@ mod tests {
         assert!(!gbk.contains('\u{FFFD}'), "{gbk}");
         // 对照：这正是主程序读取器会给的结果（UTF-8 lossy）
         assert!(String::from_utf8_lossy(&[0xD6, 0xD0, 0xCE, 0xC4]).contains('\u{FFFD}'));
+    }
+
+    #[test]
+    fn read_file_rejects_out_of_range_max_lines() {
+        // 0 不再有「不限」的第二含义，超上限也直接拒 —— 与 PI-Desktop 的
+        // schema（minimum 1 / max 4000）对齐。
+        let path = std::env::temp_dir().join("everything_mcp_maxlines_probe.txt");
+        std::fs::write(&path, "a\nb\n").unwrap();
+        let p = path.to_string_lossy().to_string();
+
+        for bad in [0usize, MAX_MAX_LINES + 1] {
+            let err = read_file(&p, 1, bad).unwrap_err();
+            assert_eq!(err.code, ERR_INVALID_ARGUMENT, "max_lines={bad}");
+            assert!(err.message.contains("max_lines"), "{}", err.message);
+        }
+        // 边界值可用
+        assert!(read_file(&p, 1, 1).is_ok());
+        assert!(read_file(&p, 1, MAX_MAX_LINES).is_ok());
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

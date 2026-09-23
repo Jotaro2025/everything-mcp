@@ -110,11 +110,13 @@ fn tools_list_contains_six_tools_with_required_params() {
         50
     );
 
-    // read_file：只要求 path；start_line / max_lines 带默认值。
+    // read_file：只要求 path；start_line / max_lines 带默认值（数值与 PI-Desktop 对齐）。
     assert_eq!(tools[4]["inputSchema"]["required"], json!(["path"]));
     let read_props = &tools[4]["inputSchema"]["properties"];
     assert_eq!(read_props["start_line"]["default"], 1);
-    assert_eq!(read_props["max_lines"]["default"], 200);
+    assert_eq!(read_props["max_lines"]["default"], 2000);
+    assert_eq!(read_props["max_lines"]["minimum"], 1);
+    assert_eq!(read_props["max_lines"]["maximum"], 4000);
 
     // grep：pattern + folder 必填，其余带默认值。
     assert_eq!(tools[5]["inputSchema"]["required"], json!(["pattern", "folder"]));
@@ -254,6 +256,28 @@ fn read_file_arg_validation_before_touching_the_disk() {
     .unwrap_err();
     assert_eq!(err.0, protocol::INVALID_PARAMS);
     assert!(err.1.contains("max_lines"), "{}", err.1);
+
+    // max_lines 是 1..=4000 的闭区间：0 与超上限都属于写错
+    // （0 不再有「不限」的第二含义 —— 与 PI-Desktop 的 schema 对齐）。
+    for bad in [0, 4001, 999_999] {
+        let err = tools::dispatch(
+            "read_file",
+            &json!({"path": "D:\\a\\b.rs", "max_lines": bad}),
+        )
+        .unwrap_err();
+        assert_eq!(err.0, protocol::INVALID_PARAMS, "max_lines={bad}");
+        assert!(err.1.contains("max_lines"), "{}", err.1);
+    }
+    // 边界值放行（文件不存在会在后面报 NOT_FOUND，而不是参数错误）
+    for ok in [1, 4000] {
+        let out = tools::dispatch(
+            "read_file",
+            &json!({"path": "D:\\a\\b.rs", "max_lines": ok}),
+        )
+        .unwrap();
+        assert!(out.1, "文件不存在应当是工具错误");
+        assert_eq!(out_error(&out)["code"], "NOT_FOUND", "max_lines={ok}");
+    }
 }
 
 /// 取工具结果的文本（单条 content）。
@@ -295,10 +319,10 @@ fn read_file_reads_a_real_file_and_windows_lines() {
     // 正文单独成项、保持原样（不是 JSON 转义过的一行）。
     assert_eq!(items[1]["text"], "bravo\ncharlie");
 
-    // max_lines=0 = 余下全部，此时不再截断、也没有下一页
+    // 够大的 max_lines = 余下全部，此时不再截断、也没有下一页
     let out = tools::dispatch(
         "read_file",
-        &json!({"path": path.to_string_lossy(), "start_line": 1, "max_lines": 0}),
+        &json!({"path": path.to_string_lossy(), "start_line": 1, "max_lines": 4000}),
     )
     .unwrap();
     let meta: Value =
@@ -319,7 +343,7 @@ fn read_file_clips_overlong_lines_and_reports_the_count() {
 
     let out = tools::dispatch(
         "read_file",
-        &json!({"path": path.to_string_lossy(), "max_lines": 0}),
+        &json!({"path": path.to_string_lossy(), "max_lines": 4000}),
     )
     .unwrap();
     assert!(!out.1, "{}", out_text(&out));

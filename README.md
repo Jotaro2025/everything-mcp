@@ -382,7 +382,7 @@ gitignore），常见做法：
 的搭档：先搜出文件，再读它的内容 —— 检索本身只返回路径与元数据，不返回正文。
 
 ```json
-{ "path": "D:\\source\\repos\\my-project\\README.md", "start_line": 1, "max_lines": 200 }
+{ "path": "D:\\source\\repos\\my-project\\README.md", "start_line": 1, "max_lines": 2000 }
 ```
 
 - `path` 必须是**绝对路径**且指向**单个已存在的文件**。通配符（`*` / `?`）
@@ -404,13 +404,14 @@ gitignore），常见做法：
   「提示注入 → 读走 `~/.ssh/id_rsa`」的机制。名单只作用于读正文，
   搜索结果不隐藏这些文件：文件名不是秘密，正文才是。
 - **单文件上限 8 MiB**，超过直接报错（`TOO_LARGE`）—— 不会把大文件读进内存。
-  返回内容另有 512 KiB 字节预算兜底，**按整行累加**：预算拦下时只会少返回
+  返回内容另有 **128 KiB 字节预算**兜底，**按整行累加**：预算拦下时只会少返回
   整行，不会从一行中间切开。
 - **超长行会被裁短**：超过 16384 字符的行裁到上限，裁了几行由 `clipped_lines`
   上报（压缩过的单行 js / 单行 JSON 因此不会一口吃掉整个窗口）。裁过的行仍
   算一行，`lines_returned` 照常计数。
 - **分页**：`start_line` 是 1 起的起始行号（默认 1），`max_lines` 是返回行数
-  （默认 200，`0` 表示余下全部）。响应直接给 `next_start_line` ——
+  （默认 **2000**、上限 **4000**）。行数是粗筛，**真正的闸门是那 128 KiB 预算** ——
+  两者谁先到就停在谁那里，且永远停在整行边界上。响应直接给 `next_start_line`，
   把上次的 `next_start_line` 原样传回 `start_line` 就是下一页，它是 `null`
   表示读完了，不用自己算。`start_line` 超出末尾返回空窗口而不是报错。
 - **响应是两段 content**：第一段是元信息 JSON（`path` / `size` /
@@ -453,9 +454,11 @@ gitignore），常见做法：
   `search_in_folder` 的 `pattern` 完全一样（`ext:rs;toml`、`dm:lastweek`、
   `!\target\`），**在任何文件被读取之前生效**。
 - **一定要给 `filter`。** 不给的话 `folder` 下每个文件都会被读一遍 —— 这跟
-  不限范围的 `content:` 检索是同一个坑。两道内部闸门兜底：候选文件上限
-  2000 个、读取总量上限 64 MiB；触顶时 `truncated` 为 `true`，而 `candidates`
-  / `files_scanned` / `bytes_scanned` 会告诉你卡在哪一道上。
+  不限范围的 `content:` 检索是同一个坑。三道内部闸门兜底：候选文件上限
+  2000 个、读取总量上限 64 MiB、**返回的命中正文累计 128 KiB**（与 `read_file`
+  同一个常量）；触顶时 `truncated` 为 `true`，而 `candidates` / `files_scanned` /
+  `bytes_scanned` 会告诉你卡在哪一道上。注意这 128 KiB 算的是**正文**，JSON
+  信封（路径、行号、转义）还会再叠一层，所以实际响应会略大于它。
 - **`output_mode`** 决定返回形状：
   - `content`（默认）：`matches` 数组，每项 `{ path, line, text }`；
   - `filesWithMatches`：`files` 数组，只给有命中的文件路径；

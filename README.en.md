@@ -435,7 +435,7 @@ It is the companion to `search_in_folder`: search to locate files, then read
 one — a search itself returns only paths and metadata, never content.
 
 ```json
-{ "path": "D:\\source\\repos\\my-project\\README.md", "start_line": 1, "max_lines": 200 }
+{ "path": "D:\\source\\repos\\my-project\\README.md", "start_line": 1, "max_lines": 2000 }
 ```
 
 - `path` must be an **absolute path** to a **single existing file**.
@@ -462,19 +462,21 @@ one — a search itself returns only paths and metadata, never content.
   reads only — search results do not hide these files, because the file name
   is not the secret; the content is.
 - **8 MiB per file**, refused above that (`TOO_LARGE`) — a large file is
-  never read into memory. The response is additionally capped at a 512 KiB
-  byte budget, accumulated **whole lines at a time**, so the budget never
+  never read into memory. The response is additionally capped at a **128 KiB
+  byte budget**, accumulated **whole lines at a time**, so the budget never
   cuts a line in half.
 - **Overlong lines are cut**: a line longer than 16384 characters is
   truncated, and `clipped_lines` reports how many were (so a minified
   single-line file cannot swallow the window). A clipped line still counts
   as one line in `lines_returned`.
 - **Paging**: `start_line` is the 1-based first line to return (default 1)
-  and `max_lines` the number of lines (default 200; `0` means all
-  remaining). The response hands you `next_start_line` — pass it straight
-  back as `start_line` for the next page, and stop when it is `null`. No
-  arithmetic needed. A `start_line` past the end returns an empty window
-  rather than an error.
+  and `max_lines` the number of lines (default **2000**, max **4000**). The
+  line count is the coarse filter — **the 128 KiB budget is the real
+  limiter**; whichever comes first wins, and it always stops on a whole line.
+  The response hands you `next_start_line` — pass it straight back as
+  `start_line` for the next page, and stop when it is `null`. No arithmetic
+  needed. A `start_line` past the end returns an empty window rather than an
+  error.
 - **The response has two content items**: a metadata JSON object (`path` /
   `size` / `total_lines` / `start_line` / `lines_returned` /
   `next_start_line` / `truncated` / `clipped_lines` / `encoding`) followed by
@@ -523,10 +525,13 @@ that one uses Everything's index to answer *which files* contain something
   exactly the same syntax as `search_in_folder`'s `pattern` (`ext:rs;toml`,
   `dm:lastweek`, `!\target\`), and it applies **before any file is read**.
 - **Always pass `filter`.** Without it, every file under `folder` gets read —
-  the same trap as an unscoped `content:` search. Two internal caps bound the
-  damage: at most 2000 candidate files and 64 MiB read. When either bites,
-  `truncated` is `true`, and `candidates` / `files_scanned` / `bytes_scanned`
-  tell you which one it was.
+  the same trap as an unscoped `content:` search. Three internal caps bound
+  the damage: at most 2000 candidate files, 64 MiB read, and a **128 KiB
+  budget on the matched text returned** (the same constant `read_file` uses).
+  When one bites, `truncated` is `true`, and `candidates` / `files_scanned` /
+  `bytes_scanned` tell you which. Note that the 128 KiB counts the matched
+  text only; the JSON envelope (paths, line numbers, escaping) sits on top, so
+  the actual response is somewhat larger.
 - **`output_mode`** picks the shape:
   - `content` (default): a `matches` array of `{ path, line, text }`;
   - `filesWithMatches`: a `files` array of paths only;

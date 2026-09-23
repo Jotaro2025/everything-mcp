@@ -112,7 +112,9 @@ pub struct GrepOutcome {
 
 /// 在已解码的文本里逐行匹配。纯函数，便于单测。
 ///
-/// content 模式下把命中追加进 `out`；返回 (本文件命中数, 裁短行数, 是否触顶)。
+/// content 模式下把命中追加进 `out`，并从 `budget`（剩余字节）里扣账 ——
+/// 预算在**逐条命中**上扣，所以单个文件也炸不了窗口。返回
+/// (本文件命中数, 裁短行数, 是否停下)。
 fn scan_text(
     re: &Regex,
     path: &str,
@@ -120,6 +122,7 @@ fn scan_text(
     mode: OutputMode,
     head_limit: usize,
     out: &mut Vec<Hit>,
+    budget: &mut usize,
 ) -> (usize, usize, bool) {
     let mut file_hits = 0usize;
     let mut clipped = 0usize;
@@ -135,6 +138,12 @@ fn scan_text(
         if was_clipped {
             clipped += 1;
         }
+        // 粗算这条命中占的字节：正文 + 路径 + 行号字段的余量。
+        let cost = piece.len() + path.len() + 8;
+        if cost > *budget {
+            return (file_hits, clipped, true);
+        }
+        *budget -= cost;
         out.push(Hit {
             path: path.to_string(),
             line: idx + 1,
@@ -206,6 +215,9 @@ pub fn grep(
     let mut bytes_scanned = 0u64;
     let mut clipped_lines = 0usize;
     let mut truncated = false;
+    // 输出预算：与 read_file 同一个常量（128 KiB）。head_limit 是粗筛，
+    // 它才是真正防「一次 grep 把上下文炸掉」的闸门。
+    let mut budget = read::MAX_WINDOW_BYTES;
 
     'files: for r in &outcome.results {
         if r.is_folder {
@@ -220,7 +232,7 @@ pub fn grep(
             truncated = true;
             break;
         }
-        if bytes_scanned >= MAX_TOTAL_BYTES {
+        if bytes_scanned >= MAX_TOTAL_BYTES || budget == 0 {
             truncated = true;
             break;
         }
@@ -231,13 +243,21 @@ pub fn grep(
         files_scanned += 1;
         bytes_scanned += text.len() as u64;
 
-        let (file_hits, clipped, hit_limit) =
-            scan_text(&re, &r.path, &text, mode, head_limit, &mut hits);
+        let (file_hits, clipped, stopped) =
+            scan_text(&re, &r.path, &text, mode, head_limit, &mut hits, &mut budget);
         clipped_lines += clipped;
         if file_hits > 0 {
+            // 非 content 模式的载荷是路径，也要计账。
+            if mode != OutputMode::Content {
+                if r.path.len() + 8 > budget {
+                    truncated = true;
+                    break;
+                }
+                budget -= r.path.len() + 8;
+            }
             per_file.push((r.path.clone(), file_hits));
         }
-        if hit_limit {
+        if stopped {
             truncated = true;
             break 'files;
         }
@@ -282,6 +302,11 @@ mod tests {
         RegexBuilder::new(p).case_insensitive(true).build().unwrap()
     }
 
+    /// 一次够用的输出预算。
+    fn budget() -> usize {
+        read::MAX_WINDOW_BYTES
+    }
+
     #[test]
     fn output_mode_parses_synonyms_and_rejects_junk() {
         assert_eq!(OutputMode::parse(""), Some(OutputMode::Content));
@@ -304,15 +329,17 @@ mod tests {
     fn scan_text_reports_line_numbers_and_all_hits() {
         let text = "alpha\nbeta TARGET\ngamma\ntarget again";
         let mut out = Vec::new();
-        let (hits, clipped, limit) = scan_text(
+        let mut b = budget();
+        let (hits, clipped, stopped) = scan_text(
             &re_i("target"),
             "D:\\a.txt",
             text,
             OutputMode::Content,
             10,
             &mut out,
+            &mut b,
         );
-        assert_eq!((hits, clipped, limit), (2, 0, false));
+        assert_eq!((hits, clipped, stopped), (2, 0, false));
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].line, 2, "行号是 1 起的");
         assert_eq!(out[0].text, "beta TARGET");
@@ -321,6 +348,7 @@ mod tests {
 
         // 默认区分大小写：同一条文本用大小写敏感版只命中一行
         let mut sensitive = Vec::new();
+        let mut b2 = budget();
         let (hits_s, _, _) = scan_text(
             &re("target"),
             "D:\\a.txt",
@@ -328,6 +356,7 @@ mod tests {
             OutputMode::Content,
             10,
             &mut sensitive,
+            &mut b2,
         );
         assert_eq!(hits_s, 1);
         assert_eq!(sensitive[0].line, 4);
@@ -337,8 +366,17 @@ mod tests {
     fn scan_text_stops_at_head_limit() {
         let text = (1..=10).map(|i| format!("hit {i}")).collect::<Vec<_>>().join("\n");
         let mut out = Vec::new();
-        let (hits, _, limit) = scan_text(&re("hit"), "p", &text, OutputMode::Content, 3, &mut out);
-        assert!(limit, "触顶要报出来");
+        let mut b = budget();
+        let (hits, _, stopped) = scan_text(
+            &re("hit"),
+            "p",
+            &text,
+            OutputMode::Content,
+            3,
+            &mut out,
+            &mut b,
+        );
+        assert!(stopped, "触顶要报出来");
         assert_eq!(out.len(), 3);
         // 触顶时本文件的命中数是「数到触顶为止」，不是全文件的真实命中数 ——
         // 这是有意的：真实总数已经超出调用方要的量了。
@@ -346,20 +384,61 @@ mod tests {
     }
 
     #[test]
+    fn scan_text_stops_when_the_output_budget_runs_out() {
+        // 每行都命中且都不短：预算耗尽时必须停下，而不是把 head_limit 条全塞进来。
+        let text = (1..=50)
+            .map(|i| format!("hit {i} {}", "z".repeat(200)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut out = Vec::new();
+        let mut b = 1000; // 故意只给 1 KB
+        let (_, _, stopped) = scan_text(
+            &re("hit"),
+            "p",
+            &text,
+            OutputMode::Content,
+            50,
+            &mut out,
+            &mut b,
+        );
+        assert!(stopped, "预算耗尽要报出来");
+        assert!(out.len() < 50, "不该把 50 条全塞进来（实际 {}）", out.len());
+        assert!(out.len() >= 2, "1 KB 至少放得下两条");
+    }
+
+    #[test]
     fn scan_text_counts_all_hits_in_non_content_modes() {
         let text = "hit\nnope\nhit\nhit";
         let mut out = Vec::new();
-        let (hits, _, limit) = scan_text(&re("hit"), "p", &text, OutputMode::Count, 2, &mut out);
+        let mut b = budget();
+        let (hits, _, stopped) = scan_text(
+            &re("hit"),
+            "p",
+            &text,
+            OutputMode::Count,
+            2,
+            &mut out,
+            &mut b,
+        );
         // count 模式不产出 Hit，也不受 head_limit 影响（上限按文件数算）
         assert!(out.is_empty());
-        assert_eq!((hits, limit), (3, false));
+        assert_eq!((hits, stopped), (3, false));
     }
 
     #[test]
     fn scan_text_clips_long_matched_lines() {
         let long = format!("prefix {}", "x".repeat(read::MAX_LINE_CHARS + 100));
         let mut out = Vec::new();
-        let (_, clipped, _) = scan_text(&re("prefix"), "p", &long, OutputMode::Content, 10, &mut out);
+        let mut b = budget();
+        let (_, clipped, _) = scan_text(
+            &re("prefix"),
+            "p",
+            &long,
+            OutputMode::Content,
+            10,
+            &mut out,
+            &mut b,
+        );
         assert_eq!(clipped, 1);
         assert_eq!(out[0].text.chars().count(), read::MAX_LINE_CHARS);
     }
@@ -368,7 +447,16 @@ mod tests {
     fn scan_text_matches_per_line_so_caret_anchors_the_line() {
         let text = "start here\nhere start";
         let mut out = Vec::new();
-        scan_text(&re("^start"), "p", text, OutputMode::Content, 10, &mut out);
+        let mut b = budget();
+        scan_text(
+            &re("^start"),
+            "p",
+            text,
+            OutputMode::Content,
+            10,
+            &mut out,
+            &mut b,
+        );
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].line, 1, "每行独立匹配，^ 锚的是行首");
     }
@@ -380,5 +468,13 @@ mod tests {
         assert!(e.contains("must not be empty"), "{e}");
         let e = grep("C:\\", "a(", "", OutputMode::Content, 10, false, 1000).unwrap_err();
         assert!(e.contains("invalid regex"), "{e}");
+    }
+
+    #[test]
+    fn output_budget_is_shared_with_read_file() {
+        // 两个工具用同一个常量：改一处两边一起变，避免只调了一个。
+        assert_eq!(read::MAX_WINDOW_BYTES, 128 * 1024);
+        assert_eq!(read::MAX_LINE_CHARS * 4, 64 * 1024, "裁过的行必须放得进预算");
+        assert!(read::MAX_LINE_CHARS * 4 < read::MAX_WINDOW_BYTES);
     }
 }

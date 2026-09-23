@@ -497,6 +497,17 @@ pub fn dispatch(name: &str, args: &Value) -> Result<ToolOutput, (i32, String)> {
                     "'start_line' is 1-based; use 1 for the first line".into(),
                 ));
             }
+            // 与 PI-Desktop 的 schema 对齐：min 1 / max 4000，不再有「0 = 不限」。
+            if max_lines == 0 || max_lines > plugin::read::MAX_MAX_LINES {
+                return Err((
+                    INVALID_PARAMS,
+                    format!(
+                        "'max_lines' must be between 1 and {}; received {}",
+                        plugin::read::MAX_MAX_LINES,
+                        max_lines
+                    ),
+                ));
+            }
 
             match plugin::read::read_file(&path, start_line, max_lines) {
                 Ok(c) => {
