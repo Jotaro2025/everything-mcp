@@ -47,7 +47,7 @@ fn initialize_result_announces_protocol_version_and_tools_capability() {
     assert_eq!(r["protocolVersion"], "2024-11-05");
     assert_eq!(r["capabilities"]["tools"]["listChanged"], false);
     assert_eq!(r["serverInfo"]["name"], "everything-mcp");
-    assert_eq!(r["serverInfo"]["version"], "1.1.0");
+    assert_eq!(r["serverInfo"]["version"], "1.1.1");
 }
 
 #[test]
@@ -93,8 +93,8 @@ fn index_changes_description_and_schema_document_the_gotchas() {
     let tool = &list["tools"][3];
     let desc = tool["description"].as_str().unwrap();
 
-    // 三个必须说清的点：它答的是「什么变了」而非「现在有什么」；要开 journal_log；
-    // 结果可能被 max_results 截断。
+    // 四个必须说清的点：它答的是「什么变了」而非「现在有什么」；要开 journal_log；
+    // 结果可能被 max_results 截断；写完到落盘有几十秒延迟。
     assert!(desc.contains("journal_log"), "desc should name the INI key");
     assert!(desc.contains("truncated"), "desc should expose truncation");
     assert!(
@@ -104,6 +104,11 @@ fn index_changes_description_and_schema_document_the_gotchas() {
     assert!(
         desc.contains("Log changes"),
         "desc should name the Options menu path"
+    );
+    // 落盘延迟不说清，LLM 会把空结果读成「什么都没发生」。
+    assert!(
+        desc.contains("delay of roughly a minute") && desc.contains("40-70s"),
+        "desc should document the log-write latency"
     );
 
     // action 用封闭枚举，避免 LLM 乱自创动作名。
