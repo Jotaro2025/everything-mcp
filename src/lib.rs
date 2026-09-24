@@ -38,8 +38,9 @@ use plugin::host::Host;
 /// 插件显示名 —— 出现在 Everything 插件管理列表里。
 const PLUGIN_NAME: &[u8] = b"Everything MCP\0";
 
-/// 插件版本号。
-const PLUGIN_VERSION: &[u8] = b"1.1.2\0";
+/// 插件版本号。唯一来源是 Cargo.toml —— 别在这里写死字符串，
+/// 否则 bump 版本时容易漏掉这一处（MCP 的 serverInfo 也取自同一个来源）。
+const PLUGIN_VERSION: &[u8] = concat!(env!("CARGO_PKG_VERSION"), "\0").as_bytes();
 
 /// 插件描述 —— 说明这个插件做什么。
 const PLUGIN_DESCRIPTION: &[u8] =

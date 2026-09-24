@@ -153,6 +153,14 @@ pub fn translate_globstar(pattern: &str) -> String {
     p.to_string()
 }
 
+/// 一个搜索项里是否用了 `content:` 搜索函数。
+///
+/// 统一小写查子串即可：Windows 文件名里不允许冒号，`content:` 出现在搜索串里
+/// 只可能是搜索函数 —— 连 `case:content:"…"` 这种函数链写法也一并挡住。
+fn uses_content_function(term: &str) -> bool {
+    term.to_ascii_lowercase().contains("content:")
+}
+
 /// 校验全局搜索（search_everywhere）的 pattern —— 文件夹范围之外的额外护栏。
 ///
 /// 全局搜索的暴露面是整个索引，pattern 再放任下去就是「列出全盘」：
@@ -160,8 +168,10 @@ pub fn translate_globstar(pattern: &str) -> String {
 ///     全局场景下没有「列出全部」的合法需求（那属于 list_folder）；
 ///   - 禁止 `content:` —— 正文检索必须收窄到文件夹（search_in_folder），
 ///     全局 `content:` 等于读遍所有已索引磁盘上的所有文件，慢且危险。
-///     大小写、`case:content:` 之类的搜索函数链写法一并挡掉（统一小写查子串；
-///     Windows 文件名里不允许冒号，`content:` 出现在 pattern 里只可能是搜索函数）。
+///
+/// 注意第一条只挡「空/单字符」，**不是范围控制**：`*.`、`a*`、`dm:thisyear`
+/// 都合法且命中量巨大。真正的范围控制是模式闸门（拒绝档）与 `max_results`
+/// 窗口（500 封顶），别把这条护栏当成防全盘枚举。
 ///
 /// 入参应当已经过 [`validate_pattern`] + [`translate_globstar`]。
 pub fn validate_global_pattern(pattern: &str) -> Result<String, String> {
@@ -172,11 +182,31 @@ pub fn validate_global_pattern(pattern: &str) -> Result<String, String> {
             pattern
         ));
     }
-    if p.to_ascii_lowercase().contains("content:") {
+    if uses_content_function(p) {
         return Err(format!(
             "global 'pattern' must not use 'content:' — a full-disk content scan is too slow and too broad; use search_in_folder with a folder to narrow the scope; received {:?}",
             pattern
         ));
     }
     Ok(p.to_string())
+}
+
+/// 校验全局搜索的 `exclude` 项 —— `content:` 闸门的第二半。
+///
+/// 为什么必须单独查一遍：`exclude` 的每一项都会被拼成 `!term` 进**同一条**
+/// 全局查询（见 tools.rs 的 combine_query）。只查 pattern 的话，
+/// `exclude: ["content:\"x\""]` 就能从旁边绕过去，造出一条带 `content:` 的
+/// 全索引查询 —— 而否定的正文项照样要 Everything 逐文件评估内容，正是护栏
+/// 要拦的那种全盘扫描。文件夹范围内不设此限（`search_in_folder` 的
+/// `exclude` 不受影响）：那里范围已经收窄，正文检索是合法用法。
+pub fn validate_global_excludes(terms: &[String]) -> Result<(), String> {
+    for t in terms {
+        if uses_content_function(t) {
+            return Err(format!(
+                "global 'exclude' must not use 'content:' — a full-disk content scan is too slow and too broad; use search_in_folder with a folder to narrow the scope; received {:?}",
+                t
+            ));
+        }
+    }
+    Ok(())
 }

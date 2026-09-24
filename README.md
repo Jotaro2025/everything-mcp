@@ -142,8 +142,8 @@ powershell -ExecutionPolicy Bypass -File build-installers.ps1
 
 | 安装包                              | 架构 | 内嵌插件 dll           |
 | ----------------------------------- | ---- | ---------------------- |
-| `everything-mcp-1.1.2-x64-setup.exe` | x64  | `everything_mcp64.dll` |
-| `everything-mcp-1.1.2-x86-setup.exe` | x86  | `everything_mcp32.dll` |
+| `everything-mcp-1.1.3-x64-setup.exe` | x64  | `everything_mcp64.dll` |
+| `everything-mcp-1.1.3-x86-setup.exe` | x86  | `everything_mcp32.dll` |
 
 安装：运行对应架构的安装包 → Everything 弹出「设置插件」对话框 → 点「安装」。
 两个安装包可以一起分发，`Plugins\` 下 `everything_mcp64.dll` 与
@@ -508,16 +508,22 @@ gitignore），常见做法：
     立即生效），其余六个工具照常、仍限定在文件夹内。错误载荷里带开启方法，
     LLM 可以直接转告用户。
   - **审核**：调用放行，但工具被标注为「非只读 / 破坏性」（`destructiveHint:
-    true`），客户端据此先弹权限确认框，模型不会自作主张调用。无论是否放行，
-    磁盘都不会被改动 —— 这个标注只用来驱动确认弹窗。
+    true`），客户端据此先弹权限确认框。注意注解在规范里是**不可信的提示** ——
+    2026-07-28 规范原文：*clients MUST consider tool annotations to be untrusted
+    unless they come from trusted servers*。所以认真读注解的客户端会先问一句，
+    忽略注解的客户端会直接放行：**服务端真正强制的只有「拒绝」这一档**。无论
+    是否放行，磁盘都不会被改动 —— 这个标注只用来驱动确认弹窗。
   - **允许**：标注为只读（`readOnlyHint: true`），调用直接放行，不再打扰用户。
   三档只改变工具注解与描述里的 POLICY 段，工具清单形状不变。注意 `tools/list`
   结果带 5 分钟缓存，切档后注解最多滞后一个 TTL，但「拒绝」档的硬闸在调用时
   检查，立即生效。
 - **两道护栏**：`pattern` 至少 2 个字符（全局空 / 单字符 pattern 的命中量是
-  灾难级的），且**禁止 `content:`** —— 全局正文扫描又慢又广，正文检索永远
-  留给带 folder 的 `search_in_folder`。两道都在触达 Everything 之前返回
-  `-32602 INVALID_PARAMS`。
+  灾难级的），且 **`pattern` 与 `exclude` 都禁止 `content:`** —— 否定的正文项
+  照样要 Everything 逐文件评估内容，所以两边都得查；正文检索永远留给带 folder
+  的 `search_in_folder`。两道都在触达 Everything 之前返回 `-32602
+  INVALID_PARAMS`。注意「≥2 字符」只挡空 / 单字符，**不是范围控制**：`*.`、
+  `a*`、`dm:thisyear` 都合法且命中量巨大 —— 真正的范围控制是档位闸门与
+  `max_results` 上限（500），`offset` 可以继续往后翻。
 - 入参与 `search_in_folder` 同构：`exclude` / `sort` / `descending` /
   `match_case` / `match_whole_word` / `match_regex` / `offset` / `timeout_ms`
   语义一致；区别是 `max_results` 上限 **500**（全局窗口必须封顶），`0` 或越界

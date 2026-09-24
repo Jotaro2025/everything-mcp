@@ -157,8 +157,8 @@ Outputs (in `installer\dist\`):
 
 | Installer                            | Arch | Embedded plugin dll   |
 | ------------------------------------ | ---- | --------------------- |
-| `everything-mcp-1.1.2-x64-setup.exe` | x64  | `everything_mcp64.dll` |
-| `everything-mcp-1.1.2-x86-setup.exe` | x86  | `everything_mcp32.dll` |
+| `everything-mcp-1.1.3-x64-setup.exe` | x64  | `everything_mcp64.dll` |
+| `everything-mcp-1.1.3-x86-setup.exe` | x86  | `everything_mcp32.dll` |
 
 To install, run the installer for your architecture; Everything then shows its
 "Setup Plugin" dialog, where you click Install. Both installers can be
@@ -594,8 +594,12 @@ follow-up work.
     LLM can relay it to the user.
   - **Review**: calls go through, but the tool is annotated as NOT read-only /
     destructive (`destructiveHint: true`), so the client shows its permission
-    prompt first and the model does not call it on its own initiative. Nothing
-    on disk is modified either way — the annotation only drives the prompt.
+    prompt first. Note that annotations are **untrusted hints** by the spec —
+    2026-07-28 states: *clients MUST consider tool annotations to be untrusted
+    unless they come from trusted servers*. A client that reads them will ask
+    first; one that ignores them will call straight through. **Deny is the only
+    tier the server actually enforces.** Nothing on disk is modified either way
+    — the annotation only drives the prompt.
   - **Allow**: annotated read-only (`readOnlyHint: true`); calls are served
     directly, without bothering the user.
   The mode only changes the tool annotations and the POLICY paragraph in the
@@ -604,9 +608,14 @@ follow-up work.
   but the Deny gate is checked at call time and bites immediately.
 - **Two guard rails**: `pattern` must be at least 2 characters (a global empty
   or single-character pattern matches a catastrophic number of entries), and
-  **`content:` is rejected** — a full-disk content scan is slow and broad, so
-  content search always stays folder-scoped in `search_in_folder`. Both come
-  back as `-32602 INVALID_PARAMS` before anything touches Everything.
+  **`content:` is rejected in both `pattern` and `exclude`** — an excluded
+  content term still forces Everything to evaluate file contents, so both
+  arguments are checked; content search always stays folder-scoped in
+  `search_in_folder`. Both come back as `-32602 INVALID_PARAMS` before anything
+  touches Everything. Note the 2-character rule only blocks empty / one-char
+  patterns and is **not a scope control**: `*.`, `a*` and `dm:thisyear` are all
+  legal and match enormous sets — the real controls are the mode gate and the
+  `max_results` cap (500), with `offset` paging through the rest.
 - Same argument shape as `search_in_folder`: `exclude` / `sort` / `descending`
   / `match_case` / `match_whole_word` / `match_regex` / `offset` / `timeout_ms`
   all mean the same thing; the difference is `max_results` caps at **500** (the

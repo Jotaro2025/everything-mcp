@@ -200,7 +200,8 @@ pub fn make_initialize_result(params: &Value) -> Value {
         },
         "serverInfo": {
             "name": "everything-mcp",
-            "version": "1.1.2"
+            // 版本号唯一来源是 Cargo.toml（与 lib.rs 的 PLUGIN_VERSION 同源）。
+            "version": env!("CARGO_PKG_VERSION")
         }
     });
     with_result_type(result, is_modern_version(version))
@@ -223,10 +224,10 @@ pub fn make_discover_result() -> Value {
         "_meta": {
             "io.modelcontextprotocol/serverInfo": {
                 "name": "everything-mcp",
-                "version": "1.1.2"
+                "version": env!("CARGO_PKG_VERSION")
             }
         },
-        "instructions": "Folder-scoped Everything file search. Search scope follows Everything's index: local drives are included automatically, but a network share is only searchable after being added in Tools > Options > Indexes > Folders — an un-indexed share yields 0 results, not an error. Use search_in_folder with an absolute folder path (a drive path like D:\\source\\repos\\myproject or a UNC path like \\\\server\\share\\project) plus Everything search syntax; list_folder for immediate children; count for totals only; index_changes to read the index journal (created/modified/deleted/renamed); it needs journal_log enabled in Everything and returns an actionable error when it is not. search_everywhere finds files/folders by NAME across the whole index without a folder — for when you know what it is called but not where it lives; it is gated by the server's global-search policy ('deny' rejects every call with GLOBAL_SEARCH_DISABLED, 'review' requires the user to confirm first, 'allow' serves calls directly) and its pattern must be at least 2 characters with no 'content:'. search_in_folder results carry size and modified/created timestamps, can be sorted (sort=name|path|size|modified|created, descending=true for newest/largest first), and support case/whole-word/regex matching. Results are capped by max_results and carry a separate 'total' count of all matches found — when count < total, page through with 'offset'.",
+        "instructions": "Folder-scoped Everything file search. Search scope follows Everything's index: local drives are included automatically, but a network share is only searchable after being added in Tools > Options > Indexes > Folders — an un-indexed share yields 0 results, not an error. Use search_in_folder with an absolute folder path (a drive path like D:\\source\\repos\\myproject or a UNC path like \\\\server\\share\\project) plus Everything search syntax; list_folder for immediate children; count for totals only; index_changes to read the index journal (created/modified/deleted/renamed); it needs journal_log enabled in Everything and returns an actionable error when it is not. search_everywhere finds files/folders by NAME across the whole index without a folder — for when you know what it is called but not where it lives; it is gated by the server's global-search policy ('deny' rejects every call with GLOBAL_SEARCH_DISABLED, 'review' requires the user to confirm first, 'allow' serves calls directly) and its pattern must be at least 2 characters with no 'content:' in either 'pattern' or 'exclude'. search_in_folder results carry size and modified/created timestamps, can be sorted (sort=name|path|size|modified|created, descending=true for newest/largest first), and support case/whole-word/regex matching. Results are capped by max_results and carry a separate 'total' count of all matches found — when count < total, page through with 'offset'.",
         "ttlMs": DISCOVER_TTL_MS,
         "cacheScope": CACHE_SCOPE_PUBLIC
     })
@@ -310,7 +311,7 @@ fn search_everywhere_entry(mode: GlobalSearchMode) -> Value {
     serde_json::json!({
         "name": "search_everywhere",
         "description": format!(
-            "{} Search file/folder NAMES across the ENTIRE Everything index — every local drive and indexed network share — without naming a folder. Use it when you know what a file is called but not where it lives (e.g. a folder somewhere on a NAS share), then hand the returned full paths to search_in_folder / list_folder for anything scoped. It exposes the whole machine's file names to the caller — hence the per-server policy above. Same Everything search syntax as search_in_folder's pattern ('*.vhd', '\"quarterly report\"', 'ext:pdf;docx dm:thisyear', 'backup !\\\\old\\\\') with two guard rails: 'pattern' must be at least 2 characters, and 'content:' is rejected (content search stays folder-scoped in search_in_folder). Each result carries the full path plus size and modified/created (ISO 8601 UTC); 'max_results' (1..500, default 50) caps the window and 'total' reports all matches — page with 'offset' like search_in_folder.",
+            "{} Search file/folder NAMES across the ENTIRE Everything index — every local drive and indexed network share — without naming a folder. Use it when you know what a file is called but not where it lives (e.g. a folder somewhere on a NAS share), then hand the returned full paths to search_in_folder / list_folder for anything scoped. It exposes the whole machine's file names to the caller — hence the per-server policy above. Same Everything search syntax as search_in_folder's pattern ('*.vhd', '\"quarterly report\"', 'ext:pdf;docx dm:thisyear', 'backup !\\\\old\\\\') with two guard rails: 'pattern' must be at least 2 characters, and 'content:' is rejected in BOTH 'pattern' and 'exclude' (content search stays folder-scoped in search_in_folder). Each result carries the full path plus size and modified/created (ISO 8601 UTC); 'max_results' (1..500, default 50) caps the window and 'total' reports all matches — page with 'offset' like search_in_folder.",
             policy
         ),
         "annotations": {
@@ -325,12 +326,12 @@ fn search_everywhere_entry(mode: GlobalSearchMode) -> Value {
             "properties": {
                 "pattern": {
                     "type": "string",
-                    "description": "Everything search pattern matched against file/folder names across the whole index, e.g. '*.vhd' (extension), '\"quarterly report\"' (name phrase), 'ext:pdf;docx dm:thisyear' (functions), 'backup !\\\\old\\\\' ('!' excludes). At least 2 characters. 'content:' is rejected — use search_in_folder for content search."
+                    "description": "Everything search pattern matched against file/folder names across the whole index, e.g. '*.vhd' (extension), '\"quarterly report\"' (name phrase), 'ext:pdf;docx dm:thisyear' (functions), 'backup !\\\\old\\\\' ('!' excludes). At least 2 characters. 'content:' is rejected here and in 'exclude' — use search_in_folder for content search."
                 },
                 "exclude": {
                     "type": ["string", "array"],
                     "items": { "type": "string" },
-                    "description": "Terms to exclude, appended as Everything NOT operators. Accepts a string or an array of strings. Quoted path fragments match well: ['\\\\old\\\\', '\\\\.git\\\\', '\\\\node_modules\\\\']. Default: none."
+                    "description": "Terms to exclude, appended as Everything NOT operators. Accepts a string or an array of strings. Quoted path fragments match well: ['\\\\old\\\\', '\\\\.git\\\\', '\\\\node_modules\\\\']. 'content:' is rejected here as well — an excluded content term still forces a full-disk content scan. Default: none."
                 },
                 "sort": {
                     "type": "string",

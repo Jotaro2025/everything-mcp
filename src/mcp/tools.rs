@@ -675,6 +675,9 @@ pub fn dispatch(name: &str, args: &Value) -> Result<ToolOutput, (i32, String)> {
             let pattern =
                 validate::validate_global_pattern(&pattern).map_err(|e| (INVALID_PARAMS, e))?;
             let excludes = exclude_arg(args)?;
+            // exclude 项会拼进同一条查询，content: 闸门必须两边都查 ——
+            // 只查 pattern 的话 `exclude: ["content:…"]` 就绕过去了。
+            validate::validate_global_excludes(&excludes).map_err(|e| (INVALID_PARAMS, e))?;
             let match_regex = bool_arg(args, "match_regex", false)?;
             let query = combine_query(&regex_term(&pattern, match_regex), &excludes);
             let offset = u64_arg(args, "offset", 0)? as usize;

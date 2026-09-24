@@ -47,7 +47,9 @@ fn initialize_result_announces_protocol_version_and_tools_capability() {
     assert_eq!(r["protocolVersion"], "2024-11-05");
     assert_eq!(r["capabilities"]["tools"]["listChanged"], false);
     assert_eq!(r["serverInfo"]["name"], "everything-mcp");
-    assert_eq!(r["serverInfo"]["version"], "1.1.2");
+    // 版本号唯一来源是 Cargo.toml —— 这里跟着它走，bump 时不必改测试。
+    // （src/lib.rs 的 PLUGIN_VERSION 与 setup\version.h 都是同一来源。）
+    assert_eq!(r["serverInfo"]["version"], env!("CARGO_PKG_VERSION"));
 }
 
 #[test]
@@ -885,6 +887,47 @@ fn search_everywhere_arg_validation_before_touching_anything() {
         assert_eq!(err.0, protocol::INVALID_PARAMS, "max_results={bad}");
         assert!(err.1.contains("between 1 and 500"), "{}", err.1);
     }
+
+    // content: 闸门在 exclude 上也要生效：exclude 项会被拼成 `!term` 进同一条
+    // 全局查询，只查 pattern 的话就能从旁边绕过护栏。
+    for bad in [
+        json!({"pattern": "ab", "exclude": ["content:\"secret\""]}),
+        json!({"pattern": "ab", "exclude": "case:content:\"secret\""}),
+    ] {
+        let err = tools::dispatch("search_everywhere", &bad).unwrap_err();
+        assert_eq!(err.0, protocol::INVALID_PARAMS, "{bad}");
+        assert!(err.1.contains("exclude"), "{}", err.1);
+        assert!(err.1.contains("content:"), "{}", err.1);
+    }
+}
+
+#[test]
+fn global_exclude_cannot_smuggle_content_search() {
+    use everything_mcp::mcp::validate;
+    // 正常的 exclude 项（路径片段、扩展名）一律放行。
+    assert!(validate::validate_global_excludes(&[]).is_ok());
+    for ok in [r"\old\", r"\.git\", "ext:tmp", "node_modules"] {
+        assert!(
+            validate::validate_global_excludes(&[ok.to_string()]).is_ok(),
+            "{ok} 应放行"
+        );
+    }
+    // content: 一律拦下 —— 大小写与函数链写法都要认出来。
+    for bad in [
+        r#"content:"secret""#,
+        r#"CONTENT:"secret""#,
+        r#"case:content:"secret""#,
+    ] {
+        let e = validate::validate_global_excludes(&[bad.to_string()]).unwrap_err();
+        assert!(e.contains("exclude"), "{e}");
+        assert!(e.contains("content:"), "{e}");
+    }
+    // 只报坏的那一项，前面的正常项不影响判断。
+    let e = validate::validate_global_excludes(&[r"\old\".to_string(), "content:x".to_string()])
+        .unwrap_err();
+    assert!(e.contains("content:x"), "{e}");
+    // 注意这条闸门只属于全局搜索：文件夹范围内范围已收窄，
+    // search_in_folder 的 exclude 用 content: 是合法用法（该分支不调用本函数）。
 }
 
 #[test]
