@@ -187,23 +187,26 @@ pub type OsThreadWaitAndCloseFn = unsafe extern "system" fn(thread: *mut c_void)
 // 这正是 etp_server.c 的做法（行 2822-2828）。
 // ====================================================================
 
-#[allow(non_camel_case_types)]
+// 类型名刻意照抄 SDK 的 C 头文件（见 docs/PLUGIN_SDK_API_CN.md）—— 与
+// reference/ 下的 etp_server.c / http_server.c 逐字对应，改成 Rust 风格的名字
+// 反而切断这层对应关系。clippy::upper_case_acronyms 在此属有意为之。
+#[allow(non_camel_case_types, clippy::upper_case_acronyms)]
 pub type UINT = u32;
-#[allow(non_camel_case_types)]
+#[allow(non_camel_case_types, clippy::upper_case_acronyms)]
 pub type DWORD = u32;
-#[allow(non_camel_case_types)]
+#[allow(non_camel_case_types, clippy::upper_case_acronyms)]
 pub type HWND = *mut c_void;
-#[allow(non_camel_case_types)]
+#[allow(non_camel_case_types, clippy::upper_case_acronyms)]
 pub type HMENU = *mut c_void;
-#[allow(non_camel_case_types)]
+#[allow(non_camel_case_types, clippy::upper_case_acronyms)]
 pub type HINSTANCE = *mut c_void;
-#[allow(non_camel_case_types)]
+#[allow(non_camel_case_types, clippy::upper_case_acronyms)]
 pub type HICON = *mut c_void;
-#[allow(non_camel_case_types)]
+#[allow(non_camel_case_types, clippy::upper_case_acronyms)]
 pub type HCURSOR = *mut c_void;
-#[allow(non_camel_case_types)]
+#[allow(non_camel_case_types, clippy::upper_case_acronyms)]
 pub type LPVOID = *mut c_void;
-#[allow(non_camel_case_types)]
+#[allow(non_camel_case_types, clippy::upper_case_acronyms)]
 /// Win32 窗口过程函数指针 —— 与 user32 一致。
 pub type WNDPROC =
     Option<unsafe extern "system" fn(hwnd: HWND, msg: u32, wparam: usize, lparam: isize) -> isize>;
@@ -365,6 +368,13 @@ impl Host {
     ///
     /// 返回 `Ok(())` 表示所有**强制**函数都获取成功；
     /// 任一强制函数不存在则返回 `Err(name)`，主程序应当拒绝加载本插件。
+    ///
+    /// 下面的 `req!` / `opt!` 宏用 `transmute::<*mut c_void, _>` 填 `Host` 的
+    /// 字段 —— 目标类型由字段声明唯一确定。clippy 的
+    /// `missing_transmute_annotations` 要求把类型写出来，但那等于把每个签名
+    /// 再抄一遍（几十处），而抄错在 FFI 里是**运行时崩溃**而非编译错误，
+    /// 比 `_` 更危险。这里保持 `_`，让字段声明做单一事实来源。
+    #[allow(clippy::missing_transmute_annotations)]
     pub fn install(get_proc_address: GetProcAddressFn) -> Result<(), &'static str> {
         let mut host = Host::default();
         super::diag::write("PM_INIT begin");
@@ -512,7 +522,9 @@ impl Host {
             let mut bytes = Vec::with_capacity(msg.len() + 1);
             bytes.extend_from_slice(msg.as_bytes());
             bytes.push(0);
-            unsafe { dp(b"%s\0".as_ptr(), bytes.as_ptr()) };
+            // c"…".to_bytes() 含结尾 NUL，类型是 *const u8（SDK 的字符串约定）。
+            // 比 b"%s\0" 多一层保障：NUL 由字面量保证，不会漏写。
+            unsafe { dp(c"%s".to_bytes().as_ptr(), bytes.as_ptr()) };
         }
     }
 }

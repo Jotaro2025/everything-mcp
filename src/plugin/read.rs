@@ -10,6 +10,7 @@
 //!   1. 只按 UTF-8 解码 —— GBK/ANSI 正文经它出来整篇是 U+FFFD 替换字符；
 //!   2. 读不了被别的进程独占打开的文件（实测该场景返回 NULL，os error 32）；
 //!   3. 也不比我们多覆盖长路径（303 字符的路径直读正常）。
+//!
 //! 三条加起来它没有一条路比自解码更好，反而要占 Everything 主线程，所以
 //! 最终没走它。详情见 docs/PLUGIN_SDK_API_CN.md 的 12.4 节。
 //!
@@ -259,15 +260,19 @@ fn binary_message(path: &str, reason: &str) -> String {
 fn decode_bytes(raw: &[u8]) -> (String, &'static str) {
     if raw.starts_with(&[0xFF, 0xFE]) {
         let units: Vec<u16> = raw[2..]
-            .chunks_exact(2)
-            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| u16::from_le_bytes(*c))
             .collect();
         return (String::from_utf16_lossy(&units), "utf-16le");
     }
     if raw.starts_with(&[0xFE, 0xFF]) {
         let units: Vec<u16> = raw[2..]
-            .chunks_exact(2)
-            .map(|c| u16::from_be_bytes([c[0], c[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| u16::from_be_bytes(*c))
             .collect();
         return (String::from_utf16_lossy(&units), "utf-16be");
     }

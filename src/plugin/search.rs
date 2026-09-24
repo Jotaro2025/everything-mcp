@@ -196,6 +196,7 @@ impl SearchOptions {
 ///   - 同时避免误伤同前缀的兄弟目录 —— `everything-mcp` 不会命中
 ///     `everything-mcp-old` 里的文件；
 ///   - 文件夹自身的路径没有尾反斜杠，因此不会把文件夹本身搜出来。
+///
 /// Global：`<pattern>` 原样 —— 不加任何路径前缀，搜整个索引。
 fn build_search_string(folder: &str, pattern: &str, scope: SearchScope) -> String {
     if scope == SearchScope::Global {
@@ -341,7 +342,7 @@ pub fn search_everywhere(
 ///   - `query`      ：结果读取的目标句柄；
 ///   - `_keepalive` ：搜索串保活守卫（后台查询线程整个查询期间都可能读它）；
 ///   - `_host_lock` ：主机互斥锁。read_results / count_results 还要 marshal
-///                    到主线程并触碰同一个 query 对象，全程不能并发第二次查询。
+///     到主线程并触碰同一个 query 对象，全程不能并发第二次查询。
 ///
 /// 字段声明顺序即 Drop 顺序：先释放缓冲区，最后才解锁。
 struct CompletedQuery {
@@ -556,7 +557,7 @@ unsafe extern "system" fn run_search_on_main(ctx: *mut core::ffi::c_void) {
         return;
     }
     let c = &mut *(ctx as *mut SearchCtx);
-    let null_str: *const u8 = b"\0".as_ptr();
+    let null_str: *const u8 = c"".to_bytes().as_ptr();
 
     // 懒创建 db 引用与 query 对象（首次搜索时）。
     // db_query_create 与 db_query_search2 一样有主线程亲和性，因此放在这里。

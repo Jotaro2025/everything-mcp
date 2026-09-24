@@ -5,6 +5,7 @@
 //!   - 2026-07-28（modern，当前最新修订版）：无握手，每个请求在 `_meta` 的
 //!     `io.modelcontextprotocol/protocolVersion` 键里自带版本（Streamable
 //!     HTTP 上还必须在 `MCP-Protocol-Version` 请求头里带同一个值）。
+//!
 //! 我们实现的子集：
 //!   - initialize / initialized 握手（legacy 客户端）
 //!   - server/discover（modern 客户端探测支持版本与能力，2026-07-28 起 MUST）

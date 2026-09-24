@@ -10,6 +10,7 @@
 //! 两道闸门防止「一次 grep 读穿整个盘」：
 //!   - 候选文件数上限 [`MAX_CANDIDATE_FILES`]（Everything 一次最多给这么多）；
 //!   - 读取字节总量上限 [`MAX_TOTAL_BYTES`]（2000 × 8 MiB 最坏是 16 GB）。
+//!
 //! 两道闸门都触发时都会把 `truncated` 置真，并如实报出 `candidates` /
 //! `files_scanned` / `bytes_scanned`，让调用方知道是卡在哪一道上。
 
@@ -414,7 +415,7 @@ mod tests {
         let (hits, _, stopped) = scan_text(
             &re("hit"),
             "p",
-            &text,
+            text,
             OutputMode::Count,
             2,
             &mut out,
@@ -475,6 +476,6 @@ mod tests {
         // 两个工具用同一个常量：改一处两边一起变，避免只调了一个。
         assert_eq!(read::MAX_WINDOW_BYTES, 128 * 1024);
         assert_eq!(read::MAX_LINE_CHARS * 4, 64 * 1024, "裁过的行必须放得进预算");
-        assert!(read::MAX_LINE_CHARS * 4 < read::MAX_WINDOW_BYTES);
+        const { assert!(read::MAX_LINE_CHARS * 4 < read::MAX_WINDOW_BYTES) };
     }
 }

@@ -76,12 +76,9 @@ fn parse_section(content: &str) -> Option<PersistedSettings> {
 
     for line in content.lines() {
         let line = line.trim();
-        if line.starts_with('[') {
-            // 行首是 '['（ASCII），切到索引 1 一定是字符边界。
-            in_section = line[1..]
-                .trim_end_matches(']')
-                .trim()
-                .eq_ignore_ascii_case(SECTION);
+        if let Some(rest) = line.strip_prefix('[') {
+            // strip_prefix 对 ASCII 前缀按字节切，不存在「索引切在字符中间」的问题。
+            in_section = rest.trim_end_matches(']').trim().eq_ignore_ascii_case(SECTION);
             continue;
         }
         if !in_section {

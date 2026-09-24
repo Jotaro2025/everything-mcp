@@ -46,11 +46,11 @@ pub fn normalize_folder(input: &str) -> Result<String, String> {
     // 统一分隔符：Windows 接受正斜杠，Everything 的路径语法用反斜杠。
     let unified = s.replace('/', "\\");
 
-    if unified.starts_with("\\\\") {
+    if let Some(rest) = unified.strip_prefix("\\\\") {
         // UNC：保留前导双反斜杠，折叠其余连续反斜杠。
         let mut out = String::from("\\\\");
         let mut prev_bs = true;
-        for c in unified[2..].chars() {
+        for c in rest.chars() {
             if c == '\\' {
                 if !prev_bs {
                     out.push('\\');

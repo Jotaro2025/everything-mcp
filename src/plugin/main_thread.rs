@@ -197,7 +197,7 @@ pub fn invoke_c(func: TaskFn, ctx: *mut c_void) -> Result<(), String> {
         }
         spins += 1;
         std::hint::spin_loop();
-        if spins % 4096 == 0 {
+        if spins.is_multiple_of(4096) {
             unsafe { Sleep(0) };
         }
     }
@@ -299,7 +299,7 @@ pub fn install_on_main_thread() -> Result<(), String> {
         create_window(
             0, // dwExStyle
             CLASS_NAME.as_ptr(),
-            b"\0".as_ptr(),        // lpWindowName —— 空字符串
+            c"".to_bytes().as_ptr(), // lpWindowName —— 空字符串（含结尾 NUL）
             0,                     // dwStyle
             0,                     // x
             0,                     // y

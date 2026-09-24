@@ -37,6 +37,7 @@ use windows_sys::Win32::UI::Controls::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{GetClientRect, GetDlgItemInt, SetDlgItemInt};
 
+use crate::abi_ok;
 use crate::mcp;
 use crate::mcp::protocol::GlobalSearchMode;
 use crate::plugin::diag;
@@ -224,7 +225,7 @@ pub fn add_page(data: *mut c_void) -> *mut c_void {
     let name = cstr_bytes(labels().page_name);
     unsafe { add(data, core::ptr::null_mut(), name.as_ptr()) };
     diag::write("options: settings page registered");
-    1 as *mut c_void
+    abi_ok()
 }
 
 /// PM_LOAD_OPTIONS_PAGE：按当前设置创建页面控件。
@@ -387,7 +388,7 @@ pub fn load_page(data: *mut c_void) -> *mut c_void {
     }
 
     diag::write("options: page loaded");
-    1 as *mut c_void
+    abi_ok()
 }
 
 /// PM_SAVE_OPTIONS_PAGE：读控件 → 更新设置 → 即时应用（启用/停用/改地址端口
@@ -427,7 +428,7 @@ pub fn save_page(data: *mut c_void) -> *mut c_void {
         // 应用失败（例如端口被占用）—— 保持 Apply 可点，改完再试。
         page.enable_apply = 1;
     }
-    1 as *mut c_void
+    abi_ok()
 }
 
 /// PM_GET_OPTIONS_PAGE_MINMAX：报告页面最小尺寸（逻辑像素）。
@@ -438,7 +439,7 @@ pub fn minmax(data: *mut c_void) -> *mut c_void {
     let p = unsafe { &mut *(data as *mut GetOptionsPageMinMax) };
     p.wide = PAGE_MIN_WIDE;
     p.high = PAGE_MIN_HIGH;
-    1 as *mut c_void
+    abi_ok()
 }
 
 /// PM_SIZE_OPTIONS_PAGE：按页面客户区尺寸（换算成逻辑像素）摆放控件。
@@ -535,7 +536,7 @@ pub fn size_page(data: *mut c_void) -> *mut c_void {
         DLG_BUTTON_HIGH,
     );
 
-    1 as *mut c_void
+    abi_ok()
 }
 
 /// PM_OPTIONS_PAGE_PROC：页面窗口消息（目前只关心 WM_COMMAND）。
@@ -546,7 +547,7 @@ pub fn page_proc(data: *mut c_void) -> *mut c_void {
     let p = unsafe { &*(data as *const OptionsPageProc) };
     if p.msg != WM_COMMAND {
         // 其它消息不处理（http_server.c 同样直接放过）。
-        return 1 as *mut c_void;
+        return abi_ok();
     }
 
     let page_hwnd = p.page_hwnd;
@@ -568,20 +569,18 @@ pub fn page_proc(data: *mut c_void) -> *mut c_void {
             unsafe { set_global_mode(page_hwnd, id) };
             enable_apply(p.options_hwnd);
         }
-        ID_BIND_EDIT | ID_PORT_EDIT => {
-            if notify == EN_CHANGE {
-                enable_apply(p.options_hwnd);
-            }
+        ID_BIND_EDIT | ID_PORT_EDIT if notify == EN_CHANGE => {
+            enable_apply(p.options_hwnd);
         }
         _ => {}
     }
 
-    1 as *mut c_void
+    abi_ok()
 }
 
 /// PM_KILL_OPTIONS_PAGE：控件由主程序创建和销毁，插件无自有资源。
 pub fn kill_page(_data: *mut c_void) -> *mut c_void {
-    1 as *mut c_void
+    abi_ok()
 }
 
 /// PM_SAVE_SETTINGS：把当前设置写回主程序的设置输出流（最终落盘到
@@ -613,7 +612,7 @@ pub fn save_settings(data: *mut c_void) -> *mut c_void {
         st.port,
         st.global_search.as_str()
     ));
-    1 as *mut c_void
+    abi_ok()
 }
 
 // ============================================================

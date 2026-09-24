@@ -52,6 +52,16 @@ const PLUGIN_AUTHOR: &[u8] = b"JOJO\0";
 /// 插件主页链接 —— Everything 插件管理里点「链接」打开的地址。
 const PLUGIN_LINK: &[u8] = b"https://github.com/Jotaro2025/everything-mcp\0";
 
+/// C ABI 的「成功」返回值。
+///
+/// 主程序只判非 NULL（见下面 `everything_plugin_proc` 的返回值约定），
+/// 具体值不重要，且永远不会被解引用。用 `NonNull::dangling()` 而不是
+/// `1 as *mut c_void`：后者是拿整数造指针，在 Rust 里属于灰区（即使从不解引用）；
+/// `dangling()` 是官方认可的等价表达 —— 一个对齐的、非 NULL 的、不可解引用的指针。
+pub(crate) fn abi_ok() -> *mut c_void {
+    core::ptr::NonNull::<c_void>::dangling().as_ptr()
+}
+
 /// Everything 1.5 唯一识别的插件入口符号。
 ///
 /// 调用约定 `extern "system"`（Windows 上等价于 WINAPI / stdcall）。
@@ -92,7 +102,7 @@ unsafe fn everything_plugin_proc_impl(msg: u32, data: *mut c_void) -> *mut c_voi
                 Ok(()) => {
                     plugin::diag::write("PM_INIT: install OK");
                     Host::debug("everything_mcp: PM_INIT ok");
-                    1 as *mut c_void
+                    abi_ok()
                 }
                 Err(missing) => {
                     let msg = format!("PM_INIT FAILED: missing host fn: {}", missing);
@@ -182,7 +192,7 @@ unsafe fn everything_plugin_proc_impl(msg: u32, data: *mut c_void) -> *mut c_voi
             // 之后用户在设置页的改动也走同一条应用路径（options::apply）。
             options::init(enabled, bind, port, global_search);
 
-            1 as *mut c_void
+            abi_ok()
         }
 
         // ============================================================
@@ -196,7 +206,7 @@ unsafe fn everything_plugin_proc_impl(msg: u32, data: *mut c_void) -> *mut c_voi
             options::mark_stopped();
             plugin::main_thread::destroy_main_window();
             unsafe { plugin::state::destroy() };
-            1 as *mut c_void
+            abi_ok()
         }
 
         plugin::PM_KILL => {
@@ -205,7 +215,7 @@ unsafe fn everything_plugin_proc_impl(msg: u32, data: *mut c_void) -> *mut c_voi
             options::mark_stopped();
             plugin::main_thread::destroy_main_window();
             unsafe { plugin::state::destroy() };
-            1 as *mut c_void
+            abi_ok()
         }
 
         // ============================================================
@@ -237,7 +247,7 @@ unsafe fn everything_plugin_proc_impl(msg: u32, data: *mut c_void) -> *mut c_voi
         plugin::PM_GET_AUTHOR => static_cstr_bytes(PLUGIN_AUTHOR).as_ptr() as *mut c_void,
         plugin::PM_GET_LINK => static_cstr_bytes(PLUGIN_LINK).as_ptr() as *mut c_void,
         plugin::PM_GET_VERSION => static_cstr_bytes(PLUGIN_VERSION).as_ptr() as *mut c_void,
-        plugin::PM_GET_PLUGIN_VERSION => 1 as *mut c_void, // 协议版本
+        plugin::PM_GET_PLUGIN_VERSION => abi_ok(), // 协议版本
 
         // 未处理的消息统一返回 NULL，但记录到诊断日志方便排查。
         other => {

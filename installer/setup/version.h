@@ -3,7 +3,7 @@
 // setup.rc uses the four numeric parts for FILEVERSION / PRODUCTVERSION.
 #define PLUGINMAJOR		1
 #define PLUGINMINOR		1
-#define PLUGINREVISION	9
+#define PLUGINREVISION	10
 #define PLUGINBUILD		0
 
-#define PLUGINVERSION	"1.1.9.0"
+#define PLUGINVERSION	"1.1.10.0"
