@@ -142,8 +142,8 @@ powershell -ExecutionPolicy Bypass -File build-installers.ps1
 
 | 安装包                              | 架构 | 内嵌插件 dll           |
 | ----------------------------------- | ---- | ---------------------- |
-| `everything-mcp-1.1.3-x64-setup.exe` | x64  | `everything_mcp64.dll` |
-| `everything-mcp-1.1.3-x86-setup.exe` | x86  | `everything_mcp32.dll` |
+| `everything-mcp-1.1.4-x64-setup.exe` | x64  | `everything_mcp64.dll` |
+| `everything-mcp-1.1.4-x86-setup.exe` | x86  | `everything_mcp32.dll` |
 
 安装：运行对应架构的安装包 → Everything 弹出「设置插件」对话框 → 点「安装」。
 两个安装包可以一起分发，`Plugins\` 下 `everything_mcp64.dll` 与
@@ -336,6 +336,10 @@ gitignore），常见做法：
   而非缺失。要整个目录树的内容，用 `search_in_folder` 递归搜索。
 - 每条同样带 `modified` / `created`（ISO 8601 UTC，无该时间时为 `null`）。
 - 响应同样带 `total`（该目录直接子项总数，排除后的数量）。
+- **大目录要翻页**：`max_results` 默认 500、上限也是 500，`offset` 往后走。
+  `count` < `total` 时说明还有下一页，`truncated` 直接给出这个判断。繁忙目录
+  可以有几千个直接子项（`C:\Windows\System32` 实测约 4900 个），旧版写死
+  500 条且没有 `offset`，第 501 项之后拿不到。
 
 #### 3. `count`
 

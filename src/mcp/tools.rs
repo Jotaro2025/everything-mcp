@@ -179,6 +179,12 @@ const INDEX_CHANGES_LIMIT: u64 = 2000;
 /// 窗口必须封顶 —— 0 也不再有「不限」的第二含义，越界直接报 INVALID_PARAMS。
 const GLOBAL_MAX_RESULTS: u64 = 500;
 
+/// `list_folder` 每页的子项上限（同时是默认值）。目录的直接子项可以上千
+/// （实测 `C:\Windows\System32` 有 4889 个），所以窗口必须能翻页：`offset`
+/// 往后走，`truncated` 告诉调用方还有没有下一页。上限取 500 是为了让一页的
+/// 响应体不至于大到被客户端截断。
+const LIST_MAX_RESULTS: usize = 500;
+
 /// 把 `action` 参数映射成 journal 的动作枚举。
 ///
 /// 接收 `Action::as_str()` 的全部取值外加 `any`（不限）。空串与缺省都视为
@@ -334,13 +340,26 @@ pub fn dispatch(name: &str, args: &Value) -> Result<ToolOutput, (i32, String)> {
             let folder = require_folder(args)?;
             let excludes = exclude_arg(args)?;
             let query = combine_query("", &excludes);
+            let offset = u64_arg(args, "offset", 0)? as usize;
+            // 窗口必须能翻页：大目录的直接子项可以上千（实测 C:\Windows\System32
+            // 有 4889 个），旧实现写死 500 条且没有 offset，第 501 项之后拿不到。
+            let max_results = u64_arg(args, "max_results", LIST_MAX_RESULTS as u64)? as usize;
+            if max_results == 0 || max_results > LIST_MAX_RESULTS {
+                return Err((
+                    INVALID_PARAMS,
+                    format!(
+                        "'max_results' must be between 1 and {}; received {}",
+                        LIST_MAX_RESULTS, max_results
+                    ),
+                ));
+            }
             // 用「直接子项」范围（SearchScope::Children → parent:"<folder>"）：
             // 无排除项时 query 为空串，等价于列出该目录全部直接子项，不递归。
             match plugin::search::search_in_folder(
                 &folder,
                 &query,
-                0,
-                500,
+                offset,
+                max_results,
                 10_000,
                 plugin::search::SearchOptions::for_scope(plugin::search::SearchScope::Children),
             ) {
@@ -358,11 +377,15 @@ pub fn dispatch(name: &str, args: &Value) -> Result<ToolOutput, (i32, String)> {
                             })
                         })
                         .collect();
+                    let returned = entries.len();
                     let text = serde_json::to_string_pretty(&json!({
                         "folder": folder,
                         "exclude": excludes,
-                        "count": entries.len(),
+                        "offset": outcome.offset,
+                        "count": returned,
                         "total": outcome.total,
+                        // 还有子项没返回 —— 用 offset 翻下一页（与 search_in_folder 同形）。
+                        "truncated": outcome.offset + returned < outcome.total,
                         "items": entries,
                     }))
                     .unwrap_or_else(|_| "{}".into());

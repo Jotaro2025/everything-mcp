@@ -632,6 +632,30 @@ fn list_folder_description_documents_zero_folder_size() {
     let desc = list["tools"][1]["description"].as_str().unwrap();
     assert!(desc.contains("size 0"), "desc: {desc}");
     assert!(desc.contains("recursive"));
+    // 大目录必须能翻页：说明里点名 offset/total/truncated，schema 里给出硬窗口。
+    assert!(desc.contains("page through with 'offset'"), "desc: {desc}");
+    assert!(desc.contains("'truncated'"), "desc: {desc}");
+    let schema = &list["tools"][1]["inputSchema"];
+    assert_eq!(schema["properties"]["max_results"]["maximum"], 500);
+    assert_eq!(schema["properties"]["max_results"]["minimum"], 1);
+    assert_eq!(schema["properties"]["offset"]["default"], 0);
+}
+
+#[test]
+fn list_folder_window_is_validated_before_touching_everything() {
+    // 0 与 501 都是写错（0 不是「不限」）—— 在触达 Everything 之前报错，
+    // 所以这条测试在没有主程序的环境里也能跑。
+    // 注意合法窗口不能在这里断言「没被拒」：那会走到搜索层，而 Host::get()
+    // 在测试进程里没有 PM_INIT，直接 panic（这是本仓库的既有约定）。
+    for bad in [0, 501] {
+        let err = tools::dispatch(
+            "list_folder",
+            &json!({"folder": "C:\\", "max_results": bad}),
+        )
+        .unwrap_err();
+        assert_eq!(err.0, protocol::INVALID_PARAMS, "max_results={bad}");
+        assert!(err.1.contains("between 1 and 500"), "{}", err.1);
+    }
 }
 
 #[test]

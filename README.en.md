@@ -157,8 +157,8 @@ Outputs (in `installer\dist\`):
 
 | Installer                            | Arch | Embedded plugin dll   |
 | ------------------------------------ | ---- | --------------------- |
-| `everything-mcp-1.1.3-x64-setup.exe` | x64  | `everything_mcp64.dll` |
-| `everything-mcp-1.1.3-x86-setup.exe` | x86  | `everything_mcp32.dll` |
+| `everything-mcp-1.1.4-x64-setup.exe` | x64  | `everything_mcp64.dll` |
+| `everything-mcp-1.1.4-x86-setup.exe` | x86  | `everything_mcp32.dll` |
 
 To install, run the installer for your architecture; Everything then shows its
 "Setup Plugin" dialog, where you click Install. Both installers can be
@@ -383,6 +383,11 @@ modification / creation time.
   when unavailable).
 - The response also carries `total` (number of direct children, after
   exclusions).
+- **Page through big directories**: `max_results` defaults to 500 (and caps at
+  500), with `offset` to move on. When `count` < `total` there is another page,
+  and `truncated` states that outright. A busy directory can hold thousands of
+  children (`C:\Windows\System32` measures ~4900), and the older fixed cap of
+  500 with no `offset` made everything past the 501st child unreachable.
 
 #### 3. `count`
 

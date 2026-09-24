@@ -461,7 +461,7 @@ pub fn make_tools_list(mode: GlobalSearchMode) -> Value {
             },
             {
                 "name": "list_folder",
-                "description": "List immediate children of a folder (non-recursive). Returns both files and sub-folders; folder entries always report size 0 (Everything does not compute directory sizes). Each entry also carries 'modified'/'created' (ISO 8601 UTC). Use search_in_folder when you need the whole tree. Pass 'exclude' to skip children such as '.git', 'obj', 'node_modules'. Search scope follows Everything's index: local drives are included automatically, but a network share is only searchable after being added in Tools > Options > Indexes > Folders — an un-indexed share yields 0 results, not an error.",
+                "description": "List immediate children of a folder (non-recursive). Returns both files and sub-folders; folder entries always report size 0 (Everything does not compute directory sizes). Each entry also carries 'modified'/'created' (ISO 8601 UTC). Use search_in_folder when you need the whole tree. Pass 'exclude' to skip children such as '.git', 'obj', 'node_modules'. Results are capped by 'max_results' (1..500, default 500) and carry a separate 'total' of all children — when 'count' < 'total', page through with 'offset' (a busy directory can hold thousands of children, e.g. C:\\Windows\\System32 has ~4900). 'truncated' says whether more children remain. Search scope follows Everything's index: local drives are included automatically, but a network share is only searchable after being added in Tools > Options > Indexes > Folders — an un-indexed share yields 0 results, not an error.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -470,6 +470,18 @@ pub fn make_tools_list(mode: GlobalSearchMode) -> Value {
                             "type": ["string", "array"],
                             "items": { "type": "string" },
                             "description": "Terms to exclude, appended as Everything NOT operators. Accepts a string or an array of strings."
+                        },
+                        "offset": {
+                            "type": "integer",
+                            "description": "Index of the first child to return, for paging a large directory: when 'count' < 'total', re-query with 'offset' advanced by 'count'. Default 0.",
+                            "default": 0
+                        },
+                        "max_results": {
+                            "type": "integer",
+                            "description": "Maximum number of children to return (1..500). Default 500.",
+                            "default": 500,
+                            "minimum": 1,
+                            "maximum": 500
                         }
                     },
                     "required": ["folder"]
