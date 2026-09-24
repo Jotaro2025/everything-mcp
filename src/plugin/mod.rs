@@ -17,6 +17,7 @@ pub mod read;
 pub mod search;
 pub mod sensitive;
 pub mod state;
+pub mod stats;
 pub mod timefmt;
 
 // PM_* 消息常量 —— 按 everything_plugin.h 的顺序原样抄录，勿凭直觉调整：

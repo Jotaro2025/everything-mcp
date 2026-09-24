@@ -33,6 +33,7 @@ use serde_json::Value;
 
 use super::protocol;
 use super::tools;
+use crate::plugin::stats;
 
 /// 全局服务句柄 —— 让 PM_STOP 能找到当前运行的服务线程。
 static SERVER: OnceLock<ServerHandle> = OnceLock::new();
@@ -97,6 +98,7 @@ fn run_listener(listener: TcpListener, shutdown: std::sync::Arc<AtomicBool>) {
         match listener.accept() {
             Ok((stream, peer)) => {
                 // 每个连接一个工作线程；MCP 调用通常很轻，无需连接池。
+                stats::record_connection();
                 let _ = peer;
                 let s_clone = shutdown.clone();
                 let _ = thread::Builder::new()
@@ -315,6 +317,7 @@ pub fn dispatch_rpc(body: &str) -> String {
 ///   - modern（2026-07-28）：server/discover、未知方法 404、通知 202 空体；
 ///   - legacy（2024-11-05 或未声明）：initialize 握手、200 + JSON-RPC 错误体。
 pub fn dispatch_rpc_http(body: &str, head: &RequestHead) -> (u16, String) {
+    stats::record_request();
     // 可能有批量和单条两种；MCP 客户端实际只发单条，这里也只处理单条。
     let parsed: protocol::JsonRpcMessage = match serde_json::from_str(body) {
         Ok(m) => m,
@@ -427,7 +430,9 @@ pub fn dispatch_rpc_http(body: &str, head: &RequestHead) -> (u16, String) {
         "tools/call" => {
             let name = params.get("name").and_then(Value::as_str).unwrap_or("");
             let args = params.get("arguments").cloned().unwrap_or(Value::Null);
-            match tools::dispatch(name, &args) {
+            let idx = stats::tool_index(name);
+            let t0 = std::time::Instant::now();
+            let resp = match tools::dispatch(name, &args) {
                 Ok((content, is_error)) => {
                     let mut result = serde_json::json!(content);
                     if is_error {
@@ -436,7 +441,12 @@ pub fn dispatch_rpc_http(body: &str, head: &RequestHead) -> (u16, String) {
                     protocol::ok_response(&id, protocol::with_result_type(result, modern))
                 }
                 Err((code, msg)) => protocol::error_response(&id, code, &msg),
-            }
+            };
+            // 三类结果都要记：Ok((_,false))=ok、Ok((_,true))/Err(_)=err。
+            let ok = stats::dispatch_ok_flag(&resp).unwrap_or(false);
+            let bytes = encode(&resp).len() as u64;
+            stats::record_call(idx, ok, t0.elapsed().as_millis() as u64, bytes);
+            resp
         }
         _ => {
             // modern：未知方法 404 + JSON-RPC 错误体；legacy：保持 200。

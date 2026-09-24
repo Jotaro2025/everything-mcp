@@ -24,6 +24,10 @@ pub mod mcp;
 mod options;
 mod plugin;
 
+/// 暴露统计模块给 tests/ 下的集成测试（验证三类结果分类）。
+/// 运行期仍走 plugin::stats 内部路径，这里只是再导出一份。
+pub use plugin::stats as stats;
+
 use core::ffi::c_void;
 use std::ffi::CStr;
 

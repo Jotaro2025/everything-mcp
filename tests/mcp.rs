@@ -1728,3 +1728,57 @@ fn end_to_end_over_real_tcp() {
 
     server::stop();
 }
+
+// ====================================================================
+// 统计：三类结果分类（Ok-false / Ok-true / Err）
+// ====================================================================
+
+/// 验证 `stats::dispatch_ok_flag` 对三类 tools/call 结果的分类正确：
+///   - `Ok((_, false))` → result 无 isError → 成功
+///   - `Ok((_, true))`  → result.isError == true → 失败
+///   - `Err(_)`         → 响应是 error 对象 → 失败
+#[test]
+fn stats_classifies_three_tool_outcomes() {
+    use everything_mcp::stats;
+
+    // Ok((_, false))：result 无 isError 字段 → 成功。
+    let ok_resp = protocol::ok_response(
+        &Some(serde_json::json!(1)),
+        serde_json::json!({"content": [{"type": "text", "text": "hi"}]}),
+    );
+    assert_eq!(stats::dispatch_ok_flag(&ok_resp), Some(true));
+
+    // Ok((_, true))：result.isError == true → 失败。
+    let err_flag_resp = protocol::ok_response(
+        &Some(serde_json::json!(2)),
+        serde_json::json!({"content": [{"type": "text", "text": "bad"}], "isError": true}),
+    );
+    assert_eq!(stats::dispatch_ok_flag(&err_flag_resp), Some(false));
+
+    // Err((code, msg))：响应是 error 对象 → 失败。
+    let rpc_err_resp = protocol::error_response(
+        &Some(serde_json::json!(3)),
+        protocol::INVALID_PARAMS,
+        "invalid params",
+    );
+    assert_eq!(stats::dispatch_ok_flag(&rpc_err_resp), Some(false));
+}
+
+/// 验证 `stats::record_call` 能正确累加到对应工具槽位，且 ok/err 分开累计。
+#[test]
+fn stats_record_call_accumulates_per_tool() {
+    use everything_mcp::stats;
+
+    let before = stats::snapshot();
+    let idx = stats::tool_index("read_file");
+    stats::record_call(idx, true, 10, 100);
+    stats::record_call(idx, true, 20, 200);
+    stats::record_call(idx, false, 5, 50);
+    let after = stats::snapshot();
+
+    assert_eq!(after.tools[idx].calls, before.tools[idx].calls + 3);
+    assert_eq!(after.tools[idx].ok, before.tools[idx].ok + 2);
+    assert_eq!(after.tools[idx].err, before.tools[idx].err + 1);
+    assert_eq!(after.tools[idx].total_ms, before.tools[idx].total_ms + 35);
+    assert_eq!(after.tools[idx].bytes_out, before.tools[idx].bytes_out + 350);
+}

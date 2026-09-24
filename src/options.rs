@@ -92,6 +92,32 @@ const PAGE_MIN_HIGH: i32 = 155;
 /// http_server_enable_options_apply 用的同一个值）。
 const OPTIONS_APPLY_BUTTON_ID: i32 = 1001;
 
+// ============================================================
+// 双页：MCP 设置页 + Statistics 只读页
+// ============================================================
+
+/// Statistics 页的 `user_data` 哨兵指针 —— 注册时传入一个静态量地址，
+/// 后续 load_page / size_page / page_proc / save_page / minmax / kill_page
+/// 按回调结构体里的 `user_data` 字段分流到两套逻辑。`page_hwnd` 在
+/// PM_KILL_OPTIONS_PAGE 里拿不到，`user_data` 是唯一可靠的页标识。
+static STATS_PAGE_MARKER: u8 = 0;
+
+fn is_stats_page(user_data: *mut c_void) -> bool {
+    user_data == core::ptr::addr_of!(STATS_PAGE_MARKER) as *mut c_void
+}
+
+/// Statistics 页控件 ID（与 MCP 页不重叠，页面内唯一即可）。
+const ID_STATS_TOTAL: i32 = 20;
+const ID_STATS_CONNECTIONS: i32 = 21;
+const ID_STATS_REQUESTS: i32 = 22;
+const ID_STATS_TABLE_HEADER: i32 = 23;
+const ID_STATS_ROW_BASE: i32 = 30; // 30..=36 共 7 行工具
+const ID_STATS_CLEAR: i32 = 50;
+
+/// Statistics 页最小尺寸（比 MCP 页高 —— 行数更多）。
+const STATS_PAGE_MIN_WIDE: i32 = 260;
+const STATS_PAGE_MIN_HIGH: i32 = 220;
+
 /// host 未提供文本宽度测量函数时，标签列的兜底宽度（逻辑像素）。
 const FALLBACK_STATIC_WIDE: i32 = 90;
 
@@ -212,7 +238,9 @@ pub fn mark_stopped() {
     state().running = None;
 }
 
-/// PM_ADD_OPTIONS_PAGES：在 Everything 选项对话框里注册设置页。
+/// PM_ADD_OPTIONS_PAGES：在 Everything 选项对话框里注册两页 ——
+/// MCP 设置页（`user_data=null`）+ Statistics 只读页（`user_data=STATS_PAGE_MARKER`）。
+/// 多页注册 SDK 未验证过，这里直接做，实机验证；不行退到「MCP 页底部加统计区块」。
 pub fn add_page(data: *mut c_void) -> *mut c_void {
     let host = Host::get();
     let add = match host.ui_options_add_plugin_page {
@@ -222,9 +250,19 @@ pub fn add_page(data: *mut c_void) -> *mut c_void {
             return core::ptr::null_mut();
         }
     };
-    let name = cstr_bytes(labels().page_name);
-    unsafe { add(data, core::ptr::null_mut(), name.as_ptr()) };
-    diag::write("options: settings page registered");
+    let name_mcp = cstr_bytes(labels().page_name);
+    unsafe { add(data, core::ptr::null_mut(), name_mcp.as_ptr()) };
+    diag::write("options: MCP settings page registered");
+
+    let name_stats = cstr_bytes(labels().stats_page_name);
+    unsafe {
+        add(
+            data,
+            core::ptr::addr_of!(STATS_PAGE_MARKER) as *mut c_void,
+            name_stats.as_ptr(),
+        )
+    };
+    diag::write("options: Statistics page registered");
     abi_ok()
 }
 
@@ -234,6 +272,9 @@ pub fn load_page(data: *mut c_void) -> *mut c_void {
         return core::ptr::null_mut();
     }
     let page = unsafe { &*(data as *const LoadOptionsPage) };
+    if is_stats_page(page.user_data) {
+        return load_stats_page(page);
+    }
     let host = Host::get();
 
     // 控件工厂函数任一缺失就放弃建页。正常不会发生 —— 能注册页面
@@ -398,6 +439,10 @@ pub fn save_page(data: *mut c_void) -> *mut c_void {
         return core::ptr::null_mut();
     }
     let page = unsafe { &mut *(data as *mut SaveOptionsPage) };
+    if is_stats_page(page.user_data) {
+        // Statistics 页只读，无任何可保存内容 —— 空转返回，不碰 Apply。
+        return abi_ok();
+    }
     let page_hwnd = page.page_hwnd;
 
     let enabled = unsafe { is_checked(page_hwnd, ID_ENABLED) };
@@ -437,8 +482,13 @@ pub fn minmax(data: *mut c_void) -> *mut c_void {
         return core::ptr::null_mut();
     }
     let p = unsafe { &mut *(data as *mut GetOptionsPageMinMax) };
-    p.wide = PAGE_MIN_WIDE;
-    p.high = PAGE_MIN_HIGH;
+    if is_stats_page(p.user_data) {
+        p.wide = STATS_PAGE_MIN_WIDE;
+        p.high = STATS_PAGE_MIN_HIGH;
+    } else {
+        p.wide = PAGE_MIN_WIDE;
+        p.high = PAGE_MIN_HIGH;
+    }
     abi_ok()
 }
 
@@ -448,6 +498,9 @@ pub fn size_page(data: *mut c_void) -> *mut c_void {
         return core::ptr::null_mut();
     }
     let p = unsafe { &*(data as *const SizeOptionsPage) };
+    if is_stats_page(p.user_data) {
+        return size_stats_page(p.page_hwnd);
+    }
     let page_hwnd = p.page_hwnd;
     let (mut wide, mut high) = client_size_logical(page_hwnd);
 
@@ -545,6 +598,9 @@ pub fn page_proc(data: *mut c_void) -> *mut c_void {
         return core::ptr::null_mut();
     }
     let p = unsafe { &*(data as *const OptionsPageProc) };
+    if is_stats_page(p.user_data) {
+        return stats_page_proc(p);
+    }
     if p.msg != WM_COMMAND {
         // 其它消息不处理（http_server.c 同样直接放过）。
         return abi_ok();
@@ -581,6 +637,208 @@ pub fn page_proc(data: *mut c_void) -> *mut c_void {
 /// PM_KILL_OPTIONS_PAGE：控件由主程序创建和销毁，插件无自有资源。
 pub fn kill_page(_data: *mut c_void) -> *mut c_void {
     abi_ok()
+}
+
+// ============================================================
+// Statistics 只读页
+// ============================================================
+
+/// 创建 Statistics 页控件：汇总行 + 表头 + 7 行工具明细 + 清空按钮。
+fn load_stats_page(page: &LoadOptionsPage) -> *mut c_void {
+    let host = Host::get();
+    let create_static = match host.os_create_static {
+        Some(f) => f,
+        None => return core::ptr::null_mut(),
+    };
+    let create_button = match host.os_create_button {
+        Some(f) => f,
+        None => return core::ptr::null_mut(),
+    };
+    let add_tooltip = host.os_add_tooltip;
+
+    let labels = labels();
+    let snap = crate::plugin::stats::snapshot();
+
+    let total_calls: u64 = snap.tools.iter().map(|t| t.calls).sum();
+    let total_text = format!("{} {}", labels.stats_total, total_calls);
+    let conn_text = format!("{} {}", labels.stats_connections, snap.global.connections);
+    let req_text = format!("{} {}", labels.stats_requests, snap.global.requests_total);
+
+    let page_hwnd = page.page_hwnd;
+    unsafe {
+        create_static(
+            page_hwnd,
+            ID_STATS_TOTAL,
+            SS_LEFTNOWORDWRAP | WS_GROUP,
+            cstr_bytes(&total_text).as_ptr(),
+        );
+        create_static(
+            page_hwnd,
+            ID_STATS_CONNECTIONS,
+            SS_LEFTNOWORDWRAP,
+            cstr_bytes(&conn_text).as_ptr(),
+        );
+        create_static(
+            page_hwnd,
+            ID_STATS_REQUESTS,
+            SS_LEFTNOWORDWRAP,
+            cstr_bytes(&req_text).as_ptr(),
+        );
+        create_static(
+            page_hwnd,
+            ID_STATS_TABLE_HEADER,
+            SS_LEFTNOWORDWRAP | WS_GROUP,
+            cstr_bytes(labels.stats_table_header).as_ptr(),
+        );
+        for (i, name) in crate::plugin::stats::TOOL_NAMES.iter().enumerate() {
+            let s = &snap.tools[i];
+            let row = format!(
+                "{:<26} {:>6}  {:>5}  {:>5}  {:>8}  {:>8}",
+                name,
+                s.calls,
+                s.ok,
+                s.err,
+                s.avg_ms(),
+                s.bytes_out / 1024
+            );
+            create_static(
+                page_hwnd,
+                ID_STATS_ROW_BASE + i as i32,
+                SS_LEFTNOWORDWRAP,
+                cstr_bytes(&row).as_ptr(),
+            );
+        }
+        create_button(
+            page_hwnd,
+            ID_STATS_CLEAR,
+            WS_GROUP,
+            cstr_bytes(labels.stats_clear).as_ptr(),
+        );
+        if let Some(tt) = add_tooltip {
+            tt(
+                page.tooltip_hwnd,
+                page_hwnd,
+                ID_STATS_CLEAR,
+                cstr_bytes(labels.stats_clear_help).as_ptr(),
+            );
+        }
+    }
+    diag::write("options: stats page loaded");
+    abi_ok()
+}
+
+/// Statistics 页布局：顶部汇总三行 + 表头 + 7 行工具 + 底部清空按钮。
+fn size_stats_page(page_hwnd: HWND) -> *mut c_void {
+    let (mut wide, mut high) = client_size_logical(page_hwnd);
+    let x = 12;
+    let mut y = 12;
+    wide -= 24;
+    high -= 24;
+
+    let row_high = DLG_STATIC_HIGH;
+    let sep = 3;
+
+    set_rect(page_hwnd, ID_STATS_TOTAL, x, y, wide, row_high);
+    y += row_high + sep;
+    set_rect(page_hwnd, ID_STATS_CONNECTIONS, x, y, wide, row_high);
+    y += row_high + sep;
+    set_rect(page_hwnd, ID_STATS_REQUESTS, x, y, wide, row_high);
+    y += row_high + sep + 3;
+
+    set_rect(page_hwnd, ID_STATS_TABLE_HEADER, x, y, wide, row_high);
+    y += row_high + sep;
+    for i in 0..crate::plugin::stats::TOOL_NAMES.len() {
+        set_rect(page_hwnd, ID_STATS_ROW_BASE + i as i32, x, y, wide, row_high);
+        y += row_high + sep;
+    }
+
+    let labels = labels();
+    let button_wide = expand_min_wide(page_hwnd, labels.stats_clear, 75 - 24) + 24;
+    set_rect(
+        page_hwnd,
+        ID_STATS_CLEAR,
+        x + wide - button_wide,
+        12 + high - DLG_BUTTON_HIGH,
+        button_wide,
+        DLG_BUTTON_HIGH,
+    );
+    abi_ok()
+}
+
+/// Statistics 页 WM_COMMAND：只处理清空按钮。
+fn stats_page_proc(p: &OptionsPageProc) -> *mut c_void {
+    if p.msg != WM_COMMAND {
+        return abi_ok();
+    }
+    let id = (p.wparam & 0xffff) as i32;
+    if id == ID_STATS_CLEAR {
+        // 两步确认：点一次变「再点一次确认」，再点才真正清空。
+        // SDK 的 ui_task_dialog_show 是 varargs，Rust FFI 不便调用，
+        // 用按钮文案自翻转做轻量确认。
+        static ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        let armed = ARMED.load(std::sync::atomic::Ordering::Relaxed);
+        if !armed {
+            ARMED.store(true, std::sync::atomic::Ordering::Relaxed);
+            if let Some(f) = Host::get().os_set_dlg_text {
+                let t = cstr_bytes("再点一次确认");
+                unsafe { f(p.page_hwnd, ID_STATS_CLEAR, t.as_ptr()) };
+            }
+        } else {
+            ARMED.store(false, std::sync::atomic::Ordering::Relaxed);
+            crate::plugin::stats::reset();
+            refresh_stats_page_text(p.page_hwnd);
+        }
+    }
+    abi_ok()
+}
+
+/// 清空后把 Statistics 页文本重置为全 0。
+fn refresh_stats_page_text(page_hwnd: HWND) {
+    let host = Host::get();
+    let set_text = match host.os_set_dlg_text {
+        Some(f) => f,
+        None => return,
+    };
+    let labels = labels();
+    let snap = crate::plugin::stats::snapshot();
+    let total_calls: u64 = snap.tools.iter().map(|t| t.calls).sum();
+    let texts: Vec<(i32, String)> = vec![
+        (
+            ID_STATS_TOTAL,
+            format!("{} {}", labels.stats_total, total_calls),
+        ),
+        (
+            ID_STATS_CONNECTIONS,
+            format!("{} {}", labels.stats_connections, snap.global.connections),
+        ),
+        (
+            ID_STATS_REQUESTS,
+            format!("{} {}", labels.stats_requests, snap.global.requests_total),
+        ),
+    ];
+    unsafe {
+        for (id, t) in texts {
+            let b = cstr_bytes(&t);
+            set_text(page_hwnd, id, b.as_ptr());
+        }
+        for (i, name) in crate::plugin::stats::TOOL_NAMES.iter().enumerate() {
+            let s = &snap.tools[i];
+            let row = format!(
+                "{:<26} {:>6}  {:>5}  {:>5}  {:>8}  {:>8}",
+                name,
+                s.calls,
+                s.ok,
+                s.err,
+                s.avg_ms(),
+                s.bytes_out / 1024
+            );
+            let b = cstr_bytes(&row);
+            set_text(page_hwnd, ID_STATS_ROW_BASE + i as i32, b.as_ptr());
+        }
+        // 按钮文案恢复。
+        let b = cstr_bytes(labels.stats_clear);
+        set_text(page_hwnd, ID_STATS_CLEAR, b.as_ptr());
+    }
 }
 
 /// PM_SAVE_SETTINGS：把当前设置写回主程序的设置输出流（最终落盘到
@@ -855,6 +1113,14 @@ struct Labels {
     global_allow_help: &'static str,
     restore: &'static str,
     restore_help: &'static str,
+    // ---- Statistics 页 ----
+    stats_page_name: &'static str,
+    stats_total: &'static str,
+    stats_connections: &'static str,
+    stats_requests: &'static str,
+    stats_table_header: &'static str,
+    stats_clear: &'static str,
+    stats_clear_help: &'static str,
 }
 
 const LABELS_EN: Labels = Labels {
@@ -874,6 +1140,13 @@ const LABELS_EN: Labels = Labels {
     global_allow_help: "search_everywhere works directly without a confirmation prompt: it searches all indexed locations by file name and returns full paths.",
     restore: "Restore Defaults",
     restore_help: "Reset to 127.0.0.1:8285 with the server disabled and global search set to Deny.",
+    stats_page_name: "Statistics",
+    stats_total: "Total calls:",
+    stats_connections: "Connections:",
+    stats_requests: "Requests:",
+    stats_table_header: "Tool                      Calls   OK    Err   Avg(ms)  Out(KiB)",
+    stats_clear: "Clear Statistics",
+    stats_clear_help: "Reset all counters to zero and delete the local stats file.",
 };
 
 const LABELS_ZH: Labels = Labels {
@@ -893,6 +1166,13 @@ const LABELS_ZH: Labels = Labels {
     global_allow_help: "search_everywhere 直接可用，不再弹确认框：按文件名搜索全部已索引位置，返回完整路径。",
     restore: "恢复默认",
     restore_help: "恢复为 127.0.0.1:8285、不启用服务、全局搜索为「拒绝」。",
+    stats_page_name: "统计",
+    stats_total: "总调用次数：",
+    stats_connections: "连接数：",
+    stats_requests: "请求数：",
+    stats_table_header: "工具                      调用   成功   出错   平均(ms)  输出(KiB)",
+    stats_clear: "清空统计",
+    stats_clear_help: "清零所有计数并删除本地统计文件。",
 };
 
 /// 按主程序界面语言取文案（探测一次后缓存）。
