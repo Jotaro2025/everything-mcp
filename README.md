@@ -142,8 +142,8 @@ powershell -ExecutionPolicy Bypass -File build-installers.ps1
 
 | 安装包                              | 架构 | 内嵌插件 dll           |
 | ----------------------------------- | ---- | ---------------------- |
-| `everything-mcp-1.1.5-x64-setup.exe` | x64  | `everything_mcp64.dll` |
-| `everything-mcp-1.1.5-x86-setup.exe` | x86  | `everything_mcp32.dll` |
+| `everything-mcp-1.1.6-x64-setup.exe` | x64  | `everything_mcp64.dll` |
+| `everything-mcp-1.1.6-x86-setup.exe` | x86  | `everything_mcp32.dll` |
 
 安装：运行对应架构的安装包 → Everything 弹出「设置插件」对话框 → 点「安装」。
 两个安装包可以一起分发，`Plugins\` 下 `everything_mcp64.dll` 与
@@ -553,7 +553,17 @@ UNC 网络共享与本地盘同权。搜索范围以 Everything 的索引为准 
 
 `index_changes` 的入参全部可选，校验规则同上：坏 `action`、越界的
 `max_results`（1–2000）、格式不对的时间戳、`since` 晚于 `until`，都在
-触达文件系统之前返回 `-32602`。
+触达文件系统之前返回 `-32602`。所有数值窗口的边界都写进了 JSON Schema 的
+`minimum` / `maximum`，客户端据此提前拦下越界值，不必等打到服务端才报错。
+
+**空结果会被解释**：`search_in_folder` / `list_folder` / `count` / `grep` 在
+「一条都没匹配」时会顺手探一下目录，路径不存在、不可访问、或根本不是目录时，
+响应里多一个 `folder_warning` 说明原因 —— 于是「目录确实是空的」与「路径写错了」
+不再长得一模一样。**这是软信号而不是报错**，这点很关键：网络共享没加进索引、
+或共享当前离线时本来就该返回 0 条，那是合法用法（NAS 场景正是它），改成报错会把
+它们误判成参数错误。探测只在结果为空时才做，正常路径上不付任何代价；反过来，
+对离线共享的那次 stat 可能阻塞到 SMB 超时，所以代价只落在「反正什么都没搜到」
+的调用上。
 
 #### 手动验证（curl）
 

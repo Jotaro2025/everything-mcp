@@ -228,6 +228,12 @@ fn index_changes_description_and_schema_document_the_gotchas() {
         action["enum"],
         json!(["created", "modified", "deleted", "renamed", "moved", "any"])
     );
+    // max_results 的边界要声明出来（不能只写在描述文字里）：客户端据此提前
+    // 拦下越界值，否则坏值要打到服务端才变成 -32602。上限与
+    // tools.rs 的 INDEX_CHANGES_LIMIT 一致。
+    let max_results = &tool["inputSchema"]["properties"]["max_results"];
+    assert_eq!(max_results["minimum"], 1);
+    assert_eq!(max_results["maximum"], 2000);
     // 描述里必须给出时间参数的形状范例，否则 LLM 会乱写。
     let since = tool["inputSchema"]["properties"]["since"]["description"]
         .as_str()
@@ -538,6 +544,26 @@ fn grep_description_documents_the_contract() {
         .as_str()
         .unwrap()
         .contains("regular expression"));
+
+    // head_limit 的边界要声明出来（与 tools.rs 的 MAX_HEAD_LIMIT 一致）。
+    assert_eq!(props["head_limit"]["minimum"], 1);
+    assert_eq!(props["head_limit"]["maximum"], 2000);
+}
+
+#[test]
+fn empty_results_can_carry_a_folder_warning() {
+    // 空结果与「路径写错」原先无法区分：四个 folder 类工具现在都会在
+    // 空结果时附一句 folder_warning，描述里必须写明这个字段，否则 LLM 看到
+    // 一个不认识的键会直接忽略。
+    let list = protocol::make_tools_list(protocol::GlobalSearchMode::Deny);
+    for idx in [0, 1, 2, 5] {
+        let name = list["tools"][idx]["name"].as_str().unwrap();
+        let desc = list["tools"][idx]["description"].as_str().unwrap();
+        assert!(
+            desc.contains("folder_warning"),
+            "{name} 的描述要点明 folder_warning: {desc}"
+        );
+    }
 }
 
 #[test]

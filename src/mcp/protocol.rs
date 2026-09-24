@@ -397,7 +397,7 @@ pub fn make_tools_list(mode: GlobalSearchMode) -> Value {
         "tools": [
             {
                 "name": "search_in_folder",
-                "description": "Search files/folders recursively under a specific folder using Everything search syntax. Prefer this over global search when working within a project directory. This is not shell glob: use '*.rs', not '**/*.rs' (a leading '**/' is stripped for you); exclude matches with a '!' prefix (e.g. 'ext:rs !test') or the 'exclude' parameter (e.g. ['\\obj\\', '\\.git\\'] to drop build/VCS noise); 'content:\"fn main\"' searches file contents (it works with no content index on the Everything side, but an unfiltered content search over a large tree is slow enough to time out — narrow it with 'ext:', a subfolder or 'exclude', or raise 'timeout_ms'). Each result carries 'size' plus 'modified'/'created' (ISO 8601 UTC). The response reports both 'count' (entries returned, capped by max_results) and 'total' (all matches found) — when they differ, page through with 'offset'. Results are sorted by 'sort' (default name ascending). Search scope follows Everything's index: local drives are included automatically, but a network share is only searchable after being added in Tools > Options > Indexes > Folders — an un-indexed share yields 0 results, not an error.",
+                "description": "Search files/folders recursively under a specific folder using Everything search syntax. Prefer this over global search when working within a project directory. This is not shell glob: use '*.rs', not '**/*.rs' (a leading '**/' is stripped for you); exclude matches with a '!' prefix (e.g. 'ext:rs !test') or the 'exclude' parameter (e.g. ['\\obj\\', '\\.git\\'] to drop build/VCS noise); 'content:\"fn main\"' searches file contents (it works with no content index on the Everything side, but an unfiltered content search over a large tree is slow enough to time out — narrow it with 'ext:', a subfolder or 'exclude', or raise 'timeout_ms'). Each result carries 'size' plus 'modified'/'created' (ISO 8601 UTC). The response reports both 'count' (entries returned, capped by max_results) and 'total' (all matches found) — when they differ, page through with 'offset'. Results are sorted by 'sort' (default name ascending). When nothing matches, the response adds a 'folder_warning' if the folder does not exist, is unreachable, or is a file — so an empty result is distinguishable from a wrong path. Search scope follows Everything's index: local drives are included automatically, but a network share is only searchable after being added in Tools > Options > Indexes > Folders — an un-indexed share yields 0 results, not an error.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -461,7 +461,7 @@ pub fn make_tools_list(mode: GlobalSearchMode) -> Value {
             },
             {
                 "name": "list_folder",
-                "description": "List immediate children of a folder (non-recursive). Returns both files and sub-folders; folder entries always report size 0 (Everything does not compute directory sizes). Each entry also carries 'modified'/'created' (ISO 8601 UTC). Use search_in_folder when you need the whole tree. Pass 'exclude' to skip children such as '.git', 'obj', 'node_modules'. Results are capped by 'max_results' (1..500, default 500) and carry a separate 'total' of all children — when 'count' < 'total', page through with 'offset' (a busy directory can hold thousands of children, e.g. C:\\Windows\\System32 has ~4900). 'truncated' says whether more children remain. Search scope follows Everything's index: local drives are included automatically, but a network share is only searchable after being added in Tools > Options > Indexes > Folders — an un-indexed share yields 0 results, not an error.",
+                "description": "List immediate children of a folder (non-recursive). Returns both files and sub-folders; folder entries always report size 0 (Everything does not compute directory sizes). Each entry also carries 'modified'/'created' (ISO 8601 UTC). Use search_in_folder when you need the whole tree. Pass 'exclude' to skip children such as '.git', 'obj', 'node_modules'. Results are capped by 'max_results' (1..500, default 500) and carry a separate 'total' of all children — when 'count' < 'total', page through with 'offset' (a busy directory can hold thousands of children, e.g. C:\\Windows\\System32 has ~4900). 'truncated' says whether more children remain. When the folder is empty, the response adds a 'folder_warning' if it does not exist, is unreachable, or is a file — so an empty result is distinguishable from a wrong path. Search scope follows Everything's index: local drives are included automatically, but a network share is only searchable after being added in Tools > Options > Indexes > Folders — an un-indexed share yields 0 results, not an error.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -489,7 +489,7 @@ pub fn make_tools_list(mode: GlobalSearchMode) -> Value {
             },
             {
                 "name": "count",
-                "description": "Count files/folders matching a pattern within a folder (recursive), without fetching names. Fast path over search_in_folder — no per-entry names or paths are materialized. Supports the same 'exclude' terms as search_in_folder.",
+                "description": "Count files/folders matching a pattern within a folder (recursive), without fetching names. Fast path over search_in_folder — no per-entry names or paths are materialized. Supports the same 'exclude' terms as search_in_folder. When the count is 0, the response adds a 'folder_warning' if the folder does not exist, is unreachable, or is a file — so an empty result is distinguishable from a wrong path.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -533,8 +533,10 @@ pub fn make_tools_list(mode: GlobalSearchMode) -> Value {
                         },
                         "max_results": {
                             "type": "integer",
-                            "description": "Maximum number of changes to return, newest first (default 50).",
-                            "default": 50
+                            "description": "Maximum number of changes to return, newest first (default 50, max 2000).",
+                            "default": 50,
+                            "minimum": 1,
+                            "maximum": 2000
                         }
                     }
                 }
@@ -567,7 +569,7 @@ pub fn make_tools_list(mode: GlobalSearchMode) -> Value {
             },
             {
                 "name": "grep",
-                "description": "Search file CONTENTS by regular expression and return the matching lines with their line numbers. This is the line-level companion to search_in_folder: that one uses Everything's index to answer WHICH files contain something (paths only), while grep reads the candidate files and reports the matching lines themselves. Candidates are still picked by the Everything index, so 'filter' decides how much actually gets read — an unfiltered grep over a large tree reads every file. Three internal caps bound that work: 2000 candidate files, 64 MiB read, and a 128 KiB budget on the matched text that is returned; 'truncated' plus 'candidates' / 'files_scanned' / 'bytes_scanned' tell you which one bit. 'pattern' is a Rust regex matched against each line individually, so '^' and '$' anchor to line boundaries and a pattern containing a literal newline can never match. 'filter' takes the same Everything syntax as search_in_folder's pattern ('ext:rs;toml', 'dm:lastweek', '!\\\\target\\\\') and is applied before any file is read — use it. 'output_mode' picks the shape: 'content' (default) returns {path, line, text} hits, 'filesWithMatches' returns just the paths, 'count' returns per-file hit counts. 'head_limit' caps matches (content) or files (other modes); default 200, max 2000 — the 128 KiB budget is the real limiter. Matched lines longer than 16384 characters are cut and counted in 'clipped_lines'. Binary files (by extension or by content sniff), files above 8 MiB and denylisted paths (private keys, .env, credentials, .git/objects) are skipped silently — grep never returns content from them. Results are ordered by file modification time, newest first. Prefer this over search_in_folder + read_file when you need to know WHERE inside the files something is.",
+                "description": "Search file CONTENTS by regular expression and return the matching lines with their line numbers. This is the line-level companion to search_in_folder: that one uses Everything's index to answer WHICH files contain something (paths only), while grep reads the candidate files and reports the matching lines themselves. Candidates are still picked by the Everything index, so 'filter' decides how much actually gets read — an unfiltered grep over a large tree reads every file. Three internal caps bound that work: 2000 candidate files, 64 MiB read, and a 128 KiB budget on the matched text that is returned; 'truncated' plus 'candidates' / 'files_scanned' / 'bytes_scanned' tell you which one bit. 'pattern' is a Rust regex matched against each line individually, so '^' and '$' anchor to line boundaries and a pattern containing a literal newline can never match. 'filter' takes the same Everything syntax as search_in_folder's pattern ('ext:rs;toml', 'dm:lastweek', '!\\\\target\\\\') and is applied before any file is read — use it. 'output_mode' picks the shape: 'content' (default) returns {path, line, text} hits, 'filesWithMatches' returns just the paths, 'count' returns per-file hit counts. 'head_limit' caps matches (content) or files (other modes); default 200, max 2000 — the 128 KiB budget is the real limiter. Matched lines longer than 16384 characters are cut and counted in 'clipped_lines'. Binary files (by extension or by content sniff), files above 8 MiB and denylisted paths (private keys, .env, credentials, .git/objects) are skipped silently — grep never returns content from them. Results are ordered by file modification time, newest first. Prefer this over search_in_folder + read_file when you need to know WHERE inside the files something is. When nothing matches, the response adds a 'folder_warning' if the folder does not exist, is unreachable, or is a file — so an empty result is distinguishable from a wrong path.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -592,7 +594,9 @@ pub fn make_tools_list(mode: GlobalSearchMode) -> Value {
                         "head_limit": {
                             "type": "integer",
                             "description": "Maximum matches (content) or files (other modes); default 200, max 2000.",
-                            "default": 200
+                            "default": 200,
+                            "minimum": 1,
+                            "maximum": 2000
                         },
                         "case_insensitive": {
                             "type": "boolean",

@@ -157,8 +157,8 @@ Outputs (in `installer\dist\`):
 
 | Installer                            | Arch | Embedded plugin dll   |
 | ------------------------------------ | ---- | --------------------- |
-| `everything-mcp-1.1.5-x64-setup.exe` | x64  | `everything_mcp64.dll` |
-| `everything-mcp-1.1.5-x86-setup.exe` | x86  | `everything_mcp32.dll` |
+| `everything-mcp-1.1.6-x64-setup.exe` | x64  | `everything_mcp64.dll` |
+| `everything-mcp-1.1.6-x86-setup.exe` | x86  | `everything_mcp32.dll` |
 
 To install, run the installer for your architecture; Everything then shows its
 "Setup Plugin" dialog, where you click Install. Both installers can be
@@ -655,7 +655,21 @@ regex, where collapsing `\\.` to `\.` would change its meaning.
 Every `index_changes` argument is optional, and the same validation rule
 applies: a bad `action`, an out-of-range `max_results` (1–2000), a
 malformed timestamp or `since` later than `until` all come back as
-`-32602` before any file is touched.
+`-32602` before any file is touched. Every numeric window also declares its
+`minimum` / `maximum` in the JSON Schema, so clients reject out-of-range values
+up front instead of waiting for the server to complain.
+
+**Empty results explain themselves.** When `search_in_folder` / `list_folder` /
+`count` / `grep` match nothing, they take one look at the folder: if it does not
+exist, cannot be accessed, or is not a directory at all, the response carries a
+`folder_warning` saying so — an empty directory and a misspelled path no longer
+look identical. **It is a soft signal, not an error**, and that distinction
+matters: a network share that was never added to the index, or one that is
+currently offline, is *supposed* to return 0 results — that is the NAS use case,
+and erroring out would misreport it as a bad argument. The probe only runs when
+the result is already empty, so a normal search pays nothing for it; conversely,
+that single stat against an offline share can block until the SMB timeout, which
+is why the cost is confined to calls that found nothing anyway.
 
 #### Verifying by hand (curl)
 

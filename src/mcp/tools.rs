@@ -132,6 +132,55 @@ fn u64_arg(args: &Value, key: &str, default: u64) -> Result<u64, (i32, String)> 
     }
 }
 
+/// 取 `timeout_ms`：必须是能装进 u32 的正整数。
+///
+/// 原先三处都是 `u64_arg(...)? as u32` —— 传 4294967296（2^32）截断成 0，
+/// 等待循环一次都不跑，调用方拿到 "search timeout after 0 ms" 这种毫无线索的
+/// 错误；0 同理（等价于立刻放弃），也按写错处理。这类「坏值静默变形」与
+/// exclude 的重复反斜杠是同一类毛病，一律改成带范围的显式校验。
+fn timeout_arg(args: &Value, default: u32) -> Result<u32, (i32, String)> {
+    let v = u64_arg(args, "timeout_ms", default as u64)?;
+    if v == 0 || v > u32::MAX as u64 {
+        return Err((
+            INVALID_PARAMS,
+            format!(
+                "'timeout_ms' must be between 1 and {}; received {}",
+                u32::MAX,
+                v
+            ),
+        ));
+    }
+    Ok(v as u32)
+}
+
+/// 目录可用性软信号：文件夹看起来不对劲时给一句话，正常时 None。
+///
+/// 为什么是软信号而不是报错：搜不到东西可能是「路径写错」，也可能是「网络共享
+/// 没加进 Everything 的索引」或「共享当前离线」—— 后两种是合法用法（本插件的
+/// NAS 场景正是它），报错会把它们误判成参数错误。所以结果照常返回，只在响应里
+/// 附一句 `folder_warning` 让调用方分得清。
+///
+/// **只在结果为空时才调用**（调用方负责）：一是正常路径上不做多余的磁盘探测，
+/// 二是探测本身对离线共享可能阻塞到 SMB 超时 —— 那种代价只该付在「反正什么
+/// 都没搜到」的调用上。
+fn folder_warning(folder: &str) -> Option<String> {
+    match std::fs::metadata(folder) {
+        Ok(m) if m.is_dir() => None,
+        Ok(_) => Some(format!(
+            "{:?} is a file, not a folder — nothing can be listed or searched under it; use read_file for its contents",
+            folder
+        )),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(format!(
+            "{:?} does not exist on this machine (or its drive/share is offline), so the empty result is expected — check the path. A network share also returns 0 results until it is added in Everything > Tools > Options > Indexes > Folders",
+            folder
+        )),
+        Err(e) => Some(format!(
+            "{:?} could not be accessed ({}), so the result may be incomplete — for a network share this usually means it is offline",
+            folder, e
+        )),
+    }
+}
+
 /// 取布尔参数：缺省用默认值。
 ///
 /// 只接受真正的 JSON 布尔 —— 字符串 `"false"` 会被 `Value::as_bool` 拒掉并报错。
@@ -286,7 +335,7 @@ pub fn dispatch(name: &str, args: &Value) -> Result<ToolOutput, (i32, String)> {
             let query = combine_query(&regex_term(&pattern, match_regex), &excludes);
             let offset = u64_arg(args, "offset", 0)? as usize;
             let max_results = u64_arg(args, "max_results", 50)? as usize;
-            let timeout_ms = u64_arg(args, "timeout_ms", 10_000)? as u32;
+            let timeout_ms = timeout_arg(args, 10_000)?;
             let sort = sort_arg(args)?;
             let descending = bool_arg(args, "descending", false)?;
             let options = plugin::search::SearchOptions {
@@ -320,7 +369,7 @@ pub fn dispatch(name: &str, args: &Value) -> Result<ToolOutput, (i32, String)> {
                             })
                         })
                         .collect();
-                    let text = serde_json::to_string_pretty(&json!({
+                    let mut payload = json!({
                         "folder": folder,
                         "pattern": pattern,
                         "exclude": excludes,
@@ -330,8 +379,15 @@ pub fn dispatch(name: &str, args: &Value) -> Result<ToolOutput, (i32, String)> {
                         "count": entries.len(),
                         "total": outcome.total,
                         "results": entries,
-                    }))
-                    .unwrap_or_else(|_| "{\"error\":\"serialization failed\"}".into());
+                    });
+                    // 一条都没搜到时才去探目录 —— 分得清「空目录」与「路径不对」。
+                    if outcome.total == 0 {
+                        if let Some(w) = folder_warning(&folder) {
+                            payload["folder_warning"] = json!(w);
+                        }
+                    }
+                    let text = serde_json::to_string_pretty(&payload)
+                        .unwrap_or_else(|_| "{\"error\":\"serialization failed\"}".into());
 
                     Ok((content_text(&text), false))
                 }
@@ -381,7 +437,7 @@ pub fn dispatch(name: &str, args: &Value) -> Result<ToolOutput, (i32, String)> {
                         })
                         .collect();
                     let returned = entries.len();
-                    let text = serde_json::to_string_pretty(&json!({
+                    let mut payload = json!({
                         "folder": folder,
                         "exclude": excludes,
                         "offset": outcome.offset,
@@ -390,8 +446,14 @@ pub fn dispatch(name: &str, args: &Value) -> Result<ToolOutput, (i32, String)> {
                         // 还有子项没返回 —— 用 offset 翻下一页（与 search_in_folder 同形）。
                         "truncated": outcome.offset + returned < outcome.total,
                         "items": entries,
-                    }))
-                    .unwrap_or_else(|_| "{}".into());
+                    });
+                    if outcome.total == 0 {
+                        if let Some(w) = folder_warning(&folder) {
+                            payload["folder_warning"] = json!(w);
+                        }
+                    }
+                    let text = serde_json::to_string_pretty(&payload)
+                        .unwrap_or_else(|_| "{}".into());
                     Ok((content_text(&text), false))
                 }
                 Err(e) => Ok((content_text(&format!("list error: {}", e)), true)),
@@ -408,10 +470,21 @@ pub fn dispatch(name: &str, args: &Value) -> Result<ToolOutput, (i32, String)> {
             // 同范围（递归子树）。
             match plugin::search::count_in_folder(&folder, &query, 10_000) {
                 Ok(n) => {
-                    let text = format!(
-                        "{{\"folder\":{:?},\"pattern\":{:?},\"count\":{}}}",
-                        folder, pattern, n
-                    );
+                    // 用 json! 而不是手拼 format! —— 手拼的 `{:?}` 走的是 Rust
+                    // Debug 转义（非 JSON 转义），只是个巧合才对得上。
+                    let mut payload = json!({
+                        "folder": folder,
+                        "pattern": pattern,
+                        "exclude": excludes,
+                        "count": n,
+                    });
+                    if n == 0 {
+                        if let Some(w) = folder_warning(&folder) {
+                            payload["folder_warning"] = json!(w);
+                        }
+                    }
+                    let text = serde_json::to_string(&payload)
+                        .unwrap_or_else(|_| "{\"error\":\"serialization failed\"}".into());
                     Ok((content_text(&text), false))
                 }
                 Err(e) => Ok((content_text(&format!("count error: {}", e)), true)),
@@ -635,8 +708,7 @@ pub fn dispatch(name: &str, args: &Value) -> Result<ToolOutput, (i32, String)> {
                 ));
             }
             let case_insensitive = bool_arg(args, "case_insensitive", false)?;
-            let timeout_ms =
-                u64_arg(args, "timeout_ms", plugin::grep::DEFAULT_TIMEOUT_MS as u64)? as u32;
+            let timeout_ms = timeout_arg(args, plugin::grep::DEFAULT_TIMEOUT_MS)?;
 
             match plugin::grep::grep(
                 &folder,
@@ -683,6 +755,12 @@ pub fn dispatch(name: &str, args: &Value) -> Result<ToolOutput, (i32, String)> {
                                 .iter()
                                 .map(|(path, count)| json!({ "path": path, "count": count }))
                                 .collect::<Vec<_>>());
+                        }
+                    }
+                    // 一个命中都没有时才探目录 —— 分得清「确实没有」与「路径不对」。
+                    if o.files_with_matches == 0 {
+                        if let Some(w) = folder_warning(&folder) {
+                            out["folder_warning"] = json!(w);
                         }
                     }
                     let text = serde_json::to_string_pretty(&out)
@@ -892,6 +970,48 @@ mod tests {
                 "{ok} 不该被改动"
             );
         }
+    }
+
+    #[test]
+    fn timeout_arg_rejects_values_that_used_to_truncate_silently() {
+        // 缺省走默认值。
+        assert_eq!(timeout_arg(&json!({}), 10_000).unwrap(), 10_000);
+        assert_eq!(timeout_arg(&json!({ "timeout_ms": null }), 7).unwrap(), 7);
+        // 正常值原样通过。
+        assert_eq!(timeout_arg(&json!({ "timeout_ms": 30_000 }), 1).unwrap(), 30_000);
+        assert_eq!(
+            timeout_arg(&json!({ "timeout_ms": u32::MAX }), 1).unwrap(),
+            u32::MAX
+        );
+        // 2^32 原先 `as u32` 截成 0 → 等待循环一次不跑 → "search timeout after 0 ms"。
+        // 0 等价于立刻放弃，同样按写错处理。
+        for bad in [0u64, 1u64 << 32, u64::MAX] {
+            let e = timeout_arg(&json!({ "timeout_ms": bad }), 1).unwrap_err();
+            assert_eq!(e.0, INVALID_PARAMS, "timeout_ms={bad}");
+            assert!(e.1.contains("timeout_ms"), "{}", e.1);
+            assert!(e.1.contains("between 1 and"), "{}", e.1);
+        }
+    }
+
+    #[test]
+    fn folder_warning_distinguishes_empty_from_wrong_path() {
+        // 真实存在的目录：没有话要说。
+        let dir = std::env::temp_dir();
+        assert_eq!(folder_warning(&dir.to_string_lossy()), None);
+
+        // 真实存在的文件：提醒改用 read_file。
+        let file = dir.join("everything_mcp_folder_warning_probe.txt");
+        std::fs::write(&file, b"x").unwrap();
+        let w = folder_warning(&file.to_string_lossy()).expect("文件应给提示");
+        assert!(w.contains("is a file"), "{w}");
+        assert!(w.contains("read_file"), "{w}");
+        let _ = std::fs::remove_file(&file);
+
+        // 不存在的路径：说清「空结果是必然的」，并点出网络共享未索引这一可能。
+        let missing = dir.join("everything_mcp_no_such_dir_probe");
+        let w = folder_warning(&missing.to_string_lossy()).expect("缺失路径应给提示");
+        assert!(w.contains("does not exist"), "{w}");
+        assert!(w.contains("Indexes"), "{w}");
     }
 
     #[test]
