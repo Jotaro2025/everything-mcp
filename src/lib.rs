@@ -192,6 +192,9 @@ unsafe fn everything_plugin_proc_impl(msg: u32, data: *mut c_void) -> *mut c_voi
             // 把状态装到全局槽位。
             let _ = plugin::state::STATE.set(state);
 
+            // 恢复上次运行的累计统计（必须在任何 record_* 之前）。
+            plugin::stats::load_history();
+
             // 载入设置并应用：启用则启动监听，否则保持关闭。
             // 之后用户在设置页的改动也走同一条应用路径（options::apply）。
             options::init(enabled, bind, port, global_search);

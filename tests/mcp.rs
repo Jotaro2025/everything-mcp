@@ -1769,6 +1769,8 @@ fn stats_classifies_three_tool_outcomes() {
 fn stats_record_call_accumulates_per_tool() {
     use everything_mcp::stats;
 
+    // 测试进程关掉磁盘刷盘，别把测试计数写进用户真实的 stats.jsonl。
+    stats::set_flush_enabled(false);
     let before = stats::snapshot();
     let idx = stats::tool_index("read_file");
     stats::record_call(idx, true, 10, 100);
@@ -1781,4 +1783,56 @@ fn stats_record_call_accumulates_per_tool() {
     assert_eq!(after.tools[idx].err, before.tools[idx].err + 1);
     assert_eq!(after.tools[idx].total_ms, before.tools[idx].total_ms + 35);
     assert_eq!(after.tools[idx].bytes_out, before.tools[idx].bytes_out + 350);
+}
+
+// ====================================================================
+// 统计：dispatch_rpc_http 的 tools/call 埋点接线
+// ====================================================================
+
+/// 未知工具走完整 HTTP 分发：Err 响应被记到 unknown 兜底槽的 err。
+/// 这段接线在 server.rs 而非 stats 模块，只有过 dispatch_rpc_http 才覆盖到。
+#[test]
+fn stats_tools_call_unknown_tool_lands_in_fallback_err() {
+    use everything_mcp::stats;
+
+    // 测试进程关掉磁盘刷盘，别把测试计数写进用户真实的 stats.jsonl。
+    stats::set_flush_enabled(false);
+
+    let before = stats::snapshot();
+    let (status, resp) = dispatch_http(
+        r#"{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"no_such_tool"}}"#,
+        &modern_head(),
+    );
+    assert_eq!(status, 200);
+    assert_eq!(resp["error"]["code"], protocol::METHOD_NOT_FOUND);
+
+    let idx = stats::tool_index("no_such_tool");
+    assert_eq!(idx, 7, "未知工具必须落兜底槽");
+    let after = stats::snapshot();
+    assert_eq!(after.tools[idx].calls, before.tools[idx].calls + 1);
+    assert_eq!(after.tools[idx].err, before.tools[idx].err + 1);
+    assert_eq!(after.tools[idx].ok, before.tools[idx].ok);
+}
+
+/// 工具级错误（isError=true，如 read_file 打不开文件）不是协议 Err，
+/// 但埋点同样要按失败记 —— 三类结果里最容易接错线的一类。
+#[test]
+fn stats_tools_call_is_error_counts_as_err_not_ok() {
+    use everything_mcp::stats;
+
+    stats::set_flush_enabled(false);
+
+    let idx = stats::tool_index("read_file");
+    let before = stats::snapshot();
+    let (status, resp) = dispatch_http(
+        r#"{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"Z:\\everything_mcp_definitely_missing.txt"}}}"#,
+        &modern_head(),
+    );
+    assert_eq!(status, 200);
+    assert_eq!(resp["result"]["isError"], json!(true));
+
+    let after = stats::snapshot();
+    assert_eq!(after.tools[idx].calls, before.tools[idx].calls + 1);
+    assert_eq!(after.tools[idx].err, before.tools[idx].err + 1);
+    assert_eq!(after.tools[idx].ok, before.tools[idx].ok);
 }

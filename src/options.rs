@@ -35,7 +35,9 @@ use windows_sys::Win32::Foundation::{HWND, RECT};
 use windows_sys::Win32::UI::Controls::{
     CheckDlgButton, IsDlgButtonChecked, BST_CHECKED, BST_UNCHECKED,
 };
-use windows_sys::Win32::UI::WindowsAndMessaging::{GetClientRect, GetDlgItemInt, SetDlgItemInt};
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    GetClientRect, GetDlgItemInt, SetDlgItemInt, SetTimer,
+};
 
 use crate::abi_ok;
 use crate::mcp;
@@ -75,7 +77,10 @@ const ID_GLOBAL_ALLOW: i32 = 10;
 const WM_COMMAND: u32 = 0x0111;
 const EN_CHANGE: u32 = 0x0300;
 const WS_GROUP: u32 = 0x0002_0000;
-const SS_LEFTNOWORDWRAP: u32 = 0x0C00;
+// 与 winuser.h 一致（历史上误抄成 0x0C00，低 4 位才是样式位：
+// 0x0C00 低 4 位为 0 = SS_LEFT，「不换行」从未生效过）。
+const SS_LEFTNOWORDWRAP: u32 = 0x000C;
+const SS_RIGHT: u32 = 0x0002;
 
 /// everything_plugin.h 里的对话框控件高度/间距常量（逻辑像素）。
 const DLG_STATIC_HIGH: i32 = 15;
@@ -110,13 +115,31 @@ fn is_stats_page(user_data: *mut c_void) -> bool {
 const ID_STATS_TOTAL: i32 = 20;
 const ID_STATS_CONNECTIONS: i32 = 21;
 const ID_STATS_REQUESTS: i32 = 22;
-const ID_STATS_TABLE_HEADER: i32 = 23;
-const ID_STATS_ROW_BASE: i32 = 30; // 30..=36 共 7 行工具
 const ID_STATS_CLEAR: i32 = 50;
+const ID_STATS_HEADER_BASE: i32 = 60; // 60..=65 六列表头
+const ID_STATS_CELL_BASE: i32 = 100; // 100..=147：8 行 × 6 列（行优先）
 
-/// Statistics 页最小尺寸（比 MCP 页高 —— 行数更多）。
-const STATS_PAGE_MIN_WIDE: i32 = 260;
-const STATS_PAGE_MIN_HIGH: i32 = 220;
+/// 统计页自动刷新定时器（SetTimer 的窗口级 ID）与周期（毫秒）。
+/// 定时器挂在 page_hwnd 上，页面窗口销毁时 user32 自动回收。
+const ID_STATS_TIMER: usize = 1;
+const STATS_REFRESH_MS: u32 = 1000;
+
+/// 统计表列数：0 = 工具名，1..=5 为五个数值列。
+const STATS_COLS: usize = 6;
+
+/// 5 个数值列的固定宽度（逻辑像素，右对齐）—— 列位定死后与字体度量
+/// 无关；工具名列吃掉内容区剩余宽度。表头最长的「输出(KiB)」也放得下。
+const STATS_NUM_COL_WIDE: [i32; 5] = [46, 40, 40, 54, 62];
+
+/// 清空按钮「两步确认」的武装状态：点一次置位并把按钮文案翻成确认提示，
+/// 再点才真正清空。每次重新加载页面时复位 —— 按钮控件是新建的，武装
+/// 状态不能跨对话框会话残留（否则下次打开后第一次点击就会直接清空）。
+static STATS_CLEAR_ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Statistics 页最小尺寸（逻辑像素）。内容区 = 数值列 242 + 工具名列 ~130
+/// + 24 边距；比 MCP 页宽 —— 逐列布局要给最长工具名留出不挤的宽度。
+const STATS_PAGE_MIN_WIDE: i32 = 400;
+const STATS_PAGE_MIN_HIGH: i32 = 240;
 
 /// host 未提供文本宽度测量函数时，标签列的兜底宽度（逻辑像素）。
 const FALLBACK_STATIC_WIDE: i32 = 90;
@@ -643,8 +666,46 @@ pub fn kill_page(_data: *mut c_void) -> *mut c_void {
 // Statistics 只读页
 // ============================================================
 
-/// 创建 Statistics 页控件：汇总行 + 表头 + 7 行工具明细 + 清空按钮。
+/// 行优先单元格 ID：`100 + row*6 + col`（col 0 = 工具名，1..=5 数值列）。
+fn stats_cell_id(row: usize, col: usize) -> i32 {
+    ID_STATS_CELL_BASE + (row * STATS_COLS + col) as i32
+}
+
+/// 一行的 6 个显示值：[工具名, 调用, 成功, 出错, 平均 ms, KiB]。
+/// 只出「值」，对齐交给控件 rect + SS_RIGHT —— 不再用空格填充凑列。
+fn stats_row_cells(
+    s: &crate::plugin::stats::ToolSnapshot,
+    name: &str,
+) -> [String; STATS_COLS] {
+    [
+        name.to_string(),
+        s.calls.to_string(),
+        s.ok.to_string(),
+        s.err.to_string(),
+        s.avg_ms().to_string(),
+        (s.bytes_out / 1024).to_string(),
+    ]
+}
+
+/// 6 列的 `(x, wide)`：工具名列吃剩余宽度，5 个数值列固定宽。
+/// 表头与 7 行数据共用同一组 rect，列自然对齐。
+fn stats_column_rects(x: i32, content_wide: i32) -> [(i32, i32); STATS_COLS] {
+    let num_total: i32 = STATS_NUM_COL_WIDE.iter().sum();
+    let name_wide = (content_wide - num_total).max(60);
+    let mut rects = [(0, 0); STATS_COLS];
+    rects[0] = (x, name_wide);
+    let mut cx = x + name_wide;
+    for (i, w) in STATS_NUM_COL_WIDE.iter().enumerate() {
+        rects[i + 1] = (cx, *w);
+        cx += w;
+    }
+    rects
+}
+
+/// 创建 Statistics 页控件：汇总行 + 表头 + 8 行工具明细（含未知兜底行）+ 清空按钮。
 fn load_stats_page(page: &LoadOptionsPage) -> *mut c_void {
+    // 重进页面 = 新按钮新文案，确认状态从「未武装」开始。
+    STATS_CLEAR_ARMED.store(false, std::sync::atomic::Ordering::Relaxed);
     let host = Host::get();
     let create_static = match host.os_create_static {
         Some(f) => f,
@@ -684,29 +745,50 @@ fn load_stats_page(page: &LoadOptionsPage) -> *mut c_void {
             SS_LEFTNOWORDWRAP,
             cstr_bytes(&req_text).as_ptr(),
         );
-        create_static(
-            page_hwnd,
-            ID_STATS_TABLE_HEADER,
-            SS_LEFTNOWORDWRAP | WS_GROUP,
-            cstr_bytes(labels.stats_table_header).as_ptr(),
-        );
-        for (i, name) in crate::plugin::stats::TOOL_NAMES.iter().enumerate() {
-            let s = &snap.tools[i];
-            let row = format!(
-                "{:<26} {:>6}  {:>5}  {:>5}  {:>8}  {:>8}",
-                name,
-                s.calls,
-                s.ok,
-                s.err,
-                s.avg_ms(),
-                s.bytes_out / 1024
-            );
+        // 表头与数据同列同对齐（数值列右对齐）。列 x 由 size_stats_page
+        // 按固定像素摆位 —— 比例字体下空格填充的列宽每行不同，会参差。
+        let heads = [
+            labels.stats_col_tool,
+            labels.stats_col_calls,
+            labels.stats_col_ok,
+            labels.stats_col_err,
+            labels.stats_col_avg,
+            labels.stats_col_out,
+        ];
+        for (c, text) in heads.iter().enumerate() {
+            let style = if c == 0 {
+                SS_LEFTNOWORDWRAP | WS_GROUP
+            } else {
+                SS_RIGHT
+            };
             create_static(
                 page_hwnd,
-                ID_STATS_ROW_BASE + i as i32,
-                SS_LEFTNOWORDWRAP,
-                cstr_bytes(&row).as_ptr(),
+                ID_STATS_HEADER_BASE + c as i32,
+                style,
+                cstr_bytes(text).as_ptr(),
             );
+        }
+        // 8 行 = 7 个真实工具 + 1 个未知工具兜底行。兜底行也要显示：
+        // 总调用次数对所有 8 个槽位求和，少画一行总数就对不上。
+        for i in 0..crate::plugin::stats::TOOL_SLOT_COUNT {
+            let name = crate::plugin::stats::TOOL_NAMES
+                .get(i)
+                .copied()
+                .unwrap_or(labels.stats_unknown_tool);
+            let cells = stats_row_cells(&snap.tools[i], name);
+            for (c, text) in cells.iter().enumerate() {
+                let style = if c == 0 {
+                    SS_LEFTNOWORDWRAP
+                } else {
+                    SS_RIGHT
+                };
+                create_static(
+                    page_hwnd,
+                    stats_cell_id(i, c),
+                    style,
+                    cstr_bytes(text).as_ptr(),
+                );
+            }
         }
         create_button(
             page_hwnd,
@@ -723,11 +805,35 @@ fn load_stats_page(page: &LoadOptionsPage) -> *mut c_void {
             );
         }
     }
+    // 页面打开期间每秒刷一次文本（page_proc 只收到 WM_COMMAND，WM_TIMER
+    // 走 TIMERPROC 回调直达，不依赖主程序转发）。窗口销毁时定时器自动回收。
+    unsafe {
+        SetTimer(page_hwnd, ID_STATS_TIMER, STATS_REFRESH_MS, Some(stats_timer_proc));
+    }
     diag::write("options: stats page loaded");
     abi_ok()
 }
 
-/// Statistics 页布局：顶部汇总三行 + 表头 + 7 行工具 + 底部清空按钮。
+/// 统计页的定时器回调：只刷新数值文本，不动清空按钮 —— 按钮可能正处于
+/// 「再点一次确认」的两步确认文案，被定时器盖掉会跟武装状态不一致。
+/// 计数代次没变就整轮跳过，空闲时不做无谓的 SetDlgItemText。
+unsafe extern "system" fn stats_timer_proc(
+    hwnd: HWND,
+    _msg: u32,
+    _id: usize,
+    _dwtime: u32,
+) {
+    static LAST_REFRESH_GEN: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+    let gen = crate::plugin::stats::generation();
+    if gen == LAST_REFRESH_GEN.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    LAST_REFRESH_GEN.store(gen, std::sync::atomic::Ordering::Relaxed);
+    refresh_stats_page_text(hwnd, false);
+}
+
+/// Statistics 页布局：顶部汇总三行 + 表头 + 8 行工具（含兜底行）+ 底部清空按钮。
 fn size_stats_page(page_hwnd: HWND) -> *mut c_void {
     let (mut wide, mut high) = client_size_logical(page_hwnd);
     let x = 12;
@@ -745,10 +851,23 @@ fn size_stats_page(page_hwnd: HWND) -> *mut c_void {
     set_rect(page_hwnd, ID_STATS_REQUESTS, x, y, wide, row_high);
     y += row_high + sep + 3;
 
-    set_rect(page_hwnd, ID_STATS_TABLE_HEADER, x, y, wide, row_high);
+    // 6 列的 x/宽一次性算好，表头与 7 行共用 —— 与字体度量无关。
+    let cols = stats_column_rects(x, wide);
+    for (c, (cx, cw)) in cols.iter().enumerate() {
+        set_rect(
+            page_hwnd,
+            ID_STATS_HEADER_BASE + c as i32,
+            *cx,
+            y,
+            *cw,
+            row_high,
+        );
+    }
     y += row_high + sep;
-    for i in 0..crate::plugin::stats::TOOL_NAMES.len() {
-        set_rect(page_hwnd, ID_STATS_ROW_BASE + i as i32, x, y, wide, row_high);
+    for i in 0..crate::plugin::stats::TOOL_SLOT_COUNT {
+        for (c, (cx, cw)) in cols.iter().enumerate() {
+            set_rect(page_hwnd, stats_cell_id(i, c), *cx, y, *cw, row_high);
+        }
         y += row_high + sep;
     }
 
@@ -775,25 +894,26 @@ fn stats_page_proc(p: &OptionsPageProc) -> *mut c_void {
         // 两步确认：点一次变「再点一次确认」，再点才真正清空。
         // SDK 的 ui_task_dialog_show 是 varargs，Rust FFI 不便调用，
         // 用按钮文案自翻转做轻量确认。
-        static ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-        let armed = ARMED.load(std::sync::atomic::Ordering::Relaxed);
+        let armed = STATS_CLEAR_ARMED.load(std::sync::atomic::Ordering::Relaxed);
         if !armed {
-            ARMED.store(true, std::sync::atomic::Ordering::Relaxed);
+            STATS_CLEAR_ARMED.store(true, std::sync::atomic::Ordering::Relaxed);
             if let Some(f) = Host::get().os_set_dlg_text {
-                let t = cstr_bytes("再点一次确认");
+                // 确认提示必须走 Labels —— Everything 界面语言可选，不能硬编码。
+                let t = cstr_bytes(labels().stats_clear_confirm);
                 unsafe { f(p.page_hwnd, ID_STATS_CLEAR, t.as_ptr()) };
             }
         } else {
-            ARMED.store(false, std::sync::atomic::Ordering::Relaxed);
+            STATS_CLEAR_ARMED.store(false, std::sync::atomic::Ordering::Relaxed);
             crate::plugin::stats::reset();
-            refresh_stats_page_text(p.page_hwnd);
+            refresh_stats_page_text(p.page_hwnd, true);
         }
     }
     abi_ok()
 }
 
-/// 清空后把 Statistics 页文本重置为全 0。
-fn refresh_stats_page_text(page_hwnd: HWND) {
+/// 把 Statistics 页文本刷成当前快照。定时器每秒调一次（restore_button =
+/// false）；清空统计后也调（restore_button = true，把确认文案翻回「清空统计」）。
+fn refresh_stats_page_text(page_hwnd: HWND, restore_button: bool) {
     let host = Host::get();
     let set_text = match host.os_set_dlg_text {
         Some(f) => f,
@@ -821,23 +941,23 @@ fn refresh_stats_page_text(page_hwnd: HWND) {
             let b = cstr_bytes(&t);
             set_text(page_hwnd, id, b.as_ptr());
         }
-        for (i, name) in crate::plugin::stats::TOOL_NAMES.iter().enumerate() {
-            let s = &snap.tools[i];
-            let row = format!(
-                "{:<26} {:>6}  {:>5}  {:>5}  {:>8}  {:>8}",
-                name,
-                s.calls,
-                s.ok,
-                s.err,
-                s.avg_ms(),
-                s.bytes_out / 1024
-            );
-            let b = cstr_bytes(&row);
-            set_text(page_hwnd, ID_STATS_ROW_BASE + i as i32, b.as_ptr());
+        // 8 行 = 7 真实工具 + 兜底行，与 load_stats_page 一一对应。
+        for i in 0..crate::plugin::stats::TOOL_SLOT_COUNT {
+            let name = crate::plugin::stats::TOOL_NAMES
+                .get(i)
+                .copied()
+                .unwrap_or(labels.stats_unknown_tool);
+            let cells = stats_row_cells(&snap.tools[i], name);
+            for (c, text) in cells.iter().enumerate() {
+                let b = cstr_bytes(text);
+                set_text(page_hwnd, stats_cell_id(i, c), b.as_ptr());
+            }
         }
-        // 按钮文案恢复。
-        let b = cstr_bytes(labels.stats_clear);
-        set_text(page_hwnd, ID_STATS_CLEAR, b.as_ptr());
+        // 按钮文案恢复（定时器刷新路径不动按钮，见 stats_timer_proc）。
+        if restore_button {
+            let b = cstr_bytes(labels.stats_clear);
+            set_text(page_hwnd, ID_STATS_CLEAR, b.as_ptr());
+        }
     }
 }
 
@@ -1118,13 +1238,20 @@ struct Labels {
     stats_total: &'static str,
     stats_connections: &'static str,
     stats_requests: &'static str,
-    stats_table_header: &'static str,
+    stats_col_tool: &'static str,
+    stats_unknown_tool: &'static str,
+    stats_col_calls: &'static str,
+    stats_col_ok: &'static str,
+    stats_col_err: &'static str,
+    stats_col_avg: &'static str,
+    stats_col_out: &'static str,
     stats_clear: &'static str,
+    stats_clear_confirm: &'static str,
     stats_clear_help: &'static str,
 }
 
 const LABELS_EN: Labels = Labels {
-    page_name: "MCP",
+    page_name: "MCP Server",
     enable: "Enable MCP server",
     enable_help: "Expose Everything file search to LLM clients over the Model Context Protocol (MCP) HTTP endpoint.",
     bind: "Bind address:",
@@ -1140,17 +1267,24 @@ const LABELS_EN: Labels = Labels {
     global_allow_help: "search_everywhere works directly without a confirmation prompt: it searches all indexed locations by file name and returns full paths.",
     restore: "Restore Defaults",
     restore_help: "Reset to 127.0.0.1:8285 with the server disabled and global search set to Deny.",
-    stats_page_name: "Statistics",
+    stats_page_name: "MCP Server Statistics",
     stats_total: "Total calls:",
     stats_connections: "Connections:",
     stats_requests: "Requests:",
-    stats_table_header: "Tool                      Calls   OK    Err   Avg(ms)  Out(KiB)",
+    stats_col_tool: "Tool",
+    stats_unknown_tool: "(other)",
+    stats_col_calls: "Calls",
+    stats_col_ok: "OK",
+    stats_col_err: "Err",
+    stats_col_avg: "Avg(ms)",
+    stats_col_out: "Out(KiB)",
     stats_clear: "Clear Statistics",
+    stats_clear_confirm: "Click again to confirm",
     stats_clear_help: "Reset all counters to zero and delete the local stats file.",
 };
 
 const LABELS_ZH: Labels = Labels {
-    page_name: "MCP",
+    page_name: "MCP 服务器",
     enable: "启用 MCP 服务",
     enable_help: "通过 MCP（模型上下文协议）HTTP 接口向 LLM 客户端开放 Everything 文件搜索。",
     bind: "绑定地址：",
@@ -1166,12 +1300,19 @@ const LABELS_ZH: Labels = Labels {
     global_allow_help: "search_everywhere 直接可用，不再弹确认框：按文件名搜索全部已索引位置，返回完整路径。",
     restore: "恢复默认",
     restore_help: "恢复为 127.0.0.1:8285、不启用服务、全局搜索为「拒绝」。",
-    stats_page_name: "统计",
+    stats_page_name: "MCP 服务器统计",
     stats_total: "总调用次数：",
     stats_connections: "连接数：",
     stats_requests: "请求数：",
-    stats_table_header: "工具                      调用   成功   出错   平均(ms)  输出(KiB)",
+    stats_col_tool: "工具",
+    stats_unknown_tool: "（其他）",
+    stats_col_calls: "调用",
+    stats_col_ok: "成功",
+    stats_col_err: "出错",
+    stats_col_avg: "平均(ms)",
+    stats_col_out: "输出(KiB)",
     stats_clear: "清空统计",
+    stats_clear_confirm: "再点一次确认",
     stats_clear_help: "清零所有计数并删除本地统计文件。",
 };
 
@@ -1224,4 +1365,45 @@ fn cstr_bytes(s: &str) -> Vec<u8> {
     v.extend_from_slice(s.as_bytes());
     v.push(0);
     v
+}
+
+// ============================================================
+// 测试
+// ============================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stats_columns_are_contiguous_and_fit_content() {
+        let content = 376; // 400 最小宽 - 24 边距
+        let cols = stats_column_rects(12, content);
+        // 名字列吃满剩余（376 - 242 数值列 = 134），数值列逐列相接、不重叠。
+        assert_eq!(cols[0], (12, content - STATS_NUM_COL_WIDE.iter().sum::<i32>()));
+        let mut cx = cols[0].0 + cols[0].1;
+        for (i, w) in STATS_NUM_COL_WIDE.iter().enumerate() {
+            assert_eq!(cols[i + 1], (cx, *w));
+            cx += w;
+        }
+        assert_eq!(cx - 12, content, "列总宽必须恰好铺满内容区");
+    }
+
+    #[test]
+    fn stats_cell_ids_are_unique_and_clear_of_other_controls() {
+        let rows = crate::plugin::stats::TOOL_NAMES.len();
+        let mut seen = std::collections::HashSet::new();
+        for row in 0..rows {
+            for col in 0..STATS_COLS {
+                assert!(seen.insert(stats_cell_id(row, col)));
+            }
+        }
+        // 与汇总行、清空按钮、表头的 ID 不相撞。
+        for id in [ID_STATS_TOTAL, ID_STATS_CONNECTIONS, ID_STATS_REQUESTS, ID_STATS_CLEAR] {
+            assert!(!seen.contains(&id));
+        }
+        for c in 0..STATS_COLS {
+            assert!(!seen.contains(&(ID_STATS_HEADER_BASE + c as i32)));
+        }
+    }
 }

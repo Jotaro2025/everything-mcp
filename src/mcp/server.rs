@@ -443,10 +443,16 @@ pub fn dispatch_rpc_http(body: &str, head: &RequestHead) -> (u16, String) {
                 Err((code, msg)) => protocol::error_response(&id, code, &msg),
             };
             // 三类结果都要记：Ok((_,false))=ok、Ok((_,true))/Err(_)=err。
+            // 响应只序列化一次：埋点字节数按最终响应算，返回时直接复用。
             let ok = stats::dispatch_ok_flag(&resp).unwrap_or(false);
-            let bytes = encode(&resp).len() as u64;
-            stats::record_call(idx, ok, t0.elapsed().as_millis() as u64, bytes);
-            resp
+            let encoded = encode(&resp);
+            stats::record_call(
+                idx,
+                ok,
+                t0.elapsed().as_millis() as u64,
+                encoded.len() as u64,
+            );
+            return (200, encoded);
         }
         _ => {
             // modern：未知方法 404 + JSON-RPC 错误体；legacy：保持 200。
