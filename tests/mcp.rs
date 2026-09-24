@@ -955,6 +955,23 @@ fn global_exclude_cannot_smuggle_content_search() {
 }
 
 #[test]
+fn normalize_exclude_term_collapses_doubled_backslashes() {
+    use everything_mcp::mcp::validate;
+    // 实机实测（1.1.4）：`\\target\\` 静默不生效，折叠后才是调用方想要的 `\target\`。
+    assert_eq!(validate::normalize_exclude_term(r"\\target\\"), r"\target\");
+    assert_eq!(validate::normalize_exclude_term(r"\\\obj\\\\"), r"\obj\");
+    // UNC 排除项也折叠 —— Everything 对完整路径做子串匹配，
+    // `\NAS\old\` 与 `\\NAS\old\` 命中同一批文件，所以「排除整个共享」照样生效。
+    assert_eq!(validate::normalize_exclude_term(r"\\NAS\old\"), r"\NAS\old\");
+    // 本来就正常的项一个字符都不动。
+    for ok in [r"\obj\", "ext:tmp", "node_modules", r"dm:lastweek", ""] {
+        assert_eq!(validate::normalize_exclude_term(ok), ok, "{ok} 不该被改动");
+    }
+    // 首尾空白照旧去掉。
+    assert_eq!(validate::normalize_exclude_term("  \\x\\  "), r"\x\");
+}
+
+#[test]
 fn search_everywhere_deny_gate_returns_global_search_disabled() {
     // 默认档（Deny）：合法入参过了校验后被模式闸门硬拒 —— 返回工具级错误
     // （is_error=true）而非 JSON-RPC 错误，载荷是结构化 JSON，LLM 一眼看出

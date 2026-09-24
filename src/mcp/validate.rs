@@ -191,6 +191,38 @@ pub fn validate_global_pattern(pattern: &str) -> Result<String, String> {
     Ok(p.to_string())
 }
 
+/// 折叠一个 exclude 项里重复的反斜杠。
+///
+/// 为什么必须做：`normalize_folder` 早就为 folder 参数折叠重复反斜杠
+/// （LLM 把 Windows 路径写成 `\\target\\` 是常见失误），而 exclude 项原先
+/// 原样透传 —— 同一个书写错误在 folder 上被原谅、在 exclude 上**静默失效**。
+/// 1.1.4 实机实测同一查询：不排除 30 条、`\target\` 22 条、
+/// `\\target\\` 又是 30 条 —— 后者一条都没排除，也不报错，调用方只会看到
+/// 结果里多出一堆本该排除的噪声。
+///
+/// 折叠是安全的，不需要给 UNC 开特例：Everything 对完整路径做**子串**匹配，
+/// `\\NAS\old\` 与 `\NAS\old\` 命中同一批文件（后者是 `\\NAS\old\x` 的子串，
+/// 前者也是），所以「排除整个共享」这种用法折叠后照样生效。
+///
+/// 只作用于 exclude，**不碰 pattern**：pattern 在 `match_regex` 下可能是正则，
+/// 把 `\\.` 折叠成 `\.` 会改变语义。
+pub fn normalize_exclude_term(term: &str) -> String {
+    let mut out = String::with_capacity(term.len());
+    let mut prev_bs = false;
+    for c in term.trim().chars() {
+        if c == '\\' {
+            if !prev_bs {
+                out.push('\\');
+            }
+            prev_bs = true;
+        } else {
+            out.push(c);
+            prev_bs = false;
+        }
+    }
+    out
+}
+
 /// 校验全局搜索的 `exclude` 项 —— `content:` 闸门的第二半。
 ///
 /// 为什么必须单独查一遍：`exclude` 的每一项都会被拼成 `!term` 进**同一条**

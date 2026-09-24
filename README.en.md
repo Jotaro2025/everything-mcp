@@ -157,8 +157,8 @@ Outputs (in `installer\dist\`):
 
 | Installer                            | Arch | Embedded plugin dll   |
 | ------------------------------------ | ---- | --------------------- |
-| `everything-mcp-1.1.4-x64-setup.exe` | x64  | `everything_mcp64.dll` |
-| `everything-mcp-1.1.4-x86-setup.exe` | x86  | `everything_mcp32.dll` |
+| `everything-mcp-1.1.5-x64-setup.exe` | x64  | `everything_mcp64.dll` |
+| `everything-mcp-1.1.5-x86-setup.exe` | x86  | `everything_mcp32.dll` |
 
 To install, run the installer for your architecture; Everything then shows its
 "Setup Plugin" dialog, where you click Install. Both installers can be
@@ -642,6 +642,15 @@ trailing-slash spellings are normalized automatically; wildcards belong in
 `-32602 INVALID_PARAMS` with the expected format and the received value in the
 message — so the LLM fixes the argument in one round trip instead of retrying
 with the same bad input.
+
+Every `exclude` term also gets its doubled backslashes collapsed
+(`\\target\\` → `\target\`). That is not fussiness: before 1.1.5 that spelling
+**silently did nothing** — measured on one query, no exclude returned 30 hits,
+`\target\` returned 22, and `\\target\\` returned 30 again, with no error.
+Collapsing is safe for UNC excludes too (`!\\NAS\old\`) because Everything
+substring-matches the full path, so `\NAS\old\` and `\\NAS\old\` hit the same
+files. `pattern` is deliberately left alone: under `match_regex` it may be a
+regex, where collapsing `\\.` to `\.` would change its meaning.
 
 Every `index_changes` argument is optional, and the same validation rule
 applies: a bad `action`, an out-of-range `max_results` (1–2000), a

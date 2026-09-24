@@ -36,6 +36,9 @@ fn pattern_arg(args: &Value) -> Result<String, (i32, String)> {
 /// 仓库噪声（`.git` / `obj` / `node_modules` / `target`）不该进搜索结果 ——
 /// 评测里 `*.cs` 前 50 条被 `obj\...` 占满、count 656 含生成代码，都是这个。
 /// 调用方可以逐项写 `!term`（pattern 里），也可以用这个参数显式排除。
+///
+/// 每项过 [`validate::normalize_exclude_term`]：折叠重复反斜杠，否则
+/// `\\target\\` 这种转义失误会静默不生效（见该函数的注释与实测数据）。
 fn exclude_arg(args: &Value) -> Result<Vec<String>, (i32, String)> {
     let mut raw_terms: Vec<String> = Vec::new();
     match args.get("exclude") {
@@ -80,7 +83,7 @@ fn exclude_arg(args: &Value) -> Result<Vec<String>, (i32, String)> {
                 ),
             ));
         }
-        terms.push(t.to_string());
+        terms.push(validate::normalize_exclude_term(t));
     }
     Ok(terms)
 }
@@ -863,6 +866,32 @@ mod tests {
         );
         assert!(exclude_arg(&json!({})).unwrap().is_empty());
         assert!(exclude_arg(&json!({ "exclude": null })).unwrap().is_empty());
+    }
+
+    #[test]
+    fn exclude_arg_collapses_doubled_backslashes() {
+        // 1.1.4 实机实测：`\\target\\` 一条都没排除掉且不报错（30 条 vs 22 条），
+        // 因为 Everything 拿它当字面路径片段匹配。这里确认参数层已经折叠。
+        let doubled = json!({ "exclude": [r"\\target\\", r"\\obj\\"] });
+        assert_eq!(
+            exclude_arg(&doubled).unwrap(),
+            v(&[r"\target\", r"\obj\"]),
+            "重复反斜杠要折叠成单个"
+        );
+        // UNC 排除项（排除整个共享）同样只留单个反斜杠：Everything 对完整路径
+        // 做子串匹配，`\NAS\old\` 与 `\\NAS\old\` 命中同一批文件。
+        assert_eq!(
+            exclude_arg(&json!({ "exclude": r"\\NAS\old\" })).unwrap(),
+            v(&[r"\NAS\old\"])
+        );
+        // 没有重复反斜杠的项原样保留（含搜索函数与普通名字）。
+        for ok in [r"\obj\", "ext:tmp", "node_modules", r"dm:lastweek"] {
+            assert_eq!(
+                exclude_arg(&json!({ "exclude": ok })).unwrap(),
+                v(&[ok]),
+                "{ok} 不该被改动"
+            );
+        }
     }
 
     #[test]

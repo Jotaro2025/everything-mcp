@@ -142,8 +142,8 @@ powershell -ExecutionPolicy Bypass -File build-installers.ps1
 
 | 安装包                              | 架构 | 内嵌插件 dll           |
 | ----------------------------------- | ---- | ---------------------- |
-| `everything-mcp-1.1.4-x64-setup.exe` | x64  | `everything_mcp64.dll` |
-| `everything-mcp-1.1.4-x86-setup.exe` | x86  | `everything_mcp32.dll` |
+| `everything-mcp-1.1.5-x64-setup.exe` | x64  | `everything_mcp64.dll` |
+| `everything-mcp-1.1.5-x86-setup.exe` | x86  | `everything_mcp32.dll` |
 
 安装：运行对应架构的安装包 → Everything 弹出「设置插件」对话框 → 点「安装」。
 两个安装包可以一起分发，`Plugins\` 下 `everything_mcp64.dll` 与
@@ -543,6 +543,13 @@ UNC 网络共享与本地盘同权。搜索范围以 Everything 的索引为准 
 带引号、正斜杠、重复反斜杠、尾斜杠的写法会被自动规范化；通配符属于 `pattern`
 而不属于 `folder`。规范化失败时返回 `-32602 INVALID_PARAMS`，消息里带期望格式
 的范例与收到的原值 —— LLM 据此一次改对，不会带着坏参数反复重试。
+
+`exclude` 的每一项同样会折叠重复反斜杠（`\\target\\` → `\target\`）。这不是
+洁癖：1.1.4 之前该写法会**静默失效** —— 实测同一查询不排除 30 条、
+`\target\` 22 条、`\\target\\` 又是 30 条，一条都没排除且不报错。折叠对 UNC
+排除项也安全（`!\\NAS\old\`），因为 Everything 对完整路径做子串匹配，
+`\NAS\old\` 与 `\\NAS\old\` 命中同一批文件。`pattern` 不做这个折叠：它在
+`match_regex` 下可能是正则，把 `\\.` 折成 `\.` 会改语义。
 
 `index_changes` 的入参全部可选，校验规则同上：坏 `action`、越界的
 `max_results`（1–2000）、格式不对的时间戳、`since` 晚于 `until`，都在
