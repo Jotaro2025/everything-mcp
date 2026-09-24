@@ -227,15 +227,26 @@ const INDEX_CHANGES_DEFAULT: u64 = 50;
 /// 历史；再加限是为了不让一次调用把整天的日志啃穿。
 const INDEX_CHANGES_LIMIT: u64 = 2000;
 
-/// `search_everywhere` 的返回条数上限（1..=500）。全局命中集可能是几十万条，
-/// 窗口必须封顶 —— 0 也不再有「不限」的第二含义，越界直接报 INVALID_PARAMS。
-const GLOBAL_MAX_RESULTS: u64 = 500;
+/// 三个搜索类工具共用的结果窗口上限（1..=2000）。`0` 一律是写错，不是「不限」。
+///
+/// 为什么开这么宽（原先是 500）：本服务是本地回环，实测一次调用有约 50 ms 的
+/// **固定**成本（提交查询 → 等 Everything → marshal 到主线程），而每条结果的
+/// 边际成本可以忽略 —— 窗口从 50 条放大到 2000 条，耗时只从 50 ms 涨到 53 ms。
+/// 更关键的是翻页要**重新提交一次查询**（每页都走 `submit_query`），所以小窗口
+/// 等于把固定成本乘以页数：4419 条按 500 一页翻约 450 ms，一次拿完只要 88 ms。
+///
+/// 上限取 2000 而不是更大，是因为约束已经从「传输扛不扛得住」变成「模型读不读
+/// 得动」：2000 条约合 14 万 token 的 JSON，再往上给出来的结果没人能用。
+/// 真正防响应体失控的是 `plugin::search::MAX_RESULT_WINDOW_BYTES` 字节预算。
+const RESULT_WINDOW_MAX: usize = 2000;
 
-/// `list_folder` 每页的子项上限（同时是默认值）。目录的直接子项可以上千
-/// （实测 `C:\Windows\System32` 有 4889 个），所以窗口必须能翻页：`offset`
-/// 往后走，`truncated` 告诉调用方还有没有下一页。上限取 500 是为了让一页的
-/// 响应体不至于大到被客户端截断。
-const LIST_MAX_RESULTS: usize = 500;
+/// `list_folder` 每页的默认子项数。
+///
+/// 上限放宽到 [`RESULT_WINDOW_MAX`] 是纯扩展（老调用方行为不变），默认值则刻意
+/// 保持 500 不动：默认值的职责是「调用方不指定时别把上下文撑爆」，而 500 条已经
+/// 覆盖绝大多数目录。真要看几千项的目录，调用方显式传 `max_results` 即可，
+/// 响应里的 `truncated` 也会告诉它还有没有下一页。
+const LIST_DEFAULT_MAX_RESULTS: usize = 500;
 
 /// 把 `action` 参数映射成 journal 的动作枚举。
 ///
@@ -335,6 +346,17 @@ pub fn dispatch(name: &str, args: &Value) -> Result<ToolOutput, (i32, String)> {
             let query = combine_query(&regex_term(&pattern, match_regex), &excludes);
             let offset = u64_arg(args, "offset", 0)? as usize;
             let max_results = u64_arg(args, "max_results", 50)? as usize;
+            // 窗口上限与另外两个搜索工具一致；0 是写错而不是「不限」。
+            if max_results == 0 || max_results > RESULT_WINDOW_MAX {
+                return Err((
+                    INVALID_PARAMS,
+                    format!(
+                        "'max_results' must be between 1 and {}; received {}. Page through the rest with \
+                         'offset' — but prefer narrowing 'pattern'/'exclude' first, because every page re-runs the search.",
+                        RESULT_WINDOW_MAX, max_results
+                    ),
+                ));
+            }
             let timeout_ms = timeout_arg(args, 10_000)?;
             let sort = sort_arg(args)?;
             let descending = bool_arg(args, "descending", false)?;
@@ -369,6 +391,7 @@ pub fn dispatch(name: &str, args: &Value) -> Result<ToolOutput, (i32, String)> {
                             })
                         })
                         .collect();
+                    let returned = entries.len();
                     let mut payload = json!({
                         "folder": folder,
                         "pattern": pattern,
@@ -376,8 +399,11 @@ pub fn dispatch(name: &str, args: &Value) -> Result<ToolOutput, (i32, String)> {
                         "sort": sort.as_str(),
                         "descending": descending,
                         "offset": outcome.offset,
-                        "count": entries.len(),
+                        "count": returned,
                         "total": outcome.total,
+                        // 还有命中没返回 —— 用 offset 翻下一页（与 list_folder 同形）。
+                        // 窗口被 max_results 或字节预算任一处截断都会是 true。
+                        "truncated": outcome.offset + returned < outcome.total,
                         "results": entries,
                     });
                     // 一条都没搜到时才去探目录 —— 分得清「空目录」与「路径不对」。
@@ -402,13 +428,13 @@ pub fn dispatch(name: &str, args: &Value) -> Result<ToolOutput, (i32, String)> {
             let offset = u64_arg(args, "offset", 0)? as usize;
             // 窗口必须能翻页：大目录的直接子项可以上千（实测 C:\Windows\System32
             // 有 4889 个），旧实现写死 500 条且没有 offset，第 501 项之后拿不到。
-            let max_results = u64_arg(args, "max_results", LIST_MAX_RESULTS as u64)? as usize;
-            if max_results == 0 || max_results > LIST_MAX_RESULTS {
+            let max_results = u64_arg(args, "max_results", LIST_DEFAULT_MAX_RESULTS as u64)? as usize;
+            if max_results == 0 || max_results > RESULT_WINDOW_MAX {
                 return Err((
                     INVALID_PARAMS,
                     format!(
                         "'max_results' must be between 1 and {}; received {}",
-                        LIST_MAX_RESULTS, max_results
+                        RESULT_WINDOW_MAX, max_results
                     ),
                 ));
             }
@@ -788,15 +814,15 @@ pub fn dispatch(name: &str, args: &Value) -> Result<ToolOutput, (i32, String)> {
             let match_regex = bool_arg(args, "match_regex", false)?;
             let query = combine_query(&regex_term(&pattern, match_regex), &excludes);
             let offset = u64_arg(args, "offset", 0)? as usize;
-            // 全局窗口必须封顶：0 不是「不限」而是写错（与 read_file 的
-            // max_lines 同一形态）。
+            // 全局窗口与另外两个搜索工具同一套上限：0 不是「不限」而是写错
+            // （与 read_file 的 max_lines 同一形态）。
             let max_results = u64_arg(args, "max_results", 50)?;
-            if max_results == 0 || max_results > GLOBAL_MAX_RESULTS {
+            if max_results == 0 || max_results > RESULT_WINDOW_MAX as u64 {
                 return Err((
                     INVALID_PARAMS,
                     format!(
                         "'max_results' must be between 1 and {}; received {}",
-                        GLOBAL_MAX_RESULTS, max_results
+                        RESULT_WINDOW_MAX, max_results
                     ),
                 ));
             }

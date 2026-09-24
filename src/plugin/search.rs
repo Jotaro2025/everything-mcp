@@ -225,6 +225,46 @@ fn build_search_string(folder: &str, pattern: &str, scope: SearchScope) -> Strin
     s
 }
 
+/// 单次响应里结果条目的 JSON 字节预算（512 KiB）。
+///
+/// 为什么需要它、而不只是 `max_results` 上限：条目字节数随路径长度变化，
+/// 275 字节/条只是 `C:\Windows\System32` 那种短路径的实测值；深目录加长文件名
+/// 下同样 2000 条可以大出好几倍。**条数上限管的是「结果还有没有用」，
+/// 字节预算管的才是「调用方能不能把这份 JSON 读下来」**，两者不能互相替代。
+///
+/// 为什么是 512 KiB 而不是更小：本服务是本地回环，实测 548 KiB 的响应 53 ms
+/// 就传完了 —— 带宽不是约束，唯一的约束是模型的上下文。卡在半兆这个量级，
+/// 既容得下约 1900 条常规条目，又不会大到模型读不动。
+///
+/// 命中预算时**至少保留一条**：否则调用方拿到空结果、`offset` 推不动，
+/// 会卡在死循环里。单条路径最长约 32 KiB，远小于预算，这个保底恒可满足。
+pub const MAX_RESULT_WINDOW_BYTES: usize = 512 * 1024;
+
+/// 一条结果在响应 JSON 里的固定开销（不含 name / path 本身）。
+///
+/// 覆盖 kind（"folder"/"file"）、size（最多 20 位）、两个各 20 字符的 ISO 时间戳，
+/// 外加键名、引号、逗号与缩进。实测这部分约 173 字节（见 `estimate_entry_bytes`），
+/// 取 200 留出余量。
+const ENTRY_JSON_OVERHEAD: usize = 200;
+
+/// 一条结果在响应 JSON 里占用的字节数估算 —— **必须是上界**。
+///
+/// **反斜杠按两倍算**：JSON 里 `\` 要转义成 `\\`，而 Windows 路径几乎全是
+/// 反斜杠。只按 `name + path + 常量` 估会低估约 20%，预算就被击穿：
+/// 2026-09-24 实测 System32 的 2000 条 `*.dll`，按 `name + path + 160` 估出
+/// 218 字节/条，实际 274 字节/条，于是 548 KB 的响应越过 512 KiB 预算却没有触发。
+/// name 也一并翻倍，省得为文件名里的引号、控制字符开特例。
+///
+/// 纯函数，单独单测（`read_all` 需要宿主，CI 里跑不了）。
+///
+/// 对 `list_folder` 偏保守：它的响应只带 `name`，不带 `path`，但这里照样把
+/// 完整路径算进去（实测 System32：1764 条占 345 KB，没填满 512 KiB 预算）。
+/// 方向是安全的一侧 —— 预算只承诺「不超过」，不承诺「填满」——所以不值得为
+/// 它把「响应是否含 path」这个形状信息从 tools 层穿透到读取层。
+fn estimate_entry_bytes(name_len: usize, path_len: usize) -> usize {
+    ENTRY_JSON_OVERHEAD + 2 * (name_len + path_len)
+}
+
 /// 一次搜索的结果：已按 `offset`/`max_results` 截断的条目 + 未截断的命中总数。
 #[derive(Debug, Clone)]
 pub struct SearchOutcome {
@@ -239,7 +279,10 @@ pub struct SearchOutcome {
 ///
 /// `folder` 必须是绝对路径（如 `D:\source\repos\Everything-Plugin`）；
 /// `pattern` 是 Everything 搜索语法（如 `*.rs`、`"readme"`、`ext:md;txt`）。
-/// `offset` / `max_results` 一起圈定返回窗口（`max_results == 0` 表示读到末尾）。
+/// `offset` / `max_results` 一起圈定返回窗口。`max_results == 0` 在本层仍表示
+/// 「读到末尾」，但 tools 层已不再产生 0（那里按 1..=2000 校验），保留该语义
+/// 只是防御。真正兜底的是 [`MAX_RESULT_WINDOW_BYTES`]：无论条数上限多大，
+/// 响应体都不会超过字节预算。
 /// `timeout_ms` 是异步等待查询完成的最大时间（建议 5000–30000）。
 /// `options` 决定搜索范围、匹配开关与排序。
 ///
@@ -747,8 +790,12 @@ unsafe fn read_result_count(query: DbQueryHandle) -> Result<usize, String> {
 
 /// 由总数、`offset`、`max_results` 算出实际要读的下标窗口 `(start, take)`。
 ///
-/// `max_results == 0` 表示读到末尾；`offset` 超出总数时返回空窗口（take=0）。
+/// `max_results == 0` 表示读到末尾（tools 层已不产生 0，见 `search_in_folder`
+/// 文档）；`offset` 超出总数时返回空窗口（take=0）。
 /// 纯函数，单独单测。
+///
+/// 注意这里算出的 `take` 只是**上界**：`read_all` 还会按
+/// [`MAX_RESULT_WINDOW_BYTES`] 提前收尾，所以实际返回条数可能更少。
 fn page_window(total: usize, offset: usize, max_results: usize) -> (usize, usize) {
     let start = offset.min(total);
     let remaining = total - start;
@@ -758,6 +805,16 @@ fn page_window(total: usize, offset: usize, max_results: usize) -> (usize, usize
         remaining.min(max_results)
     };
     (start, take)
+}
+
+/// 字节预算判定：`used` 是已累计的条目字节，`entry` 是这一条的估算字节。
+/// 返回 true 表示预算还容得下这一条。
+///
+/// `used == 0` 时恒 true —— **至少收一条**。否则调用方会拿到空结果、`offset`
+/// 推不动，卡在死循环里。单条路径最长约 32 KiB，远小于预算，这个保底恒可满足。
+/// 纯函数，单独单测（`read_all` 需要宿主，CI 里跑不了）。
+fn fits_budget(used: usize, entry: usize) -> bool {
+    used == 0 || used + entry <= MAX_RESULT_WINDOW_BYTES
 }
 
 /// 从已完成的 query 对象中读出窗口 `[offset, offset+max_results)` 的结果与命中总数。
@@ -778,6 +835,7 @@ unsafe fn read_all(
     ));
 
     let mut out = Vec::with_capacity(take);
+    let mut used_bytes = 0usize;
     let mut name_buf = Utf8Buf::default();
     let mut path_buf = Utf8Buf::default();
     let mut fd = FileInfoFd::default();
@@ -830,6 +888,19 @@ unsafe fn read_all(
                 path.push('\\');
             }
             path.push_str(&name);
+
+            // 字节预算：条数上限之外的第二道闸。命中即停，至少留一条（见 fits_budget）。
+            let entry_bytes = estimate_entry_bytes(name.len(), path.len());
+            if !fits_budget(used_bytes, entry_bytes) {
+                super::diag::write(&format!(
+                    "read_all: byte budget hit at {} of {} window entries ({} bytes)",
+                    out.len(),
+                    take,
+                    used_bytes
+                ));
+                break;
+            }
+            used_bytes += entry_bytes;
 
             out.push(SearchResult {
                 name,
@@ -935,6 +1006,48 @@ mod tests {
         assert_eq!(page_window(100, 999, 50), (100, 0));
         // 空结果集。
         assert_eq!(page_window(0, 0, 50), (0, 0));
+    }
+
+    #[test]
+    fn byte_budget_always_admits_the_first_entry() {
+        // 保底：无论这一条多大，预算为空时必须收下 —— 否则调用方拿到空结果、
+        // offset 推不动，会卡死。单条路径最长约 32 KiB，实际到不了预算。
+        assert!(fits_budget(0, MAX_RESULT_WINDOW_BYTES));
+        assert!(fits_budget(0, MAX_RESULT_WINDOW_BYTES * 10));
+        assert!(fits_budget(0, usize::MAX));
+    }
+
+    #[test]
+    fn byte_budget_capacity_is_the_same_ballpark_as_the_entry_cap() {
+        // 边界是闭区间：正好用满预算收下，超一个字节就停。
+        assert!(fits_budget(MAX_RESULT_WINDOW_BYTES - 100, 100));
+        assert!(!fits_budget(MAX_RESULT_WINDOW_BYTES - 100, 101));
+        assert!(!fits_budget(MAX_RESULT_WINDOW_BYTES, 1));
+
+        // 按实测条目尺寸算，512 KiB 能装约 1600 条 —— 与 RESULT_WINDOW_MAX
+        // （2000 条）同一档。两道闸管的是不同东西（字节 vs 条数），但正常路径
+        // 长度下不该差一个数量级，否则其中一道就成了摆设。
+        let per_entry = estimate_entry_bytes(16, 43);
+        let capacity = MAX_RESULT_WINDOW_BYTES / per_entry;
+        assert!(fits_budget((capacity - 1) * per_entry, per_entry));
+        assert!(!fits_budget(capacity * per_entry, per_entry));
+        assert!((1000..2500).contains(&capacity), "capacity={capacity}");
+    }
+
+    #[test]
+    fn entry_estimate_is_an_upper_bound_on_the_measured_entry() {
+        // 2026-09-24 实测：System32 的 2000 条 *.dll，平均 name 16 字符、
+        // path 43 字符，序列化后 274 字节/条。估算必须 ≥ 实测，否则预算被击穿
+        // —— 这正是上一版（`name + path + 160` = 218）犯的错：548 KB 的响应
+        // 越过了 512 KiB 预算却没有触发。
+        let (name, path, measured) = (16usize, 43usize, 274usize);
+        let est = estimate_entry_bytes(name, path);
+        assert!(est >= measured, "est={est} measured={measured}");
+        // 反斜杠按两倍算是这条公式的关键，别被「优化」掉。
+        assert!(est > name + path + ENTRY_JSON_OVERHEAD, "est={est}");
+        // 长路径随长度线性增长：深目录不会因为条数少就撑爆预算。
+        assert!(estimate_entry_bytes(16, 200) > estimate_entry_bytes(16, 43));
+        const { assert!(MAX_RESULT_WINDOW_BYTES == 512 * 1024) };
     }
 
     #[test]

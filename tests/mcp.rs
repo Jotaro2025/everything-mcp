@@ -78,11 +78,15 @@ fn tools_list_contains_seven_tools_with_required_params() {
         search["inputSchema"]["properties"]["max_results"]["default"],
         50
     );
-    // 0 = 不限是 search_in_folder 有意保留的语义（描述与 README 都写明），
-    // schema 里如实标 min 0 —— 另外两个搜索工具的 max_results 是 1..500 硬窗口。
+    // 三个搜索工具的 max_results 现在是同一套硬窗口 1..2000。search_in_folder
+    // 原先的「0 = 不限」已取消 —— 它是全库唯一把 0 当哨兵的窗口参数。
     assert_eq!(
         search["inputSchema"]["properties"]["max_results"]["minimum"],
-        0
+        1
+    );
+    assert_eq!(
+        search["inputSchema"]["properties"]["max_results"]["maximum"],
+        2000
     );
     assert_eq!(
         search["inputSchema"]["properties"]["timeout_ms"]["default"],
@@ -147,12 +151,12 @@ fn tools_list_contains_seven_tools_with_required_params() {
     assert_eq!(grep_props["timeout_ms"]["minimum"], 1);
     assert_eq!(grep_props["timeout_ms"]["maximum"], 4294967295u64);
 
-    // search_everywhere：只要求 pattern；max_results 是硬窗口 1..500。
+    // search_everywhere：只要求 pattern；max_results 与另外两个搜索工具同一套硬窗口。
     assert_eq!(tools[6]["inputSchema"]["required"], json!(["pattern"]));
     let global_props = &tools[6]["inputSchema"]["properties"];
     assert_eq!(global_props["max_results"]["default"], 50);
     assert_eq!(global_props["max_results"]["minimum"], 1);
-    assert_eq!(global_props["max_results"]["maximum"], 500);
+    assert_eq!(global_props["max_results"]["maximum"], 2000);
     assert_eq!(global_props["offset"]["default"], 0);
     assert_eq!(global_props["timeout_ms"]["default"], 10_000);
     assert_eq!(global_props["timeout_ms"]["minimum"], 1);
@@ -271,6 +275,20 @@ fn search_description_warns_against_shell_glob_and_documents_truncation() {
     // 新增能力也要在描述里点明：时间戳、翻页、排序。
     assert!(desc.contains("modified"), "desc should mention timestamps");
     assert!(desc.contains("offset"), "desc should document paging");
+    // 截断必须可见，并且要给出「翻页 vs 收窄」的取舍 —— 翻页会重跑查询。
+    assert!(desc.contains("truncated"), "desc should document the truncated flag");
+    assert!(
+        desc.contains("re-runs the search"),
+        "desc should warn that paging re-runs the search"
+    );
+
+    // max_results 的参数说明要写清范围、0 不是「不限」、以及字节预算的存在。
+    let mr = search["inputSchema"]["properties"]["max_results"]["description"]
+        .as_str()
+        .unwrap();
+    assert!(mr.contains("1..2000"), "max_results desc: {mr}");
+    assert!(mr.contains("512 KiB"), "max_results desc: {mr}");
+    assert!(mr.contains("truncated"), "max_results desc: {mr}");
 
     // pattern 的参数说明同样带 glob 警告与排除范例。
     let pattern_desc = search["inputSchema"]["properties"]["pattern"]["description"]
@@ -678,8 +696,10 @@ fn list_folder_description_documents_zero_folder_size() {
     assert!(desc.contains("page through with 'offset'"), "desc: {desc}");
     assert!(desc.contains("'truncated'"), "desc: {desc}");
     let schema = &list["tools"][1]["inputSchema"];
-    assert_eq!(schema["properties"]["max_results"]["maximum"], 500);
+    assert_eq!(schema["properties"]["max_results"]["maximum"], 2000);
     assert_eq!(schema["properties"]["max_results"]["minimum"], 1);
+    // 上限放宽到 2000，但默认值刻意留在 500 —— 纯扩展，老调用方行为不变。
+    assert_eq!(schema["properties"]["max_results"]["default"], 500);
     assert_eq!(schema["properties"]["offset"]["default"], 0);
     // 超时也要可调，与另外三个搜索类工具对齐（原先写死 10 秒）。
     assert_eq!(schema["properties"]["timeout_ms"]["default"], 10000);
@@ -689,19 +709,28 @@ fn list_folder_description_documents_zero_folder_size() {
 }
 
 #[test]
-fn list_folder_window_is_validated_before_touching_everything() {
-    // 0 与 501 都是写错（0 不是「不限」）—— 在触达 Everything 之前报错，
-    // 所以这条测试在没有主程序的环境里也能跑。
+fn result_window_is_validated_identically_across_the_three_search_tools() {
+    // 三个搜索工具的 max_results 共用 tools.rs 的 RESULT_WINDOW_MAX：1..2000，
+    // 0 是写错而不是「不限」。search_in_folder 原先的「0 = 不限」是全库唯一的
+    // 哨兵例外，这条测试保证它不会再回来。
+    //
+    // 全部在触达 Everything host 之前返回，无主程序环境的 CI 也能跑。
     // 注意合法窗口不能在这里断言「没被拒」：那会走到搜索层，而 Host::get()
     // 在测试进程里没有 PM_INIT，直接 panic（这是本仓库的既有约定）。
-    for bad in [0, 501] {
-        let err = tools::dispatch(
-            "list_folder",
-            &json!({"folder": "C:\\", "max_results": bad}),
-        )
-        .unwrap_err();
-        assert_eq!(err.0, protocol::INVALID_PARAMS, "max_results={bad}");
-        assert!(err.1.contains("between 1 and 500"), "{}", err.1);
+    let cases = [
+        ("search_in_folder", json!({"folder": "C:\\", "pattern": "*.rs"})),
+        ("list_folder", json!({"folder": "C:\\"})),
+        ("search_everywhere", json!({"pattern": "ab"})),
+    ];
+    for (tool, base) in cases {
+        for bad in [0, 2001, 99999] {
+            let mut args = base.clone();
+            args["max_results"] = json!(bad);
+            let err = tools::dispatch(tool, &args).unwrap_err();
+            assert_eq!(err.0, protocol::INVALID_PARAMS, "{tool} max_results={bad}");
+            assert!(err.1.contains("max_results"), "{tool}: {}", err.1);
+            assert!(err.1.contains("between 1 and 2000"), "{tool}: {}", err.1);
+        }
     }
 }
 
@@ -984,16 +1013,9 @@ fn search_everywhere_arg_validation_before_touching_anything() {
     assert_eq!(err.0, protocol::INVALID_PARAMS);
     assert!(err.1.contains("content:"), "{}", err.1);
 
-    // max_results 是硬窗口：0 与 501 都是写错，不是「不限」。
-    for bad in [0, 501] {
-        let err = tools::dispatch(
-            "search_everywhere",
-            &json!({"pattern": "ab", "max_results": bad}),
-        )
-        .unwrap_err();
-        assert_eq!(err.0, protocol::INVALID_PARAMS, "max_results={bad}");
-        assert!(err.1.contains("between 1 and 500"), "{}", err.1);
-    }
+    // max_results 的窗口校验与另外两个搜索工具同一套 —— 由
+    // result_window_is_validated_identically_across_the_three_search_tools 覆盖，
+    // 这里不重复。
 
     // content: 闸门在 exclude 上也要生效：exclude 项会被拼成 `!term` 进同一条
     // 全局查询，只查 pattern 的话就能从旁边绕过护栏。

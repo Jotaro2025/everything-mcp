@@ -259,10 +259,14 @@ Everything 官方插件页：<https://www.voidtools.com/support/everything/plugi
   默认都是 `false`。也可以直接在 pattern 里写 `case:` / `ww:` / `regex:`，
   但 **`case:` 后面不能有空格**：写 `case:content:"x"` 生效，写
   `case: content:"x"` 会被静默忽略、按不区分大小写返回结果。
-- **翻页**：`offset` 指定从第几条开始返回（默认 0）。`max_results = 0`
-  表示无上限（大目录慎用）。响应里 `count` 是实际返回条数（受
-  `max_results` 截断），`total` 是命中总数 —— 两者不等即说明还有更多，
-  把 `offset` 递增 `count` 再查一批即可翻页。
+- **翻页**：`offset` 指定从第几条开始返回（默认 0），`max_results` 是
+  1..2000（默认 50，`0` 是写错而不是「不限」）。响应里 `count` 是实际返回
+  条数，`total` 是命中总数，`truncated` 直接给出「还有更多」这个判断 —— 把
+  `offset` 递增 `count` 再查一批即可翻页。**但优先收窄 `pattern` / `exclude`**：
+  每一页都会重新执行一次查询，而单次调用有约 50 ms 的固定成本，翻页等于把这份
+  成本乘以页数（实测 4419 条按 500 一页翻约 450 ms，一次拿完只要 88 ms）。
+- **响应体另有一道 512 KiB 字节预算**：条数之外还按字节卡，路径特别长时返回
+  条数会少于 `max_results` —— 这种情况 `truncated` 同样是 `true`。
 
 
 `exclude` 参数（三个工具都支持）：字符串或字符串数组，每项作为一条
@@ -337,7 +341,7 @@ gitignore），常见做法：
   而非缺失。要整个目录树的内容，用 `search_in_folder` 递归搜索。
 - 每条同样带 `modified` / `created`（ISO 8601 UTC，无该时间时为 `null`）。
 - 响应同样带 `total`（该目录直接子项总数，排除后的数量）。
-- **大目录要翻页**：`max_results` 默认 500、上限也是 500，`offset` 往后走。
+- **大目录要翻页**：`max_results` 默认 500、上限 2000，`offset` 往后走。
   `count` < `total` 时说明还有下一页，`truncated` 直接给出这个判断。繁忙目录
   可以有几千个直接子项（`C:\Windows\System32` 实测约 4900 个），旧版写死
   500 条且没有 `offset`，第 501 项之后拿不到。
@@ -530,12 +534,11 @@ gitignore），常见做法：
   的 `search_in_folder`。两道都在触达 Everything 之前返回 `-32602
   INVALID_PARAMS`。注意「≥2 字符」只挡空 / 单字符，**不是范围控制**：`*.`、
   `a*`、`dm:thisyear` 都合法且命中量巨大 —— 真正的范围控制是档位闸门与
-  `max_results` 上限（500），`offset` 可以继续往后翻。
+  `max_results` 上限（2000），`offset` 可以继续往后翻。
 - 入参与 `search_in_folder` 同构：`exclude` / `sort` / `descending` /
   `match_case` / `match_whole_word` / `match_regex` / `offset` / `timeout_ms`
-  语义一致；区别是 `max_results` 上限 **500**（全局窗口必须封顶），`0` 或越界
-  直接 `-32602`，不是「不限」——这一点与 `search_in_folder` 的
-  `max_results = 0` 语义不同。
+  语义一致；`max_results` 也与另外两个搜索工具同一套硬窗口（1..2000），
+  `0` 或越界直接 `-32602`，不是「不限」。
 - 结果每条带 `name` / `path` / `kind` / `size` / `modified` / `created`
   （时间戳为 ISO 8601 UTC），同样有 `count` / `total` 配对，用 `offset` 翻页。
 

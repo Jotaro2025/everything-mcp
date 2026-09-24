@@ -227,7 +227,7 @@ pub fn make_discover_result() -> Value {
                 "version": env!("CARGO_PKG_VERSION")
             }
         },
-        "instructions": "Folder-scoped Everything file search. Search scope follows Everything's index: local drives are included automatically, but a network share is only searchable after being added in Tools > Options > Indexes > Folders — an un-indexed share yields 0 results, not an error. Use search_in_folder with an absolute folder path (a drive path like D:\\source\\repos\\myproject or a UNC path like \\\\server\\share\\project) plus Everything search syntax; list_folder for immediate children; count for totals only; index_changes to read the index journal (created/modified/deleted/renamed); it needs journal_log enabled in Everything and returns an actionable error when it is not. search_everywhere finds files/folders by NAME across the whole index without a folder — for when you know what it is called but not where it lives; it is gated by the server's global-search policy ('deny' rejects every call with GLOBAL_SEARCH_DISABLED, 'review' requires the user to confirm first, 'allow' serves calls directly) and its pattern must be at least 2 characters with no 'content:' in either 'pattern' or 'exclude'. search_in_folder results carry size and modified/created timestamps, can be sorted (sort=name|path|size|modified|created, descending=true for newest/largest first), and support case/whole-word/regex matching. Results are capped by max_results and carry a separate 'total' count of all matches found — when count < total, page through with 'offset'.",
+        "instructions": "Folder-scoped Everything file search. Search scope follows Everything's index: local drives are included automatically, but a network share is only searchable after being added in Tools > Options > Indexes > Folders — an un-indexed share yields 0 results, not an error. Use search_in_folder with an absolute folder path (a drive path like D:\\source\\repos\\myproject or a UNC path like \\\\server\\share\\project) plus Everything search syntax; list_folder for immediate children; count for totals only; index_changes to read the index journal (created/modified/deleted/renamed); it needs journal_log enabled in Everything and returns an actionable error when it is not. search_everywhere finds files/folders by NAME across the whole index without a folder — for when you know what it is called but not where it lives; it is gated by the server's global-search policy ('deny' rejects every call with GLOBAL_SEARCH_DISABLED, 'review' requires the user to confirm first, 'allow' serves calls directly) and its pattern must be at least 2 characters with no 'content:' in either 'pattern' or 'exclude'. search_in_folder results carry size and modified/created timestamps, can be sorted (sort=name|path|size|modified|created, descending=true for newest/largest first), and support case/whole-word/regex matching. Results are capped by max_results and carry a separate 'total' count of all matches found plus a 'truncated' flag — when truncated, page through with 'offset' (prefer narrowing the pattern instead: every page re-runs the search).",
         "ttlMs": DISCOVER_TTL_MS,
         "cacheScope": CACHE_SCOPE_PUBLIC
     })
@@ -311,7 +311,7 @@ fn search_everywhere_entry(mode: GlobalSearchMode) -> Value {
     serde_json::json!({
         "name": "search_everywhere",
         "description": format!(
-            "{} Search file/folder NAMES across the ENTIRE Everything index — every local drive and indexed network share — without naming a folder. Use it when you know what a file is called but not where it lives (e.g. a folder somewhere on a NAS share), then hand the returned full paths to search_in_folder / list_folder for anything scoped. It exposes the whole machine's file names to the caller — hence the per-server policy above. Same Everything search syntax as search_in_folder's pattern ('*.vhd', '\"quarterly report\"', 'ext:pdf;docx dm:thisyear', 'backup !\\\\old\\\\') with two guard rails: 'pattern' must be at least 2 characters, and 'content:' is rejected in BOTH 'pattern' and 'exclude' (content search stays folder-scoped in search_in_folder). Each result carries the full path plus size and modified/created (ISO 8601 UTC); 'max_results' (1..500, default 50) caps the window and 'total' reports all matches — page with 'offset' like search_in_folder.",
+            "{} Search file/folder NAMES across the ENTIRE Everything index — every local drive and indexed network share — without naming a folder. Use it when you know what a file is called but not where it lives (e.g. a folder somewhere on a NAS share), then hand the returned full paths to search_in_folder / list_folder for anything scoped. It exposes the whole machine's file names to the caller — hence the per-server policy above. Same Everything search syntax as search_in_folder's pattern ('*.vhd', '\"quarterly report\"', 'ext:pdf;docx dm:thisyear', 'backup !\\\\old\\\\') with two guard rails: 'pattern' must be at least 2 characters, and 'content:' is rejected in BOTH 'pattern' and 'exclude' (content search stays folder-scoped in search_in_folder). Each result carries the full path plus size and modified/created (ISO 8601 UTC); 'max_results' (1..2000, default 50) caps the window and 'total' reports all matches — page with 'offset' when 'truncated' is true.",
             policy
         ),
         "annotations": {
@@ -366,10 +366,10 @@ fn search_everywhere_entry(mode: GlobalSearchMode) -> Value {
                 },
                 "max_results": {
                     "type": "integer",
-                    "description": "Maximum number of results to return (1..500). Default 50.",
+                    "description": "Maximum number of results to return (1..2000). Default 50.",
                     "default": 50,
                     "minimum": 1,
-                    "maximum": 500
+                    "maximum": 2000
                 },
                 "timeout_ms": {
                     "type": "integer",
@@ -399,7 +399,7 @@ pub fn make_tools_list(mode: GlobalSearchMode) -> Value {
         "tools": [
             {
                 "name": "search_in_folder",
-                "description": "Search files/folders recursively under a specific folder using Everything search syntax. Prefer this over global search when working within a project directory. This is not shell glob: use '*.rs', not '**/*.rs' (a leading '**/' is stripped for you); exclude matches with a '!' prefix (e.g. 'ext:rs !test') or the 'exclude' parameter (e.g. ['\\obj\\', '\\.git\\'] to drop build/VCS noise); 'content:\"fn main\"' searches file contents (it works with no content index on the Everything side, but an unfiltered content search over a large tree is slow enough to time out — narrow it with 'ext:', a subfolder or 'exclude', or raise 'timeout_ms'). Each result carries 'size' plus 'modified'/'created' (ISO 8601 UTC). The response reports both 'count' (entries returned, capped by max_results) and 'total' (all matches found) — when they differ, page through with 'offset'. Results are sorted by 'sort' (default name ascending). When nothing matches, the response adds a 'folder_warning' if the folder does not exist, is unreachable, or is a file — so an empty result is distinguishable from a wrong path. Search scope follows Everything's index: local drives are included automatically, but a network share is only searchable after being added in Tools > Options > Indexes > Folders — an un-indexed share yields 0 results, not an error.",
+                "description": "Search files/folders recursively under a specific folder using Everything search syntax. Prefer this over global search when working within a project directory. This is not shell glob: use '*.rs', not '**/*.rs' (a leading '**/' is stripped for you); exclude matches with a '!' prefix (e.g. 'ext:rs !test') or the 'exclude' parameter (e.g. ['\\obj\\', '\\.git\\'] to drop build/VCS noise); 'content:\"fn main\"' searches file contents (it works with no content index on the Everything side, but an unfiltered content search over a large tree is slow enough to time out — narrow it with 'ext:', a subfolder or 'exclude', or raise 'timeout_ms'). Each result carries 'size' plus 'modified'/'created' (ISO 8601 UTC). The response reports 'count' (entries returned), 'total' (all matches found) and 'truncated' (true when more remain); page through with 'offset' when truncated — though narrowing 'pattern'/'exclude' is usually cheaper, since every page re-runs the search. Results are sorted by 'sort' (default name ascending). When nothing matches, the response adds a 'folder_warning' if the folder does not exist, is unreachable, or is a file — so an empty result is distinguishable from a wrong path. Search scope follows Everything's index: local drives are included automatically, but a network share is only searchable after being added in Tools > Options > Indexes > Folders — an un-indexed share yields 0 results, not an error.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -449,9 +449,10 @@ pub fn make_tools_list(mode: GlobalSearchMode) -> Value {
                         },
                         "max_results": {
                             "type": "integer",
-                            "description": "Maximum number of results to return. 0 = no limit (default 50).",
+                            "description": "Maximum number of results to return (1..2000, default 50). 0 is rejected, not 'no limit'. The entries are also bounded by a 512 KiB budget, so a window of unusually long paths can come back shorter than requested — 'truncated' reports that either way. Page with 'offset', but prefer narrowing 'pattern'/'exclude' first: every page re-runs the search.",
                             "default": 50,
-                            "minimum": 0
+                            "minimum": 1,
+                            "maximum": 2000
                         },
                         "timeout_ms": {
                             "type": "integer",
@@ -466,7 +467,7 @@ pub fn make_tools_list(mode: GlobalSearchMode) -> Value {
             },
             {
                 "name": "list_folder",
-                "description": "List immediate children of a folder (non-recursive). Returns both files and sub-folders; folder entries always report size 0 (Everything does not compute directory sizes). Each entry also carries 'modified'/'created' (ISO 8601 UTC). Use search_in_folder when you need the whole tree. Pass 'exclude' to skip children such as '.git', 'obj', 'node_modules'. Results are capped by 'max_results' (1..500, default 500) and carry a separate 'total' of all children — when 'count' < 'total', page through with 'offset' (a busy directory can hold thousands of children, e.g. C:\\Windows\\System32 has ~4900). 'truncated' says whether more children remain, and 'timeout_ms' raises the wait for a slow or offline share. When the folder is empty, the response adds a 'folder_warning' if it does not exist, is unreachable, or is a file — so an empty result is distinguishable from a wrong path. Search scope follows Everything's index: local drives are included automatically, but a network share is only searchable after being added in Tools > Options > Indexes > Folders — an un-indexed share yields 0 results, not an error.",
+                "description": "List immediate children of a folder (non-recursive). Returns both files and sub-folders; folder entries always report size 0 (Everything does not compute directory sizes). Each entry also carries 'modified'/'created' (ISO 8601 UTC). Use search_in_folder when you need the whole tree. Pass 'exclude' to skip children such as '.git', 'obj', 'node_modules'. Results are capped by 'max_results' (1..2000, default 500) and carry a separate 'total' of all children — when 'count' < 'total', page through with 'offset' (a busy directory can hold thousands of children, e.g. C:\\Windows\\System32 has ~4900). 'truncated' says whether more children remain, and 'timeout_ms' raises the wait for a slow or offline share. When the folder is empty, the response adds a 'folder_warning' if it does not exist, is unreachable, or is a file — so an empty result is distinguishable from a wrong path. Search scope follows Everything's index: local drives are included automatically, but a network share is only searchable after being added in Tools > Options > Indexes > Folders — an un-indexed share yields 0 results, not an error.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -483,10 +484,10 @@ pub fn make_tools_list(mode: GlobalSearchMode) -> Value {
                         },
                         "max_results": {
                             "type": "integer",
-                            "description": "Maximum number of children to return (1..500). Default 500.",
+                            "description": "Maximum number of children to return (1..2000). Default 500.",
                             "default": 500,
                             "minimum": 1,
-                            "maximum": 500
+                            "maximum": 2000
                         },
                         "timeout_ms": {
                             "type": "integer",

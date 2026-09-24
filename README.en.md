@@ -293,10 +293,16 @@ Recursively find files/folders under a given folder using Everything search synt
   while `case: content:"x"` is silently ignored and the search comes back
   case-insensitive.
 - **Paging**: `offset` is the index of the first result to return
-  (default 0). `max_results = 0` means unlimited (careful with huge
-  folders). The response reports `count` (entries returned, capped by
-  `max_results`) and `total` (all matches found) — when they differ there
-  is more, so advance `offset` by `count` and query again.
+  (default 0) and `max_results` is 1..2000 (default 50; `0` is a mistake, not
+  "unlimited"). The response reports `count` (entries returned), `total` (all
+  matches found) and `truncated` (true when more remain), so advance `offset`
+  by `count` and query again. **Prefer narrowing `pattern` / `exclude` to
+  paging**: every page re-runs the search, and a single call carries a fixed
+  cost of roughly 50 ms, so paging multiplies that cost (measured: 4419 entries
+  in 500-entry pages takes ~450 ms, while fetching them in one call takes 88 ms).
+- **The entries also carry a 512 KiB byte budget**: on top of the entry count
+  there is a limit measured in bytes, so unusually long paths can come back
+  fewer than `max_results` — `truncated` is `true` in that case too.
 
 `exclude` (all three tools accept it): a string or an array of strings,
 each appended as an Everything NOT term. Repository noise is in the
@@ -385,7 +391,7 @@ modification / creation time.
 - The response also carries `total` (number of direct children, after
   exclusions).
 - **Page through big directories**: `max_results` defaults to 500 (and caps at
-  500), with `offset` to move on. When `count` < `total` there is another page,
+  2000), with `offset` to move on. When `count` < `total` there is another page,
   and `truncated` states that outright. A busy directory can hold thousands of
   children (`C:\Windows\System32` measures ~4900), and the older fixed cap of
   500 with no `offset` made everything past the 501st child unreachable.
@@ -623,13 +629,12 @@ follow-up work.
   touches Everything. Note the 2-character rule only blocks empty / one-char
   patterns and is **not a scope control**: `*.`, `a*` and `dm:thisyear` are all
   legal and match enormous sets — the real controls are the mode gate and the
-  `max_results` cap (500), with `offset` paging through the rest.
+  `max_results` cap (2000), with `offset` paging through the rest.
 - Same argument shape as `search_in_folder`: `exclude` / `sort` / `descending`
   / `match_case` / `match_whole_word` / `match_regex` / `offset` / `timeout_ms`
-  all mean the same thing; the difference is `max_results` caps at **500** (the
-  global window must be bounded), and `0` or out-of-range is a plain `-32602`,
-  not "unlimited" — unlike `search_in_folder`, where `max_results = 0` means
-  unlimited.
+  all mean the same thing, and `max_results` shares the same hard window as the
+  other two search tools (1..2000): `0` or out-of-range is a plain `-32602`,
+  not "unlimited".
 - Each result carries `name` / `path` / `kind` / `size` / `modified` /
   `created` (ISO 8601 UTC timestamps), with the same `count` / `total` pair
   and `offset` paging.
