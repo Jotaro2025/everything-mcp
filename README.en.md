@@ -334,7 +334,8 @@ modified files with `dm:lastweek`. Measured on one repository:
 | `ext:rs content:"db_query_search2"` | returns 9 files immediately |
 
 **2. Raise `timeout_ms`.** If it still times out after narrowing, increase it
-(default 10000, no upper bound is enforced).
+(default 10000; it must be an integer in 1..4294967295 — 0 and out-of-range
+values are rejected rather than silently mangled).
 
 **3. Turn on content indexing (permanent, but only for the indexed
 folders).** In Everything, go to Tools → Options → Indexes → Folders, select

@@ -800,7 +800,7 @@ pub fn dispatch(name: &str, args: &Value) -> Result<ToolOutput, (i32, String)> {
                     ),
                 ));
             }
-            let timeout_ms = u64_arg(args, "timeout_ms", 10_000)? as u32;
+            let timeout_ms = timeout_arg(args, 10_000)?;
             let sort = sort_arg(args)?;
             let descending = bool_arg(args, "descending", false)?;
 

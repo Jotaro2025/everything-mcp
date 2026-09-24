@@ -373,8 +373,10 @@ fn search_everywhere_entry(mode: GlobalSearchMode) -> Value {
                 },
                 "timeout_ms": {
                     "type": "integer",
-                    "description": "Maximum time in milliseconds to wait for results (default 10000).",
-                    "default": 10000
+                    "description": "Maximum time in milliseconds to wait for results (1..4294967295, default 10000).",
+                    "default": 10000,
+                    "minimum": 1,
+                    "maximum": 4294967295u64
                 }
             },
             "required": ["pattern"]
@@ -448,12 +450,15 @@ pub fn make_tools_list(mode: GlobalSearchMode) -> Value {
                         "max_results": {
                             "type": "integer",
                             "description": "Maximum number of results to return. 0 = no limit (default 50).",
-                            "default": 50
+                            "default": 50,
+                            "minimum": 0
                         },
                         "timeout_ms": {
                             "type": "integer",
-                            "description": "Maximum time in milliseconds to wait for results (default 10000).",
-                            "default": 10000
+                            "description": "Maximum time in milliseconds to wait for results (1..4294967295, default 10000).",
+                            "default": 10000,
+                            "minimum": 1,
+                            "maximum": 4294967295u64
                         }
                     },
                     "required": ["folder", "pattern"]
@@ -485,8 +490,10 @@ pub fn make_tools_list(mode: GlobalSearchMode) -> Value {
                         },
                         "timeout_ms": {
                             "type": "integer",
-                            "description": "Maximum time in milliseconds to wait for results (default 10000). Raise it for a folder on a slow or offline network share.",
-                            "default": 10000
+                            "description": "Maximum time in milliseconds to wait for results (1..4294967295, default 10000). Raise it for a folder on a slow or offline network share.",
+                            "default": 10000,
+                            "minimum": 1,
+                            "maximum": 4294967295u64
                         }
                     },
                     "required": ["folder"]
@@ -499,7 +506,11 @@ pub fn make_tools_list(mode: GlobalSearchMode) -> Value {
                     "type": "object",
                     "properties": {
                         "folder": { "type": "string", "description": "Absolute path to the folder to count in, e.g. D:\\source\\repos\\myproject, or an indexed UNC path like \\\\server\\share\\project" },
-                        "pattern": { "type": "string", "default": "" },
+                        "pattern": {
+                            "type": "string",
+                            "description": "Everything search pattern, same syntax as search_in_folder's pattern: '*.rs' (extension), 'readme' (substring), 'ext:md;txt' (multiple extensions), '\"exact phrase\"'. Empty counts every file and folder under 'folder'.",
+                            "default": ""
+                        },
                         "exclude": {
                             "type": ["string", "array"],
                             "items": { "type": "string" },
@@ -615,8 +626,10 @@ pub fn make_tools_list(mode: GlobalSearchMode) -> Value {
                         },
                         "timeout_ms": {
                             "type": "integer",
-                            "description": "Maximum time in milliseconds to wait for the Everything candidate query (default 10000). Reading the candidates afterwards is not covered by it.",
-                            "default": 10000
+                            "description": "Maximum time in milliseconds to wait for the Everything candidate query (1..4294967295, default 10000). Reading the candidates afterwards is not covered by it.",
+                            "default": 10000,
+                            "minimum": 1,
+                            "maximum": 4294967295u64
                         }
                     },
                     "required": ["pattern", "folder"]

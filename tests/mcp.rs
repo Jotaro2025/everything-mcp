@@ -78,9 +78,21 @@ fn tools_list_contains_seven_tools_with_required_params() {
         search["inputSchema"]["properties"]["max_results"]["default"],
         50
     );
+    // 0 = 不限是 search_in_folder 有意保留的语义（描述与 README 都写明），
+    // schema 里如实标 min 0 —— 另外两个搜索工具的 max_results 是 1..500 硬窗口。
+    assert_eq!(
+        search["inputSchema"]["properties"]["max_results"]["minimum"],
+        0
+    );
     assert_eq!(
         search["inputSchema"]["properties"]["timeout_ms"]["default"],
         10_000
+    );
+    // timeout_ms 的 schema 范围必须与运行时校验一致：timeout_arg 拒 0 与 > u32::MAX。
+    assert_eq!(search["inputSchema"]["properties"]["timeout_ms"]["minimum"], 1);
+    assert_eq!(
+        search["inputSchema"]["properties"]["timeout_ms"]["maximum"],
+        4294967295u64
     );
 
     // 排序 / 分页 / 匹配开关：全部可选，且带默认值。
@@ -132,6 +144,8 @@ fn tools_list_contains_seven_tools_with_required_params() {
     assert_eq!(grep_props["head_limit"]["default"], 200);
     assert_eq!(grep_props["case_insensitive"]["default"], false);
     assert_eq!(grep_props["timeout_ms"]["default"], 10_000);
+    assert_eq!(grep_props["timeout_ms"]["minimum"], 1);
+    assert_eq!(grep_props["timeout_ms"]["maximum"], 4294967295u64);
 
     // search_everywhere：只要求 pattern；max_results 是硬窗口 1..500。
     assert_eq!(tools[6]["inputSchema"]["required"], json!(["pattern"]));
@@ -141,6 +155,8 @@ fn tools_list_contains_seven_tools_with_required_params() {
     assert_eq!(global_props["max_results"]["maximum"], 500);
     assert_eq!(global_props["offset"]["default"], 0);
     assert_eq!(global_props["timeout_ms"]["default"], 10_000);
+    assert_eq!(global_props["timeout_ms"]["minimum"], 1);
+    assert_eq!(global_props["timeout_ms"]["maximum"], 4294967295u64);
     assert_eq!(global_props["sort"]["default"], "name");
     assert_eq!(
         global_props["sort"]["enum"],
@@ -667,6 +683,8 @@ fn list_folder_description_documents_zero_folder_size() {
     assert_eq!(schema["properties"]["offset"]["default"], 0);
     // 超时也要可调，与另外三个搜索类工具对齐（原先写死 10 秒）。
     assert_eq!(schema["properties"]["timeout_ms"]["default"], 10000);
+    assert_eq!(schema["properties"]["timeout_ms"]["minimum"], 1);
+    assert_eq!(schema["properties"]["timeout_ms"]["maximum"], 4294967295u64);
     assert!(desc.contains("timeout_ms"), "desc: {desc}");
 }
 
@@ -688,10 +706,46 @@ fn list_folder_window_is_validated_before_touching_everything() {
 }
 
 #[test]
+fn timeout_ms_is_validated_identically_across_the_four_search_tools() {
+    // 四个搜索类工具的 timeout_ms 共用 tools.rs 的 timeout_arg：0 与 > u32::MAX
+    // 都按写错处理，返回带范围的 INVALID_PARAMS。
+    //
+    // 这条不变式曾被 search_everywhere 打破 —— 它写的是 `u64_arg(...)? as u32`，
+    // 传 2^32 被截断成 0 后等待循环一次都不跑（search.rs 的
+    // `while waited < timeout_ms`），调用方只拿到 "search timeout after 0 ms"
+    // 这种毫无线索的错误。四个一起断言，任何一处再退回去都会被这条挡住。
+    //
+    // 全部在触达 Everything host 之前返回，无主程序环境的 CI 也能跑。
+    let cases = [
+        ("search_in_folder", json!({"folder": "C:\\", "pattern": "*.rs"})),
+        ("list_folder", json!({"folder": "C:\\"})),
+        ("grep", json!({"folder": "C:\\", "pattern": "x"})),
+        ("search_everywhere", json!({"pattern": "ab"})),
+    ];
+    for (tool, base) in cases {
+        for bad in [0u64, 1u64 << 32, u64::MAX] {
+            let mut args = base.clone();
+            args["timeout_ms"] = json!(bad);
+            let err = tools::dispatch(tool, &args).unwrap_err();
+            assert_eq!(err.0, protocol::INVALID_PARAMS, "{tool} timeout_ms={bad}");
+            assert!(err.1.contains("timeout_ms"), "{tool}: {}", err.1);
+            assert!(err.1.contains("between 1 and"), "{tool}: {}", err.1);
+        }
+    }
+}
+
+#[test]
 fn count_description_documents_fast_path() {
     let list = protocol::make_tools_list(protocol::GlobalSearchMode::Deny);
     let desc = list["tools"][2]["description"].as_str().unwrap();
     assert!(desc.contains("without fetching names"), "desc: {desc}");
+    // pattern 是六个静态条目里唯一没有 description 的参数 —— 补上，
+    // 并说明空 pattern 的语义（统计该目录下全部条目）。
+    let pattern = &list["tools"][2]["inputSchema"]["properties"]["pattern"];
+    let pattern_desc = pattern["description"].as_str().expect("pattern 必须有描述");
+    assert!(pattern_desc.contains("*.rs"), "desc: {pattern_desc}");
+    assert!(pattern_desc.contains("Empty"), "desc: {pattern_desc}");
+    assert_eq!(pattern["default"], "");
 }
 
 #[test]
