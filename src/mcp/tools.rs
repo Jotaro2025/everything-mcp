@@ -414,12 +414,15 @@ pub fn dispatch(name: &str, args: &Value) -> Result<ToolOutput, (i32, String)> {
             }
             // 用「直接子项」范围（SearchScope::Children → parent:"<folder>"）：
             // 无排除项时 query 为空串，等价于列出该目录全部直接子项，不递归。
+            // 超时同样可调：一个挂着离线共享的目录要等多久，调用方说了算
+            // （原先写死 10 秒，与另外三个搜索类工具不对称）。
+            let timeout_ms = timeout_arg(args, 10_000)?;
             match plugin::search::search_in_folder(
                 &folder,
                 &query,
                 offset,
                 max_results,
-                10_000,
+                timeout_ms,
                 plugin::search::SearchOptions::for_scope(plugin::search::SearchScope::Children),
             ) {
                 Ok(outcome) => {

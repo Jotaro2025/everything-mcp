@@ -157,8 +157,8 @@ Outputs (in `installer\dist\`):
 
 | Installer                            | Arch | Embedded plugin dll   |
 | ------------------------------------ | ---- | --------------------- |
-| `everything-mcp-1.1.6-x64-setup.exe` | x64  | `everything_mcp64.dll` |
-| `everything-mcp-1.1.6-x86-setup.exe` | x86  | `everything_mcp32.dll` |
+| `everything-mcp-1.1.7-x64-setup.exe` | x64  | `everything_mcp64.dll` |
+| `everything-mcp-1.1.7-x86-setup.exe` | x86  | `everything_mcp32.dll` |
 
 To install, run the installer for your architecture; Everything then shows its
 "Setup Plugin" dialog, where you click Install. Both installers can be
@@ -388,6 +388,8 @@ modification / creation time.
   and `truncated` states that outright. A busy directory can hold thousands of
   children (`C:\Windows\System32` measures ~4900), and the older fixed cap of
   500 with no `offset` made everything past the 501st child unreachable.
+- `timeout_ms` defaults to 10000, matching the other three search tools (this
+  call used to be pinned to 10 s, with no way to widen it for a slow share).
 
 #### 3. `count`
 

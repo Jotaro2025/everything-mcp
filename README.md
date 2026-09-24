@@ -142,8 +142,8 @@ powershell -ExecutionPolicy Bypass -File build-installers.ps1
 
 | 安装包                              | 架构 | 内嵌插件 dll           |
 | ----------------------------------- | ---- | ---------------------- |
-| `everything-mcp-1.1.6-x64-setup.exe` | x64  | `everything_mcp64.dll` |
-| `everything-mcp-1.1.6-x86-setup.exe` | x86  | `everything_mcp32.dll` |
+| `everything-mcp-1.1.7-x64-setup.exe` | x64  | `everything_mcp64.dll` |
+| `everything-mcp-1.1.7-x86-setup.exe` | x86  | `everything_mcp32.dll` |
 
 安装：运行对应架构的安装包 → Everything 弹出「设置插件」对话框 → 点「安装」。
 两个安装包可以一起分发，`Plugins\` 下 `everything_mcp64.dll` 与
@@ -340,6 +340,8 @@ gitignore），常见做法：
   `count` < `total` 时说明还有下一页，`truncated` 直接给出这个判断。繁忙目录
   可以有几千个直接子项（`C:\Windows\System32` 实测约 4900 个），旧版写死
   500 条且没有 `offset`，第 501 项之后拿不到。
+- `timeout_ms` 默认 10000，与另外三个搜索类工具一致（旧版这里写死 10 秒，
+  挂着一个慢共享时没法放宽）。
 
 #### 3. `count`
 

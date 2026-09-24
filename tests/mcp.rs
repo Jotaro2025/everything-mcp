@@ -665,6 +665,9 @@ fn list_folder_description_documents_zero_folder_size() {
     assert_eq!(schema["properties"]["max_results"]["maximum"], 500);
     assert_eq!(schema["properties"]["max_results"]["minimum"], 1);
     assert_eq!(schema["properties"]["offset"]["default"], 0);
+    // 超时也要可调，与另外三个搜索类工具对齐（原先写死 10 秒）。
+    assert_eq!(schema["properties"]["timeout_ms"]["default"], 10000);
+    assert!(desc.contains("timeout_ms"), "desc: {desc}");
 }
 
 #[test]
