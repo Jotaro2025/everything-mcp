@@ -666,6 +666,37 @@ pub fn kill_page(_data: *mut c_void) -> *mut c_void {
 // Statistics 只读页
 // ============================================================
 
+/// 上一次实际推送到统计页的数值（渲染缓存）。刷新时逐项 diff：没变的
+/// 汇总行/数据行不再重复 SetDlgItemText —— 典型一次工具调用只动一行
+/// 计数，其余 40+ 格连格式化都跳过。仅在主线程访问（load/定时器回调/
+/// WM_COMMAND 都在主线程），锁无竞争。名字列每会话固定，不入缓存；
+/// 按钮文案不走缓存（两步确认绕过这里直接改按钮）。
+#[derive(Clone, Copy, PartialEq)]
+struct StatsRenderCache {
+    total_calls: u64,
+    connections: u64,
+    requests_total: u64,
+    /// 每行数值列 [calls, ok, err, total_ms, bytes_out]。
+    rows: [[u64; 5]; crate::plugin::stats::TOOL_SLOT_COUNT],
+}
+
+static LAST_STATS_RENDER: Mutex<Option<StatsRenderCache>> = Mutex::new(None);
+
+/// 从快照算出渲染缓存。load 播种与刷新 diff 共用同一映射，防止两处
+/// 手写映射漂移。
+fn render_cache_from(snap: &crate::plugin::stats::StatsSnapshot) -> StatsRenderCache {
+    let mut cache = StatsRenderCache {
+        total_calls: snap.tools.iter().map(|t| t.calls).sum(),
+        connections: snap.global.connections,
+        requests_total: snap.global.requests_total,
+        rows: [[0; 5]; crate::plugin::stats::TOOL_SLOT_COUNT],
+    };
+    for (i, t) in snap.tools.iter().enumerate() {
+        cache.rows[i] = [t.calls, t.ok, t.err, t.total_ms, t.bytes_out];
+    }
+    cache
+}
+
 /// 行优先单元格 ID：`100 + row*6 + col`（col 0 = 工具名，1..=5 数值列）。
 fn stats_cell_id(row: usize, col: usize) -> i32 {
     ID_STATS_CELL_BASE + (row * STATS_COLS + col) as i32
@@ -805,6 +836,9 @@ fn load_stats_page(page: &LoadOptionsPage) -> *mut c_void {
             );
         }
     }
+    // 播种渲染缓存：控件初值就来自这份快照，第一轮定时器刷新无需重推。
+    *LAST_STATS_RENDER.lock().unwrap_or_else(|p| p.into_inner()) =
+        Some(render_cache_from(&snap));
     // 页面打开期间每秒刷一次文本（page_proc 只收到 WM_COMMAND，WM_TIMER
     // 走 TIMERPROC 回调直达，不依赖主程序转发）。窗口销毁时定时器自动回收。
     unsafe {
@@ -913,6 +947,10 @@ fn stats_page_proc(p: &OptionsPageProc) -> *mut c_void {
 
 /// 把 Statistics 页文本刷成当前快照。定时器每秒调一次（restore_button =
 /// false）；清空统计后也调（restore_button = true，把确认文案翻回「清空统计」）。
+///
+/// 逐项 diff：只把相对上次实推有变化的汇总行/数据行推给控件（见
+/// LAST_STATS_RENDER），没变的行连格式化都跳过 —— 典型一次工具调用只
+/// 动一行计数 + 汇总行，其余 40+ 格保持沉默。
 fn refresh_stats_page_text(page_hwnd: HWND, restore_button: bool) {
     let host = Host::get();
     let set_text = match host.os_set_dlg_text {
@@ -921,28 +959,33 @@ fn refresh_stats_page_text(page_hwnd: HWND, restore_button: bool) {
     };
     let labels = labels();
     let snap = crate::plugin::stats::snapshot();
-    let total_calls: u64 = snap.tools.iter().map(|t| t.calls).sum();
-    let texts: Vec<(i32, String)> = vec![
-        (
-            ID_STATS_TOTAL,
-            format!("{} {}", labels.stats_total, total_calls),
-        ),
-        (
-            ID_STATS_CONNECTIONS,
-            format!("{} {}", labels.stats_connections, snap.global.connections),
-        ),
-        (
-            ID_STATS_REQUESTS,
-            format!("{} {}", labels.stats_requests, snap.global.requests_total),
-        ),
-    ];
+    let cache = render_cache_from(&snap);
+
+    let mut last = LAST_STATS_RENDER.lock().unwrap_or_else(|p| p.into_inner());
+    let prev = *last;
     unsafe {
-        for (id, t) in texts {
+        // 汇总三行：逐行 diff。
+        if prev.map_or(true, |p| p.total_calls != cache.total_calls) {
+            let t = format!("{} {}", labels.stats_total, cache.total_calls);
             let b = cstr_bytes(&t);
-            set_text(page_hwnd, id, b.as_ptr());
+            set_text(page_hwnd, ID_STATS_TOTAL, b.as_ptr());
+        }
+        if prev.map_or(true, |p| p.connections != cache.connections) {
+            let t = format!("{} {}", labels.stats_connections, cache.connections);
+            let b = cstr_bytes(&t);
+            set_text(page_hwnd, ID_STATS_CONNECTIONS, b.as_ptr());
+        }
+        if prev.map_or(true, |p| p.requests_total != cache.requests_total) {
+            let t = format!("{} {}", labels.stats_requests, cache.requests_total);
+            let b = cstr_bytes(&t);
+            set_text(page_hwnd, ID_STATS_REQUESTS, b.as_ptr());
         }
         // 8 行 = 7 真实工具 + 兜底行，与 load_stats_page 一一对应。
+        // 整行 diff：数值没变的行跳过（名字列只在创建时写一次，永不变化）。
         for i in 0..crate::plugin::stats::TOOL_SLOT_COUNT {
+            if prev.map_or(false, |p| p.rows[i] == cache.rows[i]) {
+                continue;
+            }
             let name = crate::plugin::stats::TOOL_NAMES
                 .get(i)
                 .copied()
@@ -959,6 +1002,7 @@ fn refresh_stats_page_text(page_hwnd: HWND, restore_button: bool) {
             set_text(page_hwnd, ID_STATS_CLEAR, b.as_ptr());
         }
     }
+    *last = Some(cache);
 }
 
 /// PM_SAVE_SETTINGS：把当前设置写回主程序的设置输出流（最终落盘到
@@ -1405,5 +1449,48 @@ mod tests {
         for c in 0..STATS_COLS {
             assert!(!seen.contains(&(ID_STATS_HEADER_BASE + c as i32)));
         }
+    }
+
+    #[test]
+    fn render_cache_maps_snapshot_values() {
+        let zero = crate::plugin::stats::ToolSnapshot {
+            calls: 0,
+            ok: 0,
+            err: 0,
+            total_ms: 0,
+            bytes_out: 0,
+        };
+        let mut tools = vec![zero; crate::plugin::stats::TOOL_SLOT_COUNT];
+        tools[0] = crate::plugin::stats::ToolSnapshot {
+            calls: 3,
+            ok: 2,
+            err: 1,
+            total_ms: 30,
+            bytes_out: 300,
+        };
+        tools[crate::plugin::stats::TOOL_SLOT_COUNT - 1] = crate::plugin::stats::ToolSnapshot {
+            calls: 5,
+            ok: 4,
+            err: 1,
+            total_ms: 50,
+            bytes_out: 500,
+        };
+        let snap = crate::plugin::stats::StatsSnapshot {
+            tools,
+            global: crate::plugin::stats::GlobalSnapshot {
+                connections: 7,
+                requests_total: 9,
+                first_seen_unix: 0,
+            },
+        };
+        let cache = render_cache_from(&snap);
+        // 总调用 = 全部槽位之和（含兜底行）。
+        assert_eq!(cache.total_calls, 8);
+        assert_eq!(cache.connections, 7);
+        assert_eq!(cache.requests_total, 9);
+        assert_eq!(cache.rows[0], [3, 2, 1, 30, 300]);
+        assert_eq!(cache.rows[crate::plugin::stats::TOOL_SLOT_COUNT - 1], [5, 4, 1, 50, 500]);
+        // 中间行保持零 —— diff 依赖「没动的行 rows 相等」来跳过推送。
+        assert_eq!(cache.rows[1], [0, 0, 0, 0, 0]);
     }
 }
