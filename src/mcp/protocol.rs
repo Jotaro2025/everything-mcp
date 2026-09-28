@@ -395,7 +395,30 @@ fn search_everywhere_entry(mode: GlobalSearchMode) -> Value {
 /// ToolAnnotations（工具清单的形状不变，`listChanged` 仍可宣告 false）。
 /// 注意 tools/list 结果带 5 分钟 TTL 缓存：切档后注解最多滞后一个 TTL，
 /// 但 Deny 档的硬闸门在调用时检查，立即生效。
+///
+/// 清单只随档位变（3 档），整段描述字符串约 30KB —— 按档位缓存构建
+/// 结果，每次请求只付一次 Value 克隆。锁内返回克隆，调用方的时代装饰
+/// （with_result_type 等）只落在克隆上，缓存永不带时代字段。
+static TOOLS_LIST_CACHE: std::sync::Mutex<[Option<Value>; 3]> =
+    std::sync::Mutex::new([None, None, None]);
+
 pub fn make_tools_list(mode: GlobalSearchMode) -> Value {
+    let slot = match mode {
+        GlobalSearchMode::Deny => 0,
+        GlobalSearchMode::Review => 1,
+        GlobalSearchMode::Allow => 2,
+    };
+    let mut cache = TOOLS_LIST_CACHE.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(cached) = &cache[slot] {
+        return cached.clone();
+    }
+    let built = build_tools_list(mode);
+    cache[slot] = Some(built.clone());
+    built
+}
+
+/// 实际构建工具清单（仅缓存未命中时执行）。
+fn build_tools_list(mode: GlobalSearchMode) -> Value {
     let mut result = serde_json::json!({
         "tools": [
             {

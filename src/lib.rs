@@ -196,6 +196,8 @@ unsafe fn everything_plugin_proc_impl(msg: u32, data: *mut c_void) -> *mut c_voi
 
             // 恢复上次运行的累计统计（必须在任何 record_* 之前）。
             plugin::stats::load_history();
+            // 后台刷盘线程：把磁盘 I/O 挪出请求路径。PM_STOP 会停掉它。
+            plugin::stats::start_flusher();
 
             // 载入设置并应用：启用则启动监听，否则保持关闭。
             // 之后用户在设置页的改动也走同一条应用路径（options::apply）。
@@ -212,6 +214,9 @@ unsafe fn everything_plugin_proc_impl(msg: u32, data: *mut c_void) -> *mut c_voi
         plugin::PM_STOP => {
             Host::debug("everything_mcp: PM_STOP");
             mcp::server::stop();
+            // 排空已完成（server::stop 等在途请求），落最后一笔统计并
+            // 收掉刷盘线程 —— 必须在 FreeLibrary 前 join。
+            plugin::stats::stop_flusher();
             options::mark_stopped();
             plugin::main_thread::destroy_main_window();
             unsafe { plugin::state::destroy() };
@@ -221,6 +226,7 @@ unsafe fn everything_plugin_proc_impl(msg: u32, data: *mut c_void) -> *mut c_voi
         plugin::PM_KILL => {
             Host::debug("everything_mcp: PM_KILL");
             mcp::server::stop();
+            plugin::stats::stop_flusher();
             options::mark_stopped();
             plugin::main_thread::destroy_main_window();
             unsafe { plugin::state::destroy() };

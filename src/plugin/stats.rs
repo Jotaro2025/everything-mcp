@@ -8,18 +8,23 @@
 //!   - **纯计数，不碰 host**：本模块完全独立于 host API（同 diag.rs），
 //!     纯 std::fs 落盘，避免循环依赖。统计路径绝不能在持 HOST_LOCK 的
 //!     调用链上做任何阻塞操作 —— 但因为根本不碰 host，所以无所谓。
-//!   - **原子累加 + 批量刷盘**：热路径上每 20 次调用或 60 秒（先到者）
-//!     才 append 一行 JSONL 到磁盘，避免 diag.rs 那种每次 open/write/flush
-//!     的开销。进程崩溃最多丢最近一小批（约几秒内），这是可接受的取舍。
+//!   - **原子累加 + 后台刷盘**：热路径上只动原子量；每 20 次调用或
+//!     60 秒（先到者）由后台刷盘线程 append 一批 JSONL 到磁盘 —— 磁盘
+//!     I/O 绝不在请求路径上，也不在 Everything 的 UI 线程上。进程崩溃
+//!     最多丢最近一小批（约几秒内），这是可接受的取舍。线程生命周期
+//!     归 [`start_flusher`] / [`stop_flusher`] 管，PM_STOP 必须停掉它，
+//!     否则 FreeLibrary 后线程会执行已卸载的代码。
 //!   - **隐私**：统计绝不记录文件路径/搜索词/参数值 —— 只记工具名、
 //!     计数、耗时、字节数、时间戳。
 //!   - **fire-and-forget**：统计失败绝不能让工具调用失败，所有 I/O
 //!     错误都吞掉（内部记到 diag 便于排查）。
 
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Condvar, Mutex};
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 use serde_json::json;
 
@@ -47,6 +52,19 @@ const FLUSH_CALL_THRESHOLD: u64 = 20;
 
 /// 批量刷盘阈值：距上次刷盘超过 M 秒刷一次。
 const FLUSH_SECS_THRESHOLD: u64 = 60;
+
+/// stats.jsonl 轮转阈值。超过就整体重写为当前快照 —— load_history 按
+/// 「每工具最后一行」取最新累计，语义不变；重写行的 ts 统一用
+/// first_seen_unix，让全文件最小 ts（重启后 first_seen_unix 的来源）
+/// 不因轮转跳变。
+const STATS_MAX_BYTES: u64 = 1 << 20; // 1 MiB
+
+/// 刷盘线程句柄槽。PM_START 启动、PM_STOP/PM_KILL 停止 —— 线程绝不能
+/// 活过 FreeLibrary，否则会执行已卸载的代码。
+static FLUSHER: Mutex<Option<JoinHandle<()>>> = Mutex::new(None);
+/// 刷盘唤醒：record_call 凑满阈值时 notify；停机时也用它打断 1s tick。
+static FLUSH_WAKE: Condvar = Condvar::new();
+static FLUSH_SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
 /// 每工具统计（全部 AtomicU64 + Relaxed —— 纯单调计数，不需要更强内存序）。
 struct ToolStat {
@@ -231,9 +249,11 @@ pub fn record_call(tool_idx: usize, ok: bool, ms: u64, bytes: u64) {
     let last = LAST_FLUSH_UNIX.load(Ordering::Relaxed);
     let due_by_count = calls >= FLUSH_CALL_THRESHOLD;
     let due_by_time = last != 0 && now.saturating_sub(last) >= FLUSH_SECS_THRESHOLD;
-    let due_first = last == 0; // 首次调用立即刷一次，建立文件
-    if FLUSH_ENABLED.load(Ordering::Relaxed) && (due_by_count || due_by_time || due_first) {
-        flush();
+    let due_first = last == 0; // 首次调用尽快建文件
+    if due_by_count || due_by_time || due_first {
+        // 只唤醒后台刷盘线程 —— 磁盘 I/O 不在请求路径上，响应不该等
+        // 一次 open/write/flush 才出发。FLUSH_ENABLED 由线程侧判断。
+        FLUSH_WAKE.notify_all();
     }
 }
 
@@ -306,18 +326,36 @@ pub fn dispatch_ok_flag(resp: &crate::mcp::protocol::JsonRpcMessage) -> Option<b
 // 落盘（JSONL）
 // ====================================================================
 
-/// 真正刷盘（持文件锁 append 一行 JSONL）。任何错误都吞掉。
+/// 真正刷盘。任何错误都吞掉。
 ///
 /// 这里用「快照全部计数器一次性 append」而不是「攒一批 record 后 append」：
 /// 后者需要在内存里维护一个待写队列，复杂度高且容易漏刷。快照式刷盘更简单 ——
 /// 每次把当前累计值写一行，UI 读历史时按 `tool` 聚合最后一条即可（同名多条时
 /// 取最大 `ts` 那条代表最新累计）。批量阈值的作用是控制刷盘频率，不是控制
 /// 单次写入量。
+///
+/// 文件超过 [`STATS_MAX_BYTES`] 时改为整体重写当前快照（轮转）。
 fn flush() {
-    let _g = STATS_FILE_LOCK.lock();
+    let _g = STATS_FILE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let path = stats_path();
-    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&path) {
-        let now = now_unix();
+    let now = now_unix();
+    // 轮转：文件超限就截断重写。行 ts 用 first_seen_unix（0 则用 now），
+    // 保证重启后 load_history 算出的全文件最小 ts 不跳变。
+    let rotate = std::fs::metadata(&path)
+        .map(|m| m.len() > STATS_MAX_BYTES)
+        .unwrap_or(false);
+    let first_seen = GLOBAL.first_seen_unix.load(Ordering::Relaxed);
+    let line_ts = if rotate && first_seen != 0 {
+        first_seen
+    } else {
+        now
+    };
+    let opened: std::io::Result<File> = if rotate {
+        File::create(&path)
+    } else {
+        OpenOptions::new().create(true).append(true).open(&path)
+    };
+    if let Ok(mut f) = opened {
         for (idx, t) in TOOL_STATS.iter().enumerate() {
             let s = t.snapshot();
             if s.calls == 0 {
@@ -325,7 +363,7 @@ fn flush() {
             }
             let name = TOOL_NAMES.get(idx).copied().unwrap_or("_unknown");
             let line = json!({
-                "ts": now,
+                "ts": line_ts,
                 "tool": name,
                 "calls": s.calls,
                 "ok": s.ok,
@@ -338,7 +376,74 @@ fn flush() {
         let _ = f.flush();
     }
     CALLS_SINCE_FLUSH.store(0, Ordering::Relaxed);
-    LAST_FLUSH_UNIX.store(now_unix(), Ordering::Relaxed);
+    LAST_FLUSH_UNIX.store(now, Ordering::Relaxed);
+}
+
+/// PM_START 时启动后台刷盘线程。重复调用是幂等的。
+pub fn start_flusher() {
+    let mut slot = FLUSHER.lock().unwrap_or_else(|p| p.into_inner());
+    if slot.is_some() {
+        return;
+    }
+    FLUSH_SHUTDOWN.store(false, Ordering::SeqCst);
+    if let Ok(h) = thread::Builder::new()
+        .name("everything-mcp-stats".into())
+        .spawn(flusher_loop)
+    {
+        *slot = Some(h);
+    }
+}
+
+/// PM_STOP / PM_KILL 时停止：置停机位、唤醒、join。线程退出前把内存
+/// 计数落最后一笔。必须在 FreeLibrary 之前调用。
+pub fn stop_flusher() {
+    let handle = {
+        let mut slot = FLUSHER.lock().unwrap_or_else(|p| p.into_inner());
+        slot.take()
+    };
+    let Some(h) = handle else {
+        return;
+    };
+    FLUSH_SHUTDOWN.store(true, Ordering::SeqCst);
+    FLUSH_WAKE.notify_all();
+    let _ = h.join();
+}
+
+/// 刷盘线程主体：1s tick 兜底时间阈值；record_call 凑满阈值时立即被
+/// notify 唤醒；停机位置位后落最后一笔退出。没跑 flusher 的构建（测试）
+/// 里 notify 是空操作，flush 由测试显式调用。
+fn flusher_loop() {
+    let gate = Mutex::new(());
+    let mut guard = gate.lock().unwrap_or_else(|p| p.into_inner());
+    loop {
+        guard = match FLUSH_WAKE.wait_timeout(guard, Duration::from_secs(1)) {
+            Ok((g, _)) => g,
+            Err(p) => p.into_inner().0,
+        };
+        if FLUSH_SHUTDOWN.load(Ordering::SeqCst) {
+            if FLUSH_ENABLED.load(Ordering::Relaxed) {
+                flush();
+            }
+            break;
+        }
+        if !FLUSH_ENABLED.load(Ordering::Relaxed) {
+            continue;
+        }
+        let calls = CALLS_SINCE_FLUSH.load(Ordering::Relaxed);
+        if calls == 0 {
+            // 空转时不碰 LAST_FLUSH_UNIX —— 那会把时间阈值和 due_first
+            // 的判定基准一直往后推。
+            continue;
+        }
+        let last = LAST_FLUSH_UNIX.load(Ordering::Relaxed);
+        let now = now_unix();
+        let due = calls >= FLUSH_CALL_THRESHOLD
+            || (last != 0 && now.saturating_sub(last) >= FLUSH_SECS_THRESHOLD)
+            || last == 0;
+        if due {
+            flush();
+        }
+    }
 }
 
 /// 设置测试重定向目录（仅 cfg(test) 构建存在）。传 None 恢复生产路径。
@@ -608,21 +713,21 @@ mod tests {
         set_test_stats_dir(Some(dir.clone()));
         set_flush_enabled(true);
 
-        // due_first：开启刷盘后的第一次调用立即建文件、写第一份快照。
+        // 第一笔：刷盘线程不在（测试构建不起线程），显式 flush 建文件。
         record_call(tool_index("grep"), true, 7, 70);
         record_call(tool_index("grep"), false, 3, 30);
+        flush();
         let path = dir.join("stats.jsonl");
         let text = std::fs::read_to_string(&path).unwrap();
         let (latest, min_ts) = parse_history(&text);
-        assert_eq!(latest[5], Some([1, 1, 0, 7, 70]));
+        assert_eq!(latest[5], Some([2, 1, 1, 10, 100]));
         assert!(min_ts > 0, "flush 必须写时间戳");
 
-        // 再凑满一个刷盘周期（次数阈值路径）：阈值数的是「距上次刷盘」的
-        // 调用数 —— 第 1 次调用已触发刷盘并清零，第 2 次调用 + 下面 19 次
-        // 恰好 20 次，在循环最后一次触发第二次刷盘。
+        // 再记满一个刷盘周期并显式 flush（生产环境由后台线程在阈值处刷）。
         for _ in 0..(FLUSH_CALL_THRESHOLD - 1) {
             record_call(tool_index("grep"), true, 1, 10);
         }
+        flush();
         let text2 = std::fs::read_to_string(&path).unwrap();
         let (latest2, _) = parse_history(&text2);
         assert_eq!(latest2[5], Some([21, 20, 1, 29, 290]));
@@ -643,6 +748,65 @@ mod tests {
         assert!(!path.exists(), "reset 必须删除 stats.jsonl");
 
         // 收尾：恢复生产路径；flush 保持关闭，挡住后续测试误写盘。
+        set_test_stats_dir(None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 轮转：文件撑过 STATS_MAX_BYTES 后 flush 必须重写为当前快照，
+    /// 文件缩回阈值以内，且 load_history 仍取得到最新累计值。
+    #[test]
+    fn flush_rotates_oversized_file_keeping_latest_values() {
+        let _g = TEST_GLOBALS_LOCK.lock().unwrap();
+
+        let dir = std::env::temp_dir().join(format!(
+            "everything_mcp_stats_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        set_test_stats_dir(Some(dir.clone()));
+        set_flush_enabled(true);
+
+        let path = dir.join("stats.jsonl");
+        record_call(tool_index("count"), true, 1, 10);
+        flush();
+
+        // 把文件撑过轮转阈值：塞一批 ts=1 的旧快照行（模拟长期追加）。
+        {
+            use std::io::Write as _;
+            let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+            let filler = "x".repeat(4096);
+            while f.metadata().unwrap().len() <= STATS_MAX_BYTES {
+                let _ = writeln!(
+                    f,
+                    "{{\"ts\":1,\"tool\":\"grep\",\"calls\":9,\"ok\":9,\"err\":0,\"ms\":9,\"bytes\":9}} {}",
+                    filler
+                );
+            }
+        }
+
+        let first_seen_before = snapshot().global.first_seen_unix;
+        record_call(tool_index("count"), true, 2, 20);
+        flush();
+
+        assert!(
+            path.metadata().unwrap().len() <= STATS_MAX_BYTES,
+            "轮转后文件必须缩回快照大小"
+        );
+        // 轮转行的 ts 用 first_seen_unix —— 重启后 min_ts（first_seen 的
+        // 来源）不因轮转跳变。
+        let text = std::fs::read_to_string(&path).unwrap();
+        let (latest, min_ts) = parse_history(&text);
+        assert_eq!(latest[2], Some([2, 2, 0, 3, 30]));
+        assert!(min_ts >= first_seen_before, "min_ts 不得小于原 first_seen");
+        assert!(min_ts > 0);
+        // 撑文件用的 grep 旧值行（calls=9）必须已随轮转消失。
+        assert!(
+            latest[5].is_none() || latest[5] == Some([0, 0, 0, 0, 0]),
+            "轮转后不得残留撑文件的旧值行"
+        );
+
+        set_flush_enabled(false);
         set_test_stats_dir(None);
         let _ = std::fs::remove_dir_all(&dir);
     }

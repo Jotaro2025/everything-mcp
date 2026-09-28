@@ -23,11 +23,11 @@
 //! 保存监听线程句柄，PM_STOP 时调用 `stop()` 标记关闭、join 线程。
 
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
@@ -43,10 +43,29 @@ use crate::plugin::stats;
 /// 连接），线程句柄也一并泄漏。
 static SERVER: Mutex<Option<ServerHandle>> = Mutex::new(None);
 
+/// 在途连接计数：并发上限与 PM_STOP 排空共用。
+static INFLIGHT: AtomicUsize = AtomicUsize::new(0);
+
 struct ServerHandle {
     shutdown: std::sync::Arc<AtomicBool>,
+    /// 自连接唤醒地址：阻塞 accept 的打断手段（stop() 往这里连一下）。
+    wakeup: SocketAddr,
     thread: Mutex<Option<JoinHandle<()>>>,
 }
+
+/// 并发连接上限。MCP 客户端串行调用，正常个位数并发就到顶；上限只为
+/// 挡住失控客户端把「每连接一线程」撑爆。满了直接 503，不排队。
+const MAX_CONNECTIONS: usize = 64;
+
+/// 单连接总时限：头部与 body 的每次读取都按「剩余时限」设读超时，
+/// 慢速客户端不能再靠「每 29 秒发 1 字节」永久占住线程。分发阶段不受
+/// 此限 —— 搜索时长由工具自己的 timeout_ms 管。
+const CONNECTION_DEADLINE: Duration = Duration::from_secs(60);
+
+/// PM_STOP 排空在途请求的上限。搜索默认超时 10s 加余量取 15s。排空只是
+/// 礼貌（把已接单的请求答完），不是内存安全要求 —— query 只在主线程
+/// 使用，与 PM_STOP 天然串行。
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// 启动 HTTP 服务并立即返回。失败返回错误描述。
 pub fn start(bind: &str, port: u16) -> Result<(), String> {
@@ -57,6 +76,20 @@ pub fn start(bind: &str, port: u16) -> Result<(), String> {
     let listener = TcpListener::bind(&addr).map_err(|e| format!("bind {} failed: {}", addr, e))?;
     // Windows 上 TCPListener::bind 默认已开启 SO_EXCLUSIVEADDRUSE/SO_REUSEADDR，
     // 服务退出后立即重启不会因为 TIME_WAIT 失败。
+
+    // 唤醒地址：bind 0.0.0.0/[::] 时换成对应的 loopback，自连接才连得到。
+    let wakeup = match listener.local_addr() {
+        Ok(a) => match a.ip() {
+            IpAddr::V4(ip) if ip.is_unspecified() => {
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), a.port())
+            }
+            IpAddr::V6(ip) if ip.is_unspecified() => {
+                SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), a.port())
+            }
+            _ => a,
+        },
+        Err(_) => SocketAddr::from(([127, 0, 0, 1], port)),
+    };
 
     let shutdown = std::sync::Arc::new(AtomicBool::new(false));
     let shutdown_thread = shutdown.clone();
@@ -71,6 +104,7 @@ pub fn start(bind: &str, port: u16) -> Result<(), String> {
     let mut slot = SERVER.lock().unwrap_or_else(|p| p.into_inner());
     *slot = Some(ServerHandle {
         shutdown,
+        wakeup,
         thread: Mutex::new(Some(handle)),
     });
     Ok(())
@@ -90,39 +124,75 @@ pub fn stop() {
     };
     s.shutdown.store(true, Ordering::SeqCst);
 
-    // 唤醒监听线程 —— 我们已经把它放在非阻塞模式，关闭标志会立刻被读取。
-    // guard 在 join 前先释放，避免跨 join 持锁。
-    let joined = match s.thread.lock() {
-        Ok(mut guard) => guard.take(),
-        Err(p) => p.into_inner().take(),
-    };
-    if let Some(t) = joined {
-        let _ = t.join();
+    // 打断阻塞 accept：向本机端口自连接唤醒。连不上（理论上不会发生）
+    // 就放弃 join —— 监听线程会在下一个真实连接到来时自行退出，不值得
+    // 为停机挂死 PM_STOP。
+    let mut woken = false;
+    for _ in 0..10 {
+        if TcpStream::connect_timeout(&s.wakeup, Duration::from_millis(100)).is_ok() {
+            woken = true;
+            break;
+        }
+    }
+    if woken {
+        let joined = match s.thread.lock() {
+            Ok(mut guard) => guard.take(),
+            Err(p) => p.into_inner().take(),
+        };
+        if let Some(t) = joined {
+            let _ = t.join();
+        }
+    } else {
+        crate::plugin::host::Host::debug(
+            "everything_mcp: stop() self-connect failed; listener exits on next connection",
+        );
+    }
+
+    // 排空在途请求：等连接线程把已接单的请求答完（有界）。这只影响
+    // 「停机时不丢已接单的请求」；query 只在主线程使用，与 PM_STOP
+    // 串行，没有内存安全问题。
+    let deadline = Instant::now() + DRAIN_TIMEOUT;
+    while INFLIGHT.load(Ordering::SeqCst) > 0 && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(20));
+    }
+    if INFLIGHT.load(Ordering::SeqCst) > 0 {
+        crate::plugin::host::Host::debug(
+            "everything_mcp: stop() drain timeout; dropping in-flight requests",
+        );
     }
 }
 
 fn run_listener(listener: TcpListener, shutdown: std::sync::Arc<AtomicBool>) {
-    // 让 accept 不阻塞 —— 通过设置 listener 本身的非阻塞模式 + 短轮询。
-    // 更简单的做法是阻塞 accept + shutdown_socket，但 Windows 上没有可移植的
-    // 关闭阻塞 accept 的方式，所以这里采用非阻塞 + 轮询。
-    let _ = listener.set_nonblocking(true);
-
+    // 阻塞 accept：旧实现的非阻塞 + 50ms 轮询给每个请求平均白加 ~25ms
+    // 延迟（响应是 Connection: close，每个 MCP 请求都是新连接）。停机
+    // 由 stop() 向本机端口自连接唤醒。
     while !shutdown.load(Ordering::SeqCst) {
         match listener.accept() {
-            Ok((stream, peer)) => {
-                // 每个连接一个工作线程；MCP 调用通常很轻，无需连接池。
+            Ok((mut stream, _peer)) => {
+                // 唤醒连接或停机后才到达的连接：直接退出循环，套接字丢弃。
+                if shutdown.load(Ordering::SeqCst) {
+                    break;
+                }
+                // 并发上限：满了 503 拒掉，不再开线程。
+                if INFLIGHT.load(Ordering::Relaxed) >= MAX_CONNECTIONS {
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    );
+                    continue;
+                }
                 stats::record_connection();
-                let _ = peer;
                 let s_clone = shutdown.clone();
-                let _ = thread::Builder::new()
+                INFLIGHT.fetch_add(1, Ordering::SeqCst);
+                let spawned = thread::Builder::new()
                     .name("everything-mcp-conn".into())
                     .spawn(move || {
                         let _ = handle_connection(stream, s_clone);
+                        INFLIGHT.fetch_sub(1, Ordering::SeqCst);
                     });
-            }
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                // 没有新连接 —— 短暂休眠再试。
-                thread::sleep(Duration::from_millis(50));
+                if spawned.is_err() {
+                    // 没起线程就得自己把计数还回去。
+                    INFLIGHT.fetch_sub(1, Ordering::SeqCst);
+                }
             }
             Err(e) => {
                 crate::plugin::host::Host::debug(&format!("accept err: {}", e));
@@ -145,14 +215,12 @@ fn handle_connection(
     if shutdown.load(Ordering::SeqCst) {
         return Ok(());
     }
-    // 关键：listener 被设成 nonblocking 用于轮询 accept；这个属性会被
-    // accept 出来的 stream 继承。我们必须显式恢复阻塞模式，否则下面
-    // 的 stream.read() 会立刻返回 WSAEWOULDBLOCK (os error 10035)。
-    let _ = stream.set_nonblocking(false);
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
+    // 阻塞 accept 出来的 stream 天生是阻塞模式。读写超时按连接总时限的
+    // 剩余量逐次设置（见 read_bounded）。
+    let deadline = Instant::now() + CONNECTION_DEADLINE;
     let _ = stream.set_write_timeout(Some(Duration::from_secs(30)));
 
-    let req = match read_http_request(&mut stream) {
+    let req = match read_http_request(&mut stream, deadline) {
         Ok(r) => r,
         Err(e) => {
             let body = format!("HTTP parse error: {}", e);
@@ -224,6 +292,24 @@ fn find_head_end(buf: &[u8], from: usize) -> Option<usize> {
     (from..=buf.len() - 4).find(|&i| &buf[i..i + 4] == b"\r\n\r\n")
 }
 
+/// 带连接总时限的一次读取：读超时取「剩余时限」与 30s 的较小者，到线
+/// 即报错 —— 防慢速客户端用永不完结的请求把线程占到底。
+fn read_bounded(
+    stream: &mut TcpStream,
+    chunk: &mut [u8],
+    deadline: Instant,
+) -> std::io::Result<usize> {
+    let remain = deadline.saturating_duration_since(Instant::now());
+    if remain.is_zero() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "connection deadline exceeded",
+        ));
+    }
+    let _ = stream.set_read_timeout(Some(remain.min(Duration::from_secs(30))));
+    stream.read(chunk)
+}
+
 /// 读取并解析一个 HTTP 请求。
 /// 我们只关心 method、path、Content-Length、MCP 镜像头与 body。
 ///
@@ -231,7 +317,10 @@ fn find_head_end(buf: &[u8], from: usize) -> Option<usize> {
 /// 就是几百次系统调用）；body 原来每 1 KiB 块独立 `from_utf8_lossy`，
 /// 跨块边界的多字节 UTF-8 序列（中文搜索词很常见）前后两半各变 U+FFFD，
 /// 属于静默数据损坏 —— 现在整个 body 攒齐后一次性解码。
-fn read_http_request(stream: &mut TcpStream) -> std::io::Result<HttpRequest> {
+fn read_http_request(
+    stream: &mut TcpStream,
+    deadline: Instant,
+) -> std::io::Result<HttpRequest> {
     let mut buf = Vec::with_capacity(4096);
     let mut chunk = [0u8; 4096];
     let mut search_from = 0usize;
@@ -247,7 +336,7 @@ fn read_http_request(stream: &mut TcpStream) -> std::io::Result<HttpRequest> {
                 "header too large",
             ));
         }
-        let n = stream.read(&mut chunk)?;
+        let n = read_bounded(stream, &mut chunk, deadline)?;
         if n == 0 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
@@ -265,7 +354,7 @@ fn read_http_request(stream: &mut TcpStream) -> std::io::Result<HttpRequest> {
     let mut body_bytes = Vec::with_capacity(head.content_length.min(64 * 1024));
     body_bytes.extend_from_slice(&buf[(head_end + 4).min(buf.len())..]);
     while body_bytes.len() < head.content_length {
-        let n = stream.read(&mut chunk)?;
+        let n = read_bounded(stream, &mut chunk, deadline)?;
         if n == 0 {
             // 与旧行为一致：对端中途关闭时按已收到的内容继续。
             break;
@@ -364,11 +453,11 @@ pub fn dispatch_rpc_http(body: &str, head: &RequestHead) -> (u16, String) {
 
     let id = parsed.id.clone();
     let method = parsed.method.as_deref().unwrap_or("");
-    let params = parsed.params.clone().unwrap_or(Value::Null);
+    let params = parsed.params.as_ref().unwrap_or(&Value::Null);
     let is_notification = parsed.id.is_none();
 
     // ---- 版本协商 ----
-    let meta_version = protocol::requested_version_from_meta(&params);
+    let meta_version = protocol::requested_version_from_meta(params);
     let declared = match (&head.protocol_version, &meta_version) {
         (Some(h), Some(m)) if h != m => {
             let resp = protocol::header_mismatch_error(
@@ -435,7 +524,7 @@ pub fn dispatch_rpc_http(body: &str, head: &RequestHead) -> (u16, String) {
         // discover 对两个时代都应答 —— modern 客户端靠它探测时代与版本，
         // 应答一个版本全带的 discover 是最友好的双时代行为。
         "server/discover" => protocol::ok_response(&id, protocol::make_discover_result()),
-        "initialize" => protocol::ok_response(&id, protocol::make_initialize_result(&params)),
+        "initialize" => protocol::ok_response(&id, protocol::make_initialize_result(params)),
         "notifications/initialized" => {
             // legacy：通知不返回业务内容，回一个 id 为 null 的空响应（200）。
             // modern 客户端走上面的 202 空体分支，到不了这里。
@@ -458,10 +547,10 @@ pub fn dispatch_rpc_http(body: &str, head: &RequestHead) -> (u16, String) {
         }
         "tools/call" => {
             let name = params.get("name").and_then(Value::as_str).unwrap_or("");
-            let args = params.get("arguments").cloned().unwrap_or(Value::Null);
+            let args = params.get("arguments").unwrap_or(&Value::Null);
             let idx = stats::tool_index(name);
             let t0 = std::time::Instant::now();
-            let resp = match tools::dispatch(name, &args) {
+            let resp = match tools::dispatch(name, args) {
                 Ok((content, is_error)) => {
                     let mut result = serde_json::json!(content);
                     if is_error {
