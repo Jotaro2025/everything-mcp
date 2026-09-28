@@ -81,11 +81,13 @@ pub(crate) fn abi_ok() -> *mut c_void {
 /// 这是 C ABI 入口，由主程序跨语言调用。`data` 的类型随 `msg` 变化。
 #[no_mangle]
 pub unsafe extern "system" fn everything_plugin_proc(msg: u32, data: *mut c_void) -> *mut c_void {
-    // 入口钩子：把每次调用都记录到磁盘日志，方便排查主程序实际传入了哪些 msg。
-    // 注意：这是 PM_INIT 之前的调用，Host 表还没填充，不能用 Host::debug。
-    plugin::diag::write(&format!("--> proc(msg={}, data={:p})", msg, data));
+    // 入口钩子：记录主程序传入了哪些 msg。这是热路径 —— 每次插件 proc
+    // 调用（包括设置页每个按键）都会走到，默认丢弃，设环境变量
+    // EVERYTHING_MCP_DIAG=1 可恢复全量落盘。注意：这是 PM_INIT 之前的
+    // 调用，Host 表还没填充，不能用 Host::debug。
+    plugin::diag::verbose(&format!("--> proc(msg={}, data={:p})", msg, data));
     let result = everything_plugin_proc_impl(msg, data);
-    plugin::diag::write(&format!("<-- proc(msg={}) => {:p}", msg, result));
+    plugin::diag::verbose(&format!("<-- proc(msg={}) => {:p}", msg, result));
     result
 }
 

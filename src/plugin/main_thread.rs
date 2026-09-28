@@ -132,7 +132,7 @@ pub fn invoke_c(func: TaskFn, ctx: *mut c_void) -> Result<(), String> {
     // 取走这条消息才返回 —— 而消息泵此刻正卡在本调用里，必死锁。
     // （PM_START 期间注册窗口就是在主线程上跑的，这条路径可达。）
     if caller_tid == INSTALL_TID.load(Ordering::Acquire) {
-        super::diag::write("invoke_c: already on main thread — running inline");
+        super::diag::verbose("invoke_c: already on main thread — running inline");
         unsafe { func(ctx) };
         return Ok(());
     }
@@ -151,7 +151,7 @@ pub fn invoke_c(func: TaskFn, ctx: *mut c_void) -> Result<(), String> {
         });
     }
 
-    super::diag::write(&format!(
+    super::diag::verbose(&format!(
         "invoke_c: caller_tid={} hwnd=0x{:x}",
         caller_tid, hwnd
     ));
@@ -218,7 +218,7 @@ pub unsafe extern "system" fn wnd_proc(
     if msg == WM_INVOKE {
         let cur_tid = unsafe { GetCurrentThreadId() };
         let install_tid = INSTALL_TID.load(Ordering::SeqCst);
-        super::diag::write(&format!(
+        super::diag::verbose(&format!(
             "wnd_proc: WM_INVOKE cur_tid={} install_tid={}",
             cur_tid, install_tid
         ));
@@ -230,9 +230,9 @@ pub unsafe extern "system" fn wnd_proc(
         };
 
         if let Some(t) = task {
-            super::diag::write_flush("wnd_proc: executing task on main thread...");
+            super::diag::verbose("wnd_proc: executing task on main thread...");
             unsafe { (t.func)(t.ctx) };
-            super::diag::write_flush("wnd_proc: task completed");
+            super::diag::verbose("wnd_proc: task completed");
             // 先置位完成标志，再让调用方解除阻塞 —— 顺序不能反，
             // 否则调用方可能提前返回并释放 ctx 指向的内存。
             t.done.store(true, Ordering::SeqCst);

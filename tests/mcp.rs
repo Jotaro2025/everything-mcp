@@ -8,6 +8,7 @@ use everything_mcp::mcp::protocol;
 use everything_mcp::mcp::server;
 use everything_mcp::mcp::tools;
 use serde_json::{json, Value};
+use std::sync::Mutex;
 
 // ====================================================================
 // 辅助
@@ -1650,6 +1651,7 @@ fn http_post(port: u16, body: &str, extra_headers: &[(&str, &str)]) -> (String, 
 
 #[test]
 fn end_to_end_over_real_tcp() {
+    let _g = SERVER_TESTS.lock().unwrap_or_else(|p| p.into_inner());
     let port = 18285;
     server::start("127.0.0.1", port).expect("test server must start");
 
@@ -1727,6 +1729,40 @@ fn end_to_end_over_real_tcp() {
     assert!(resp["error"]["message"].as_str().unwrap().contains("folder"));
 
     server::stop();
+}
+
+/// 真实 TCP 测试共用全局 SERVER —— start/stop 会踢掉对方正在用的服务，
+/// 用这把锁把所有起真服务的测试串行化。
+static SERVER_TESTS: Mutex<()> = Mutex::new(());
+
+/// 回归：stop → start → stop 之后端口必须真的关掉。
+///
+/// SERVER 曾是 `OnceLock<ServerHandle>`：第二次 start() 的句柄被
+/// `let _ = set(...)` 静默丢弃，第二个监听线程从此无人能停 ——
+/// 下面的最后一个断言（重启后必须拒绝连接）在该实现下会失败。
+#[test]
+fn server_restart_really_closes_the_port() {
+    let _g = SERVER_TESTS.lock().unwrap_or_else(|p| p.into_inner());
+    let port = 18287;
+    let ping = r#"{"jsonrpc":"2.0","id":1,"method":"ping","params":{}}"#;
+
+    server::start("127.0.0.1", port).expect("first start");
+    let (head, _) = http_post(port, ping, &[]);
+    assert!(head.starts_with("HTTP/1.1 200"), "{}", head);
+    server::stop();
+
+    server::start("127.0.0.1", port).expect("second start must rebind the same port");
+    let (head, _) = http_post(port, ping, &[]);
+    assert!(
+        head.starts_with("HTTP/1.1 200"),
+        "second instance must answer: {}",
+        head
+    );
+    server::stop();
+
+    // stop 返回即监听线程已 join、监听套接字已释放 —— 必须连不上了。
+    let refused = std::net::TcpStream::connect(("127.0.0.1", port)).is_err();
+    assert!(refused, "port must be closed after the second stop");
 }
 
 // ====================================================================

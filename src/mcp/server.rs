@@ -25,7 +25,7 @@
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -36,7 +36,12 @@ use super::tools;
 use crate::plugin::stats;
 
 /// 全局服务句柄 —— 让 PM_STOP 能找到当前运行的服务线程。
-static SERVER: OnceLock<ServerHandle> = OnceLock::new();
+///
+/// 必须是可写的 Option：stop → start（改端口、停用再启用插件）会创建
+/// 全新的 shutdown Arc 与监听线程。OnceLock 只能 set 一次，第二次 set
+/// 会被静默丢弃 —— 新监听线程从此没人能停（停用插件后端口照常接受
+/// 连接），线程句柄也一并泄漏。
+static SERVER: Mutex<Option<ServerHandle>> = Mutex::new(None);
 
 struct ServerHandle {
     shutdown: std::sync::Arc<AtomicBool>,
@@ -45,10 +50,8 @@ struct ServerHandle {
 
 /// 启动 HTTP 服务并立即返回。失败返回错误描述。
 pub fn start(bind: &str, port: u16) -> Result<(), String> {
-    // 已有服务在跑 —— 关闭旧的再启新的。
-    if SERVER.get().is_some() {
-        stop();
-    }
+    // 已有服务在跑 —— 关闭旧的再启新的（无服务时是 no-op）。
+    stop();
 
     let addr = format!("{}:{}", bind, port);
     let listener = TcpListener::bind(&addr).map_err(|e| format!("bind {} failed: {}", addr, e))?;
@@ -65,7 +68,8 @@ pub fn start(bind: &str, port: u16) -> Result<(), String> {
         })
         .map_err(|e| format!("spawn listener thread failed: {}", e))?;
 
-    let _ = SERVER.set(ServerHandle {
+    let mut slot = SERVER.lock().unwrap_or_else(|p| p.into_inner());
+    *slot = Some(ServerHandle {
         shutdown,
         thread: Mutex::new(Some(handle)),
     });
@@ -74,17 +78,26 @@ pub fn start(bind: &str, port: u16) -> Result<(), String> {
 
 /// 关闭服务（PM_STOP / PM_KILL 时调用）。
 pub fn stop() {
-    let s = match SERVER.get() {
+    // 先把句柄整体取走再 join：不持有 SERVER 锁等待线程退出，
+    // stop 幂等（第二次调用拿到 None 直接返回）。
+    let taken = {
+        let mut slot = SERVER.lock().unwrap_or_else(|p| p.into_inner());
+        slot.take()
+    };
+    let s = match taken {
         Some(s) => s,
         None => return,
     };
     s.shutdown.store(true, Ordering::SeqCst);
 
     // 唤醒监听线程 —— 我们已经把它放在非阻塞模式，关闭标志会立刻被读取。
-    if let Ok(mut guard) = s.thread.lock() {
-        if let Some(t) = guard.take() {
-            let _ = t.join();
-        }
+    // guard 在 join 前先释放，避免跨 join 持锁。
+    let joined = match s.thread.lock() {
+        Ok(mut guard) => guard.take(),
+        Err(p) => p.into_inner().take(),
+    };
+    if let Some(t) = joined {
+        let _ = t.join();
     }
 }
 
@@ -202,52 +215,68 @@ struct HttpRequest {
     body: String,
 }
 
+/// 在 buf[from..] 里找 b"\r\n\r\n"，返回匹配起点。
+fn find_head_end(buf: &[u8], from: usize) -> Option<usize> {
+    if buf.len() < 4 {
+        return None;
+    }
+    let from = from.min(buf.len() - 4);
+    (from..=buf.len() - 4).find(|&i| &buf[i..i + 4] == b"\r\n\r\n")
+}
+
 /// 读取并解析一个 HTTP 请求。
 /// 我们只关心 method、path、Content-Length、MCP 镜像头与 body。
+///
+/// 头部与 body 都按块读进字节缓冲：头部原来逐字节 read（几百字节的头部
+/// 就是几百次系统调用）；body 原来每 1 KiB 块独立 `from_utf8_lossy`，
+/// 跨块边界的多字节 UTF-8 序列（中文搜索词很常见）前后两半各变 U+FFFD，
+/// 属于静默数据损坏 —— 现在整个 body 攒齐后一次性解码。
 fn read_http_request(stream: &mut TcpStream) -> std::io::Result<HttpRequest> {
     let mut buf = Vec::with_capacity(4096);
-    let mut byte = [0u8; 1];
-    loop {
-        // 读取直到 "\r\n\r\n" 标志头部结束。
-        let n = stream.read(&mut byte)?;
-        if n == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "connection closed during header",
-            ));
+    let mut chunk = [0u8; 4096];
+    let mut search_from = 0usize;
+    let head_end = loop {
+        if let Some(pos) = find_head_end(&buf, search_from) {
+            break pos;
         }
-        buf.push(byte[0]);
-        if buf.len() >= 4 && &buf[buf.len() - 4..] == b"\r\n\r\n" {
-            break;
-        }
+        // 下一轮从「可能被新数据补全的最早位置」开始找，避免整段重扫。
+        search_from = buf.len().saturating_sub(3);
         if buf.len() > 65536 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "header too large",
             ));
         }
-    }
+        let n = stream.read(&mut chunk)?;
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "connection closed during header",
+            ));
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    };
 
-    let header_str = String::from_utf8_lossy(&buf);
+    let header_str = String::from_utf8_lossy(&buf[..head_end]);
     let head = parse_header(&header_str)
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "no request line"))?;
 
-    // 读取 body。
-    let mut body = String::new();
-    if head.content_length > 0 {
-        let mut remain = head.content_length;
-        let mut chunk = [0u8; 1024];
-        while remain > 0 {
-            let take = remain.min(chunk.len());
-            let n = stream.read(&mut chunk[..take])?;
-            if n == 0 {
-                break;
-            }
-            body.push_str(&String::from_utf8_lossy(&chunk[..n]));
-            remain -= n;
+    // 读取 body：头部结束符后面可能已经带进来一段（甚至超出的）body 字节。
+    let mut body_bytes = Vec::with_capacity(head.content_length.min(64 * 1024));
+    body_bytes.extend_from_slice(&buf[(head_end + 4).min(buf.len())..]);
+    while body_bytes.len() < head.content_length {
+        let n = stream.read(&mut chunk)?;
+        if n == 0 {
+            // 与旧行为一致：对端中途关闭时按已收到的内容继续。
+            break;
         }
+        body_bytes.extend_from_slice(&chunk[..n]);
     }
+    // 管道化（同一段里塞了两条请求）时丢弃超出 Content-Length 的部分，
+    // 保持「一次连接只处理一条请求」的既有语义。
+    body_bytes.truncate(head.content_length);
 
+    let body = String::from_utf8_lossy(&body_bytes).into_owned();
     Ok(HttpRequest { head, body })
 }
 

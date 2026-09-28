@@ -41,6 +41,7 @@
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 /// 单条索引变更。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -263,14 +264,32 @@ const FOLDER_KEYWORDS: &[&str] = &[
     "directory",
 ];
 
+/// 预小写化的动作关键词表。classify 逐行调用 —— 关键词若在循环里
+/// `to_lowercase()`，每行要做 ~86 次堆分配；这里进程内只算一次。
+fn action_keywords_lower() -> &'static [(Action, Vec<String>)] {
+    static TABLE: OnceLock<Vec<(Action, Vec<String>)>> = OnceLock::new();
+    TABLE.get_or_init(|| {
+        ACTION_KEYWORDS
+            .iter()
+            .map(|(action, keys)| (*action, keys.iter().map(|k| k.to_lowercase()).collect()))
+            .collect()
+    })
+}
+
+/// 预小写化的「文件夹」关键词，同上。
+fn folder_keywords_lower() -> &'static [String] {
+    static TABLE: OnceLock<Vec<String>> = OnceLock::new();
+    TABLE.get_or_init(|| FOLDER_KEYWORDS.iter().map(|k| k.to_lowercase()).collect())
+}
+
 /// 把 Everything 输出的本地化动作串归类成稳定枚举。
 ///
 /// 认不出的返回 [`Action::Other`] —— 调用方仍能拿到 `action_text` 原文，
 /// 不会因为多语言覆盖不全就把事件丢掉。
 pub fn classify(raw: &str) -> Action {
     let lower = raw.to_lowercase();
-    for (action, keys) in ACTION_KEYWORDS {
-        if keys.iter().any(|k| lower.contains(&k.to_lowercase())) {
+    for (action, keys) in action_keywords_lower() {
+        if keys.iter().any(|k| lower.contains(k.as_str())) {
             return *action;
         }
     }
@@ -280,9 +299,36 @@ pub fn classify(raw: &str) -> Action {
 /// 从动作串判断是不是文件夹条目（兜底；主判断依据是路径列的尾部分隔符）。
 fn action_implies_folder(raw: &str) -> bool {
     let lower = raw.to_lowercase();
-    FOLDER_KEYWORDS
+    folder_keywords_lower()
         .iter()
-        .any(|k| lower.contains(&k.to_lowercase()))
+        .any(|k| lower.contains(k.as_str()))
+}
+
+/// 大小写不敏感的 `starts_with`。两边都 ASCII 时逐字节比对、零分配；
+/// 含非 ASCII 时退回 `to_lowercase`（Unicode 大小写折叠无法零分配完成）。
+/// `needle` 需调用方预先小写化（与原实现的比较语义一致）。
+fn starts_with_ci(hay: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    if hay.is_ascii() && needle.is_ascii() {
+        let (h, n) = (hay.as_bytes(), needle.as_bytes());
+        return h.len() >= n.len() && h[..n.len()].eq_ignore_ascii_case(n);
+    }
+    hay.to_lowercase().starts_with(needle)
+}
+
+/// 大小写不敏感的 `contains`。ASCII 走零分配逐字节比对，非 ASCII 退回
+/// `to_lowercase`。`needle` 需调用方预先小写化。
+fn contains_ci(hay: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    if hay.is_ascii() && needle.is_ascii() {
+        let (h, n) = (hay.as_bytes(), needle.as_bytes());
+        return h.len() >= n.len() && h.windows(n.len()).any(|w| w.eq_ignore_ascii_case(n));
+    }
+    hay.to_lowercase().contains(needle)
 }
 
 // ====================================================================
@@ -750,15 +796,15 @@ fn matches_filter(
         }
     }
     if let Some(p) = path_prefix {
-        if !c.path.to_lowercase().starts_with(p) {
+        if !starts_with_ci(&c.path, p) {
             return false;
         }
     }
     if let Some(n) = name_sub {
-        let hit = c.name().to_lowercase().contains(n)
+        let hit = contains_ci(c.name(), n)
             || c.new_path
                 .as_deref()
-                .map(|np| basename(np).to_lowercase().contains(n))
+                .map(|np| contains_ci(basename(np), n))
                 .unwrap_or(false);
         if !hit {
             return false;
@@ -1097,6 +1143,23 @@ mod tests {
         assert_eq!(normalize_prefix("D:/src/"), "D:\\src");
         assert_eq!(normalize_prefix("D:"), "D:\\");
         assert_eq!(normalize_prefix("D:\\src\\\\repo"), "D:\\src\\repo");
+    }
+
+    #[test]
+    fn ci_helpers_fold_ascii_in_place_and_fall_back_for_non_ascii() {
+        // ASCII 快路径：逐字节比对，大小写不敏感，零分配。
+        assert!(starts_with_ci("C:\\Windows\\System32", "c:\\windows"));
+        assert!(!starts_with_ci("C:\\Users", "c:\\windows"));
+        assert!(contains_ci("C:\\Program Files\\App", "program files"));
+        assert!(!contains_ci("C:\\Program Files\\App", "programzz"));
+        // 非 ASCII 兜底：to_lowercase 分支（路径与过滤词都可能是中文）。
+        assert!(contains_ci("D:\\资料\\文件夹测试", "文件夹"));
+        assert!(starts_with_ci("D:\\资料\\文件夹测试", "d:\\资料"));
+        assert!(!starts_with_ci("D:\\资料\\文件夹测试", "d:\\下载"));
+        // 空过滤词视为命中；needle 比 haystack 长时不命中、不 panic。
+        assert!(contains_ci("anything", ""));
+        assert!(starts_with_ci("anything", ""));
+        assert!(!contains_ci("ab", "abcdef"));
     }
 
     #[test]

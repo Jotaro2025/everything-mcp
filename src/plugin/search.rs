@@ -401,7 +401,7 @@ fn submit_query(
     // 参数表严格按 etp_server.c 中 everything_plugin_db_query_search2 的调用形式：
     // 大量参数传 0/NULL，仅保留 force/allow_*/clear_* 这些必要开关。
     let search = host.db_query_search.ok_or("db_query_search2 null")?;
-    super::diag::write(&format!(
+    super::diag::verbose(&format!(
         "submit_query: search_bytes_len={} search={:?}",
         search_bytes.len(),
         std::str::from_utf8(&search_bytes).unwrap_or("<utf8err>")
@@ -476,7 +476,7 @@ fn submit_query(
 
     // 等待结束（无论是否等到）即撤守卫 —— 之后再来完成事件都与本次无关。
     QUERY_SUBMITTED.store(false, Ordering::SeqCst);
-    super::diag::write(&format!(
+    super::diag::verbose(&format!(
         "submit_query: wait done signaled={} waited={}ms",
         signaled, waited
     ));
@@ -588,7 +588,7 @@ unsafe extern "system" fn run_search_on_main(ctx: *mut core::ffi::c_void) {
     // db_query_search2 的 sort_ascending：1 = 升序，0 = 降序。
     let sort_ascending = if opts.descending { 0 } else { 1 };
 
-    super::diag::write_flush(&format!(
+    super::diag::verbose(&format!(
         "run_search_on_main: calling db_query_search2 query={:p} sort={:p} asc={} case={} ww={}...",
         query, sort_property, sort_ascending, opts.match_case, opts.match_whole_word
     ));
@@ -652,7 +652,7 @@ unsafe extern "system" fn run_search_on_main(ctx: *mut core::ffi::c_void) {
             0,
         );
     }
-    super::diag::write_flush("run_search_on_main: db_query_search2 returned");
+    super::diag::verbose("run_search_on_main: db_query_search2 returned");
 }
 
 /// 在主线程 wndproc 里读取查询结果，写回 ctx 字段。
@@ -828,7 +828,7 @@ unsafe fn read_all(
     let host = Host::get();
     let total = unsafe { read_result_count(query)? };
     let (start, take) = page_window(total, offset, max_results);
-    super::diag::write(&format!(
+    super::diag::verbose(&format!(
         "read_all: total={} window=[{}, {})",
         total,
         start,
@@ -893,7 +893,7 @@ unsafe fn read_all(
             // 字节预算：条数上限之外的第二道闸。命中即停，至少留一条（见 fits_budget）。
             let entry_bytes = estimate_entry_bytes(name.len(), path.len());
             if !fits_budget(used_bytes, entry_bytes) {
-                super::diag::write(&format!(
+                super::diag::verbose(&format!(
                     "read_all: byte budget hit at {} of {} window entries ({} bytes)",
                     out.len(),
                     take,
