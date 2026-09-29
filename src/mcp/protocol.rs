@@ -330,9 +330,9 @@ fn search_everywhere_entry(mode: GlobalSearchMode) -> Value {
                     "description": "Everything search pattern matched against file/folder names across the whole index, e.g. '*.vhd' (extension), '\"quarterly report\"' (name phrase), 'ext:pdf;docx dm:thisyear' (functions), 'backup !\\\\old\\\\' ('!' excludes). At least 2 characters. 'content:' is rejected here and in 'exclude' — use search_in_folder for content search."
                 },
                 "exclude": {
-                    "type": ["string", "array"],
+                    "type": "array",
                     "items": { "type": "string" },
-                    "description": "Terms to exclude, appended as Everything NOT operators. Accepts a string or an array of strings. Quoted path fragments match well: ['\\\\old\\\\', '\\\\.git\\\\', '\\\\node_modules\\\\']. 'content:' is rejected here as well — an excluded content term still forces a full-disk content scan. Default: none."
+                    "description": "Terms to exclude, appended as Everything NOT operators. Pass an array of strings. Quoted path fragments match well: ['\\\\old\\\\', '\\\\.git\\\\', '\\\\node_modules\\\\']. 'content:' is rejected here as well — an excluded content term still forces a full-disk content scan. Default: none."
                 },
                 "sort": {
                     "type": "string",
@@ -436,9 +436,9 @@ fn build_tools_list(mode: GlobalSearchMode) -> Value {
                             "description": "Everything search pattern. Examples: '*.rs' (extension), 'readme' (substring), 'ext:md;txt' (multiple extensions), '\"exact phrase\"', 'content:\"fn main\"' (content search — slow unless the scope is narrow, see the tool description), 'ext:rs !test' (the '!' prefix excludes matches). Case-sensitive content search is 'case:content:\"...\"' with no space after 'case:'. Empty pattern lists all files. Shell globs like '**/*.rs' are not supported — the folder scope already restricts the tree."
                         },
                         "exclude": {
-                            "type": ["string", "array"],
+                            "type": "array",
                             "items": { "type": "string" },
-                            "description": "Terms to exclude, appended as Everything NOT operators. Accepts a string or an array of strings. Quoted path fragments match well: ['\\obj\\', '\\.git\\', '\\node_modules\\'] drops build output, VCS metadata and dependencies. Default: none."
+                            "description": "Terms to exclude, appended as Everything NOT operators. Pass an array of strings. Quoted path fragments match well: ['\\obj\\', '\\.git\\', '\\node_modules\\'] drops build output, VCS metadata and dependencies. Default: none."
                         },
                         "sort": {
                             "type": "string",
@@ -497,9 +497,9 @@ fn build_tools_list(mode: GlobalSearchMode) -> Value {
                     "properties": {
                         "folder": { "type": "string", "description": "Absolute folder path, e.g. D:\\source\\repos\\myproject, or an indexed UNC path like \\\\server\\share\\project" },
                         "exclude": {
-                            "type": ["string", "array"],
+                            "type": "array",
                             "items": { "type": "string" },
-                            "description": "Terms to exclude, appended as Everything NOT operators. Accepts a string or an array of strings."
+                            "description": "Terms to exclude, appended as Everything NOT operators (array of strings)."
                         },
                         "offset": {
                             "type": "integer",
@@ -537,9 +537,9 @@ fn build_tools_list(mode: GlobalSearchMode) -> Value {
                             "default": ""
                         },
                         "exclude": {
-                            "type": ["string", "array"],
+                            "type": "array",
                             "items": { "type": "string" },
-                            "description": "Terms to exclude, appended as Everything NOT operators. Accepts a string or an array of strings."
+                            "description": "Terms to exclude, appended as Everything NOT operators (array of strings)."
                         }
                     },
                     "required": ["folder"]
@@ -645,7 +645,7 @@ fn build_tools_list(mode: GlobalSearchMode) -> Value {
                             "default": false
                         },
                         "exclude": {
-                            "type": ["string", "array"],
+                            "type": "array",
                             "items": { "type": "string" },
                             "description": "Terms to exclude from the candidate files, appended as Everything NOT operators (same as search_in_folder's 'exclude'). Quoted path fragments match well: ['\\\\target\\\\', '\\\\.git\\\\']. Default: none."
                         },

@@ -39,11 +39,15 @@ fn pattern_arg(args: &Value) -> Result<String, (i32, String)> {
 ///
 /// 每项过 [`validate::normalize_exclude_term`]：折叠重复反斜杠，否则
 /// `\\target\\` 这种转义失误会静默不生效（见该函数的注释与实测数据）。
+///
+/// 字符串形式若形如 `[...]`，按字符串化的 JSON 数组就地展开 —— 客户端把
+/// 参数块按纯文本转发时，数组写法会整串落进 String 分支（见
+/// [`expand_stringified_exclude`] 的注释与实测数据）。
 fn exclude_arg(args: &Value) -> Result<Vec<String>, (i32, String)> {
     let mut raw_terms: Vec<String> = Vec::new();
     match args.get("exclude") {
         None | Some(Value::Null) => {}
-        Some(Value::String(s)) => raw_terms.push(s.clone()),
+        Some(Value::String(s)) => raw_terms.extend(expand_stringified_exclude(s)?),
         Some(Value::Array(arr)) => {
             for v in arr {
                 match v.as_str() {
@@ -86,6 +90,45 @@ fn exclude_arg(args: &Value) -> Result<Vec<String>, (i32, String)> {
         terms.push(validate::normalize_exclude_term(t));
     }
     Ok(terms)
+}
+
+/// 字符串形式的 exclude 若形如 `[...]`，按"字符串化的 JSON 数组"就地展开。
+///
+/// 实测（2026-09）：客户端把 `<parameter>` 块按纯文本转发，`string|array`
+/// 联合类型的数组写法不解析成 JSON 数组，整串落进 String 分支。整串当一个
+/// NOT 词时，引号/逗号/方括号成了 Everything 查询里的字面量：多项时恒
+/// 0 命中（假"无匹配"，open-vetta 会话的 custom-auth 确认搜索就这么废掉
+/// 的），单项时排除整个静默失效（candidates 与不传完全相同）。
+///
+/// 形如 `[...]` 且能解析成字符串数组的就地展开 —— 无歧义的书写错误就地
+/// 原谅，与 [`validate::normalize_exclude_term`] 同一哲学；形似数组却解析
+/// 失败的显式报错，不再静默放过（静默失效正是要修的病）。
+fn expand_stringified_exclude(s: &str) -> Result<Vec<String>, (i32, String)> {
+    let t = s.trim();
+    if !(t.starts_with('[') && t.ends_with(']')) {
+        return Ok(vec![s.to_string()]);
+    }
+    let items: Vec<Value> = serde_json::from_str(t).map_err(|e| {
+        (
+            INVALID_PARAMS,
+            format!(
+                "'exclude' looks like a stringified JSON array but does not parse ({e}); pass an array of strings instead; received {s:?}"
+            ),
+        )
+    })?;
+    let mut out = Vec::with_capacity(items.len());
+    for v in items {
+        match v.as_str() {
+            Some(item) => out.push(item.to_string()),
+            None => {
+                return Err((
+                    INVALID_PARAMS,
+                    format!("every item of 'exclude' must be a string; received {}", v),
+                ))
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// 把 pattern 包成 Everything 的 `regex:` 搜索函数项。
@@ -753,6 +796,7 @@ pub fn dispatch(name: &str, args: &Value) -> Result<ToolOutput, (i32, String)> {
                         "folder": folder,
                         "pattern": pattern,
                         "filter": candidate_filter,
+                        "exclude": excludes,
                         "output_mode": o.mode.as_str(),
                         "head_limit": o.head_limit,
                         "candidates": o.candidates,
@@ -973,6 +1017,37 @@ mod tests {
         );
         assert!(exclude_arg(&json!({})).unwrap().is_empty());
         assert!(exclude_arg(&json!({ "exclude": null })).unwrap().is_empty());
+    }
+
+    #[test]
+    fn exclude_stringified_array_is_expanded() {
+        // 客户端文本化传输的实锤形态：`["\\.git\\", "\\.vs\\"]` 整串落进
+        // String 分支。不展开的话它就是一个 NOT 词，查询被引号/逗号毒化。
+        let stringified = json!({ "exclude": "[\"\\\\.git\\\\\", \"\\\\.vs\\\\\"]" });
+        assert_eq!(
+            exclude_arg(&stringified).unwrap(),
+            v(&[r"\.git\", r"\.vs\"])
+        );
+    }
+
+    #[test]
+    fn exclude_stringified_array_with_non_string_item_is_invalid() {
+        let err = exclude_arg(&json!({ "exclude": "[\"a\", 1]" })).unwrap_err();
+        assert!(err.1.contains("every item of 'exclude'"), "{}", err.1);
+    }
+
+    #[test]
+    fn exclude_bracket_shaped_but_unparseable_is_invalid() {
+        // `\.` 不是合法 JSON 转义 —— 模型按路径直觉写单反斜杠就会到这里。
+        // 宁可报错也不静默放过：静默失效正是这次要修的病。
+        let err = exclude_arg(&json!({ "exclude": "[\"\\.git\\\"]" })).unwrap_err();
+        assert!(err.1.contains("stringified"), "{}", err.1);
+    }
+
+    #[test]
+    fn exclude_bare_string_without_brackets_stays_single_term() {
+        let bare = json!({ "exclude": r"\.git\" });
+        assert_eq!(exclude_arg(&bare).unwrap(), v(&[r"\.git\"]));
     }
 
     #[test]
