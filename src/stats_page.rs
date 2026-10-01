@@ -51,7 +51,7 @@ const ID_STATS_CONNECTIONS: i32 = 21;
 const ID_STATS_REQUESTS: i32 = 22;
 const ID_STATS_CLEAR: i32 = 50;
 const ID_STATS_HEADER_BASE: i32 = 60; // 60..=65 六列表头
-const ID_STATS_CELL_BASE: i32 = 100; // 100..=147：8 行 × 6 列（行优先）
+const ID_STATS_CELL_BASE: i32 = 100; // 100..=153：9 行 × 6 列（行优先）
 
 /// 统计页自动刷新定时器（SetTimer 的窗口级 ID）与周期（毫秒）。
 /// 定时器挂在 page_hwnd 上，页面窗口销毁时 user32 自动回收。
@@ -129,7 +129,7 @@ fn stats_row_cells(s: &crate::plugin::stats::ToolSnapshot, name: &str) -> [Strin
 }
 
 /// 6 列的 `(x, wide)`：工具名列吃剩余宽度，5 个数值列固定宽。
-/// 表头与 7 行数据共用同一组 rect，列自然对齐。
+/// 表头与 8 行数据共用同一组 rect，列自然对齐。
 fn stats_column_rects(x: i32, content_wide: i32) -> [(i32, i32); STATS_COLS] {
     let num_total: i32 = STATS_NUM_COL_WIDE.iter().sum();
     let name_wide = (content_wide - num_total).max(60);
@@ -147,7 +147,7 @@ fn stats_column_rects(x: i32, content_wide: i32) -> [(i32, i32); STATS_COLS] {
 // 页面生命周期回调（options.rs 的分流终点）
 // ============================================================
 
-/// 创建 Statistics 页控件：汇总行 + 表头 + 8 行工具明细（含未知兜底行）+ 清空按钮。
+/// 创建 Statistics 页控件：汇总行 + 表头 + 9 行工具明细（含未知兜底行）+ 清空按钮。
 pub(crate) fn load_stats_page(page: &LoadOptionsPage) -> *mut c_void {
     // 重进页面 = 新按钮新文案，确认状态从「未武装」开始。
     STATS_CLEAR_ARMED.store(false, std::sync::atomic::Ordering::Relaxed);
@@ -213,8 +213,8 @@ pub(crate) fn load_stats_page(page: &LoadOptionsPage) -> *mut c_void {
                 cstr_bytes(text).as_ptr(),
             );
         }
-        // 8 行 = 7 个真实工具 + 1 个未知工具兜底行。兜底行也要显示：
-        // 总调用次数对所有 8 个槽位求和，少画一行总数就对不上。
+        // 9 行 = 8 个真实工具 + 1 个未知工具兜底行。兜底行也要显示：
+        // 总调用次数对所有 9 个槽位求和，少画一行总数就对不上。
         for i in 0..crate::plugin::stats::TOOL_SLOT_COUNT {
             let name = crate::plugin::stats::TOOL_NAMES
                 .get(i)
@@ -274,7 +274,7 @@ unsafe extern "system" fn stats_timer_proc(hwnd: HWND, _msg: u32, _id: usize, _d
     refresh_stats_page_text(hwnd, false);
 }
 
-/// Statistics 页布局：顶部汇总三行 + 表头 + 8 行工具（含兜底行）+ 底部清空按钮。
+/// Statistics 页布局：顶部汇总三行 + 表头 + 9 行工具（含兜底行）+ 底部清空按钮。
 pub(crate) fn size_stats_page(page_hwnd: HWND) -> *mut c_void {
     let (mut wide, mut high) = client_size_logical(page_hwnd);
     let x = 12;
@@ -387,7 +387,7 @@ fn refresh_stats_page_text(page_hwnd: HWND, restore_button: bool) {
             let b = cstr_bytes(&t);
             set_text(page_hwnd, ID_STATS_REQUESTS, b.as_ptr());
         }
-        // 8 行 = 7 真实工具 + 兜底行，与 load_stats_page 一一对应。
+        // 9 行 = 8 真实工具 + 兜底行，与 load_stats_page 一一对应。
         // 整行 diff：数值没变的行跳过（名字列只在创建时写一次，永不变化）。
         for i in 0..crate::plugin::stats::TOOL_SLOT_COUNT {
             if prev.is_some_and(|p| p.rows[i] == cache.rows[i]) {

@@ -516,7 +516,7 @@ gitignore），常见做法：
 - **默认关闭，按三档全局搜索开关管控**（Everything 选项 → 插件 → MCP →
   全局搜索）：
   - **拒绝**（默认）：调用一律返回 `GLOBAL_SEARCH_DISABLED`（服务端硬闸门，
-    立即生效），其余六个工具照常、仍限定在文件夹内。错误载荷里带开启方法，
+    立即生效），其余七个工具照常、仍限定在文件夹内。错误载荷里带开启方法，
     LLM 可以直接转告用户。
   - **审核**：调用放行，但工具被标注为「非只读 / 破坏性」（`destructiveHint:
     true`），客户端据此先弹权限确认框。注意注解在规范里是**不可信的提示** ——
@@ -541,6 +541,24 @@ gitignore），常见做法：
   `0` 或越界直接 `-32602`，不是「不限」。
 - 结果每条带 `name` / `path` / `kind` / `size` / `modified` / `created`
   （时间戳为 ISO 8601 UTC），同样有 `count` / `total` 配对，用 `offset` 翻页。
+
+#### 8. `server_diagnostics`
+
+服务自诊断：零参数、只读，不触达 Everything 数据库。聚合当前配置与状态，让
+LLM 在工具行为异常时先自查一轮，再决定是重试、换工具还是请用户去设置页处理：
+
+- `server`：插件版本（与 serverInfo 同源）、支持的协议版本、**服务是否真的在
+  监听**（`listening` / `bound_port`）与配置值（`enabled` / `bind` /
+  `configured_port`）——`listening: false` 说明服务从未启用或 Apply 失败
+  （比如端口被占）。
+- `global_search`：`search_everywhere` 的当前档位与一句话说明（拒绝档带开启
+  指引）。
+- `index_changes_prerequisite`：journal 日志目录路径与**是否存在** —— 不存在
+  基本就是 `journal_log` 没开，这正是 `index_changes` 空结果最常见的原因。
+- `diagnostic_log`：`%LOCALAPPDATA%\everything-mcp\plugin.log` 的路径，排查
+  「插件为什么没起来」的第一入口（见「调试」一节）。
+- `stats`：终身计数 —— 总调用、请求数、连接数，以及每个工具的
+  `calls` / `ok` / `err` / `avg_ms`。某个工具一直 `err` 是很强的线索。
 
 三个工具共用的入参规则：`folder` 必须是绝对路径（`C:\…` 或 `\\server\share\…`），
 UNC 网络共享与本地盘同权。搜索范围以 Everything 的索引为准 —— 本地盘自动全收，

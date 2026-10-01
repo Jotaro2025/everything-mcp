@@ -54,7 +54,7 @@ fn initialize_result_announces_protocol_version_and_tools_capability() {
 }
 
 #[test]
-fn tools_list_contains_seven_tools_with_required_params() {
+fn tools_list_contains_eight_tools_with_required_params() {
     let list = protocol::make_tools_list(protocol::GlobalSearchMode::Deny);
     let tools = list["tools"].as_array().expect("tools must be an array");
     let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
@@ -67,7 +67,8 @@ fn tools_list_contains_seven_tools_with_required_params() {
             "index_changes",
             "read_file",
             "grep",
-            "search_everywhere"
+            "search_everywhere",
+            "server_diagnostics"
         ]
     );
 
@@ -167,6 +168,16 @@ fn tools_list_contains_seven_tools_with_required_params() {
         global_props["sort"]["enum"],
         json!(["name", "path", "size", "modified", "created"])
     );
+
+    // server_diagnostics：零参数、只读 —— 无 required 无 properties，注解标只读幂等。
+    assert!(tools[7]["inputSchema"].get("required").is_none());
+    assert_eq!(
+        tools[7]["inputSchema"]["properties"],
+        json!({})
+    );
+    assert_eq!(tools[7]["annotations"]["readOnlyHint"], true);
+    assert_eq!(tools[7]["annotations"]["destructiveHint"], false);
+    assert_eq!(tools[7]["annotations"]["idempotentHint"], true);
 }
 
 #[test]
@@ -881,10 +892,10 @@ fn dispatch_ping_returns_empty_result() {
 }
 
 #[test]
-fn dispatch_tools_list_returns_seven_tools() {
+fn dispatch_tools_list_returns_eight_tools() {
     let resp = dispatch(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#);
     let list = resp["result"]["tools"].as_array().unwrap();
-    assert_eq!(list.len(), 7);
+    assert_eq!(list.len(), 8);
 }
 
 #[test]
@@ -915,6 +926,38 @@ fn dispatch_tools_call_unknown_tool_is_method_not_found() {
     );
     assert_eq!(resp["error"]["code"], protocol::METHOD_NOT_FOUND);
     assert!(resp["error"]["message"].as_str().unwrap().contains("nope"));
+}
+
+#[test]
+fn server_diagnostics_reports_server_state_without_arguments() {
+    use everything_mcp::stats;
+
+    // 与真实 TCP 测试互斥：它们会临时 start/stop 全局 SERVER，而本测试
+    // 断言「从未启用 → listening=false」，并发读到中途状态会假失败。
+    let _g = SERVER_TESTS.lock().unwrap_or_else(|p| p.into_inner());
+    stats::set_flush_enabled(false);
+
+    let resp = dispatch(
+        r#"{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"server_diagnostics","arguments":{}}}"#,
+    );
+    assert!(resp.get("error").unwrap_or(&json!(null)).is_null());
+    assert_eq!(resp["result"]["isError"], json!(null));
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    let v: Value = serde_json::from_str(text).unwrap();
+
+    // 服务身份与版本号同源（Cargo.toml）。
+    assert_eq!(v["server"]["name"], "everything-mcp");
+    assert_eq!(v["server"]["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(v["server"]["protocol_versions"].as_array().unwrap().len(), 2);
+    // 测试进程从未启用服务：bound_port 应为 None（listening=false）。
+    assert_eq!(v["server"]["listening"], json!(false));
+    assert_eq!(v["server"]["enabled"], json!(false));
+    // 默认档位是 Deny；journal 目录与诊断日志给出路径（存在与否随环境）。
+    assert_eq!(v["global_search"]["mode"], "deny");
+    assert!(v["index_changes_prerequisite"]["journal_log_directory"].is_string());
+    assert!(v["diagnostic_log"]["path"].as_str().unwrap().contains("plugin.log"));
+    // 每工具统计覆盖全部 8 个真实工具。
+    assert_eq!(v["stats"]["tools"].as_array().unwrap().len(), 8);
 }
 
 #[test]
@@ -1255,7 +1298,7 @@ fn modern_tools_list_result_carries_result_type() {
     );
     assert_eq!(status, 200);
     assert_eq!(resp["result"]["resultType"], "complete");
-    assert_eq!(resp["result"]["tools"].as_array().unwrap().len(), 7);
+    assert_eq!(resp["result"]["tools"].as_array().unwrap().len(), 8);
 }
 
 #[test]
@@ -1264,7 +1307,7 @@ fn legacy_tools_list_has_no_result_type() {
     // 客户端按桥接规则把缺失当作 complete。
     let resp = dispatch(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#);
     assert!(resp["result"].get("resultType").is_none());
-    assert_eq!(resp["result"]["tools"].as_array().unwrap().len(), 7);
+    assert_eq!(resp["result"]["tools"].as_array().unwrap().len(), 8);
 }
 
 #[test]
@@ -1690,7 +1733,7 @@ fn end_to_end_over_real_tcp() {
     assert_eq!(resp["result"]["resultType"], "complete");
     assert_eq!(resp["result"]["ttlMs"], json!(protocol::TOOLS_LIST_TTL_MS));
     assert_eq!(resp["result"]["cacheScope"], "public");
-    assert_eq!(resp["result"]["tools"].as_array().unwrap().len(), 7);
+    assert_eq!(resp["result"]["tools"].as_array().unwrap().len(), 8);
     // 清单里应当能看到新工具，且按现有顺序排在最后。
     let names: Vec<&str> = resp["result"]["tools"]
         .as_array()
@@ -1702,6 +1745,8 @@ fn end_to_end_over_real_tcp() {
     assert_eq!(resp["result"]["tools"][3]["name"], "index_changes");
     assert_eq!(names[6], "search_everywhere");
     assert_eq!(resp["result"]["tools"][6]["name"], "search_everywhere");
+    assert_eq!(names[7], "server_diagnostics");
+    assert_eq!(resp["result"]["tools"][7]["name"], "server_diagnostics");
 
     // modern 未知方法 → 404。
     let (head, _) = http_post(
@@ -1847,7 +1892,7 @@ fn stats_tools_call_unknown_tool_lands_in_fallback_err() {
     assert_eq!(resp["error"]["code"], protocol::METHOD_NOT_FOUND);
 
     let idx = stats::tool_index("no_such_tool");
-    assert_eq!(idx, 7, "未知工具必须落兜底槽");
+    assert_eq!(idx, stats::UNKNOWN_TOOL_IDX, "未知工具必须落兜底槽");
     let after = stats::snapshot();
     assert_eq!(after.tools[idx].calls, before.tools[idx].calls + 1);
     assert_eq!(after.tools[idx].err, before.tools[idx].err + 1);

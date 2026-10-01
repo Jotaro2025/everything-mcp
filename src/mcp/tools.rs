@@ -396,8 +396,93 @@ pub fn dispatch(name: &str, args: &Value) -> Result<ToolOutput, (i32, String)> {
         "read_file" => tool_read_file(args),
         "grep" => tool_grep(args),
         "search_everywhere" => tool_search_everywhere(args),
+        "server_diagnostics" => tool_server_diagnostics(args),
         other => Err((METHOD_NOT_FOUND, format!("unknown tool: {}", other))),
     }
+}
+
+/// `server_diagnostics`：服务自诊断 —— 只读、零参数、不触达 Everything DB。
+///
+/// 聚合的都是现成状态：配置（options）、监听（server）、全局搜索档位、
+/// journal 日志目录存在性（index_changes 的前提）、诊断日志路径、统计。
+/// 目的是让 LLM 在工具行为异常时先自查，再决定是重试、换工具还是请用户
+/// 去设置页处理。
+fn tool_server_diagnostics(_args: &Value) -> Result<ToolOutput, (i32, String)> {
+    let (enabled, bind, configured_port) = crate::options::settings_snapshot();
+    let mode = crate::options::global_search_mode();
+    // 实际监听端口：None = 服务没在跑（未启用，或 Apply 失败）。
+    let bound_port = crate::mcp::server::bound_port();
+
+    // journal 日志目录：index_changes 的前提。目录不存在通常意味着
+    // journal_log 没开 —— 这正是 index_changes 空结果最常见的原因。
+    let journal_dir = plugin::journal::log_directory();
+    let journal_dir_str = journal_dir.to_string_lossy().into_owned();
+    let journal_dir_exists = journal_dir.is_dir();
+
+    // 诊断日志：排查「插件为什么没起来」的第一入口。
+    let diag_path = plugin::diag::path();
+    let diag_exists = std::fs::metadata(diag_path).is_ok();
+
+    // 终身统计：哪个工具一直在错，一眼可见。
+    let snap = plugin::stats::snapshot();
+    let total_calls: u64 = snap.tools.iter().map(|t| t.calls).sum();
+    let tools: Vec<Value> = plugin::stats::TOOL_NAMES
+        .iter()
+        .enumerate()
+        .map(|(i, name)| {
+            let t = &snap.tools[i];
+            json!({
+                "name": name,
+                "calls": t.calls,
+                "ok": t.ok,
+                "err": t.err,
+                "avg_ms": t.avg_ms(),
+            })
+        })
+        .collect();
+
+    let payload = json!({
+        "server": {
+            "name": "everything-mcp",
+            "version": env!("CARGO_PKG_VERSION"),
+            "protocol_versions": crate::mcp::protocol::SUPPORTED_PROTOCOL_VERSIONS,
+            "listening": bound_port.is_some(),
+            "bound_port": bound_port,
+            "enabled": enabled,
+            "bind": bind,
+            "configured_port": configured_port,
+        },
+        "global_search": {
+            "mode": mode.as_str(),
+            "note": if mode == GlobalSearchMode::Deny {
+                "search_everywhere rejects every call with GLOBAL_SEARCH_DISABLED; set Everything > Options > Plugins > MCP > global search to 'review' or 'allow' to change this"
+            } else {
+                "search_everywhere is served; 'review' additionally relies on the client honoring the tool annotations"
+            },
+        },
+        "index_changes_prerequisite": {
+            "journal_log_directory": journal_dir_str,
+            "journal_log_directory_exists": journal_dir_exists,
+            "note": if journal_dir_exists {
+                "journal log directory found; index_changes is usable (a change made moments ago may still lag behind by 8-70 s)"
+            } else {
+                "journal log directory not found — index_changes returns empty results until journal_log is enabled in Everything > Tools > Options > Index > Journal > Log changes"
+            },
+        },
+        "diagnostic_log": {
+            "path": diag_path,
+            "exists": diag_exists,
+        },
+        "stats": {
+            "total_calls": total_calls,
+            "requests_total": snap.global.requests_total,
+            "connections": snap.global.connections,
+            "tools": tools,
+        },
+    });
+    let text = serde_json::to_string_pretty(&payload)
+        .unwrap_or_else(|_| "{\"error\":\"serialization failed\"}".into());
+    Ok((content_text(&text), false))
 }
 
 /// `search_in_folder`：递归子树内按 pattern 搜索文件与文件夹。

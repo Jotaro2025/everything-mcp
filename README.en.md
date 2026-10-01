@@ -603,7 +603,7 @@ follow-up work.
 - **Off by default, governed by a three-mode global-search switch**
   (Everything → Options → Plugins → MCP → global search):
   - **Deny** (default): every call returns `GLOBAL_SEARCH_DISABLED` (a hard
-    server-side gate, effective immediately); the other six tools are
+    server-side gate, effective immediately); the other seven tools are
     unaffected and stay folder-scoped. The error payload names the fix, so the
     LLM can relay it to the user.
   - **Review**: calls go through, but the tool is annotated as NOT read-only /
@@ -638,6 +638,29 @@ follow-up work.
 - Each result carries `name` / `path` / `kind` / `size` / `modified` /
   `created` (ISO 8601 UTC timestamps), with the same `count` / `total` pair
   and `offset` paging.
+
+#### 8. `server_diagnostics`
+
+Server self-diagnostics: argument-free, read-only, never touches the Everything
+database. It aggregates current configuration and state so the LLM can triage a
+misbehaving tool on its own before deciding whether to retry, switch tools, or
+ask the user to open the options page:
+
+- `server`: plugin version (same source as serverInfo), supported protocol
+  versions, whether the HTTP server is **actually listening**
+  (`listening` / `bound_port`) plus the configured values (`enabled` / `bind` /
+  `configured_port`) — `listening: false` means the server was never enabled or
+  Apply failed (e.g. a busy port).
+- `global_search`: the current mode for `search_everywhere` with a one-line
+  note (the Deny tier carries enablement instructions).
+- `index_changes_prerequisite`: the journal log directory path and **whether it
+  exists** — a missing directory almost always means `journal_log` is off,
+  which is the most common cause of empty `index_changes` results.
+- `diagnostic_log`: the path of `%LOCALAPPDATA%\everything-mcp\plugin.log`,
+  the first stop when chasing "why didn't the plugin start" (see Debugging).
+- `stats`: lifetime counters — total calls, requests, connections, plus
+  `calls` / `ok` / `err` / `avg_ms` per tool. A tool that keeps erring is a
+  strong hint.
 
 Argument rules shared by all three tools: `folder` must be an absolute path
 (`C:\…` or `\\server\share\…`) — UNC network shares are on equal footing with

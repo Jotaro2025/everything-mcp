@@ -58,6 +58,12 @@ fn log_path() -> &'static str {
     .as_str()
 }
 
+/// 诊断日志的完整路径 —— server_diagnostics 工具把它回给调用方，
+/// 排查「插件为什么没起来」时知道去哪看。
+pub fn path() -> &'static str {
+    log_path()
+}
+
 static WRITES: AtomicU64 = AtomicU64::new(0);
 
 pub fn write(line: &str) {

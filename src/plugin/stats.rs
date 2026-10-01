@@ -28,9 +28,9 @@ use std::time::Duration;
 
 use serde_json::json;
 
-/// 7 个工具的固定顺序。与 tools::dispatch 的 match 分支一一对应，
+/// 8 个工具的固定顺序。与 tools::dispatch 的 match 分支一一对应，
 /// 顺序变了这里也得跟着改（否则 UI 显示会串行）。
-pub const TOOL_NAMES: [&str; 7] = [
+pub const TOOL_NAMES: [&str; 8] = [
     "search_in_folder",
     "list_folder",
     "count",
@@ -38,14 +38,15 @@ pub const TOOL_NAMES: [&str; 7] = [
     "read_file",
     "grep",
     "search_everywhere",
+    "server_diagnostics",
 ];
 
 /// 未知工具名的兜底槽位 —— 不单列一行，防名字空间被撑爆。
 /// 未知调用统一记到这个槽位（与 `tool_index` 的兜底逻辑对应）。
-pub const UNKNOWN_TOOL_IDX: usize = 7;
+pub const UNKNOWN_TOOL_IDX: usize = 8;
 /// 槽位总数 = TOOL_NAMES.len() + 1 兜底。UI 按这个数画行（兜底行也要显示，
 /// 否则「总调用次数」和各行之和对不上）。
-pub const TOOL_SLOT_COUNT: usize = 8;
+pub const TOOL_SLOT_COUNT: usize = 9;
 
 /// 批量刷盘阈值：每 N 次调用刷一次。
 const FLUSH_CALL_THRESHOLD: u64 = 20;
@@ -173,8 +174,9 @@ pub struct StatsSnapshot {
 // 全局状态
 // ====================================================================
 
-/// 8 个工具槽位（7 真实 + 1 未知兜底）。
+/// 9 个工具槽位（8 真实 + 1 未知兜底）。
 static TOOL_STATS: [ToolStat; TOOL_SLOT_COUNT] = [
+    ToolStat::new(),
     ToolStat::new(),
     ToolStat::new(),
     ToolStat::new(),

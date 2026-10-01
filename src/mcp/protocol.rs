@@ -663,11 +663,31 @@ fn build_tools_list(mode: GlobalSearchMode) -> Value {
         ]
     });
     // search_everywhere 的描述前缀与注解随档位变，单独构造后追加 ——
-    // 上面六个条目保持纯静态形状，方便逐字段断言。
+    // 上面七个条目保持纯静态形状，方便逐字段断言。
     if let Some(arr) = result["tools"].as_array_mut() {
         arr.push(search_everywhere_entry(mode));
+        arr.push(diagnostics_entry());
     }
     result
+}
+
+/// server_diagnostics 的工具条目 —— 纯静态：无参数、只读，不做任何查询。
+fn diagnostics_entry() -> Value {
+    serde_json::json!({
+        "name": "server_diagnostics",
+        "description": "Return server self-diagnostics to triage problems before asking the user: which MCP protocol versions are supported; whether the HTTP server is actually listening and on which port (compare with the configured bind/port — 'listening': false means the server was never enabled or Apply failed, e.g. a busy port); the current global-search policy for search_everywhere; whether the Everything journal log directory exists (the prerequisite for index_changes — if missing, journal_log is not enabled in Everything > Tools > Options > Index > Journal > Log changes); the path of the plugin's diagnostic log (%LOCALAPPDATA%\\everything-mcp\\plugin.log) for crash tracing; and lifetime per-tool call statistics (calls/ok/err per tool — a tool that always errs is a strong hint). Read-only and argument-free; it never touches the Everything database or the filesystem beyond metadata of the two log locations.",
+        "annotations": {
+            "title": "Server Diagnostics",
+            "readOnlyHint": true,
+            "destructiveHint": false,
+            "idempotentHint": true,
+            "openWorldHint": false
+        },
+        "inputSchema": {
+            "type": "object",
+            "properties": {}
+        }
+    })
 }
 
 /// 构造一个标准的 JSON-RPC 成功响应。

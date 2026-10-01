@@ -198,6 +198,13 @@ pub fn global_search_mode() -> GlobalSearchMode {
     state().global_search
 }
 
+/// 当前生效的设置快照 `(enabled, bind, port)` —— server_diagnostics 工具用。
+/// 这是「配置值」，不代表服务真的在监听（那要看 server::bound_port）。
+pub fn settings_snapshot() -> (bool, String, u16) {
+    let st = state();
+    (st.enabled, st.bind.clone(), st.port)
+}
+
 // ============================================================
 // 对外入口 —— 由 lib.rs 的 everything_plugin_proc 分发
 // ============================================================
