@@ -48,6 +48,8 @@ static INFLIGHT: AtomicUsize = AtomicUsize::new(0);
 
 struct ServerHandle {
     shutdown: std::sync::Arc<AtomicBool>,
+    /// 实际绑定的地址：`port` 传 0 时由系统分配，调用方用 [`bound_port`] 查。
+    local: SocketAddr,
     /// 自连接唤醒地址：阻塞 accept 的打断手段（stop() 往这里连一下）。
     wakeup: SocketAddr,
     thread: Mutex<Option<JoinHandle<()>>>,
@@ -78,7 +80,8 @@ pub fn start(bind: &str, port: u16) -> Result<(), String> {
     // 服务退出后立即重启不会因为 TIME_WAIT 失败。
 
     // 唤醒地址：bind 0.0.0.0/[::] 时换成对应的 loopback，自连接才连得到。
-    let wakeup = match listener.local_addr() {
+    let local = listener.local_addr();
+    let wakeup = match &local {
         Ok(a) => match a.ip() {
             IpAddr::V4(ip) if ip.is_unspecified() => {
                 SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), a.port())
@@ -86,10 +89,11 @@ pub fn start(bind: &str, port: u16) -> Result<(), String> {
             IpAddr::V6(ip) if ip.is_unspecified() => {
                 SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), a.port())
             }
-            _ => a,
+            _ => *a,
         },
         Err(_) => SocketAddr::from(([127, 0, 0, 1], port)),
     };
+    let local = local.unwrap_or(wakeup);
 
     let shutdown = std::sync::Arc::new(AtomicBool::new(false));
     let shutdown_thread = shutdown.clone();
@@ -104,10 +108,18 @@ pub fn start(bind: &str, port: u16) -> Result<(), String> {
     let mut slot = SERVER.lock().unwrap_or_else(|p| p.into_inner());
     *slot = Some(ServerHandle {
         shutdown,
+        local,
         wakeup,
         thread: Mutex::new(Some(handle)),
     });
     Ok(())
+}
+
+/// 本次启动实际绑定的端口。`start(…, 0)` 时端口由系统临时分配 —— 测试用它
+/// 拿到真实端口，避免固定端口在共享环境（CI runner）里偶发被占导致 bind 失败。
+pub fn bound_port() -> Option<u16> {
+    let slot = SERVER.lock().unwrap_or_else(|p| p.into_inner());
+    slot.as_ref().map(|s| s.local.port())
 }
 
 /// 关闭服务（PM_STOP / PM_KILL 时调用）。

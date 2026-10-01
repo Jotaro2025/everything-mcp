@@ -1652,8 +1652,10 @@ fn http_post(port: u16, body: &str, extra_headers: &[(&str, &str)]) -> (String, 
 #[test]
 fn end_to_end_over_real_tcp() {
     let _g = SERVER_TESTS.lock().unwrap_or_else(|p| p.into_inner());
-    let port = 18285;
-    server::start("127.0.0.1", port).expect("test server must start");
+    // 端口 0 = 系统临时分配：固定端口在共享环境（CI runner）里偶发被占，
+    // bind 失败会让测试莫名挂掉。
+    server::start("127.0.0.1", 0).expect("test server must start");
+    let port = server::bound_port().expect("listener must report its bound port");
 
     // legacy initialize 握手照旧。
     let (head, body) = http_post(
@@ -1743,10 +1745,12 @@ static SERVER_TESTS: Mutex<()> = Mutex::new(());
 #[test]
 fn server_restart_really_closes_the_port() {
     let _g = SERVER_TESTS.lock().unwrap_or_else(|p| p.into_inner());
-    let port = 18287;
     let ping = r#"{"jsonrpc":"2.0","id":1,"method":"ping","params":{}}"#;
 
-    server::start("127.0.0.1", port).expect("first start");
+    // 第一次用临时端口拿到系统分配的值，重启复用同一个端口 ——
+    // 回归点（第二次 start 必须能重新 bind 同一端口）不受影响。
+    server::start("127.0.0.1", 0).expect("first start");
+    let port = server::bound_port().expect("listener must report its bound port");
     let (head, _) = http_post(port, ping, &[]);
     assert!(head.starts_with("HTTP/1.1 200"), "{}", head);
     server::stop();
