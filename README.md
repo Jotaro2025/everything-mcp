@@ -629,6 +629,28 @@ rebinding）；`Mcp-Method` / `Mcp-Name` 镜像头存在时校验与请求体一
 值走 `=?base64?…?=` sentinel；`tools/call` 的参数校验（路径规范化）发生在触达
 Everything 主程序之前，因此非法入参绝不会变成一次真实搜索。
 
+### 已知限制
+
+集中列出各工具文档里散落的行为边界，接入前值得一读：
+
+- **搜索结果的上限是 Everything 的索引**。只搜已索引的位置：所有本地 NTFS
+  盘 + 在 Everything 选项 → 索引 → 文件夹 里添加的网络共享。未索引的共享
+  （或当前离线的共享）返回 0 条 —— 工具会在结果为空时附 `folder_warning`
+  帮你区分「真的没有」与「没被索引」。
+- **`index_changes` 依赖 Everything 的变更日志**。需要先在 Everything 选项里
+  开启 journal_log（索引 → 变更日志），否则日志不存在，只能返回空结果。
+- **`search_everywhere` 的 review 档位依赖客户端自觉**。服务端只下发工具注解
+  （`readOnlyHint` / `destructiveHint`），confirm 弹窗由 MCP 客户端实现；只有
+  deny 档在服务端硬拒。服务端无法强制客户端弹确认 —— 这是 MCP 注解机制的
+  固有边界。
+- **传输是简单的一次一请求 HTTP**：每连接单请求（`Connection: close`）、无
+  SSE 长连接通道、无 GET 通知流（405）。并发上限 64，超出直接 503。单机
+  回环 + 串行调用的 MCP 客户端足够；不要把它当高并发 Web 服务用。
+- **HTTP 服务器只信任 localhost 来源**。绑定地址默认回环，带非 localhost
+  `Origin` 头的请求一律 403（防 DNS rebinding）—— 远程访问不在设计目标内。
+- **只处理文本**。`read_file` 拒绝二进制内容（按扩展名与内容双重嗅探），
+  行长超 16 KiB 截断；`grep` 同样跳过二进制文件与超过 8 MiB 的文件。
+
 ### 调试
 
 诊断信息有两条出路：

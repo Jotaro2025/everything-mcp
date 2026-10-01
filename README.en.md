@@ -746,6 +746,33 @@ the request body (non-ASCII values use the `=?base64?…?=` sentinel); and
 reaches the Everything host, so a malformed argument never becomes a real
 search.
 
+### Known limitations
+
+Behavior boundaries collected from the per-tool docs — worth a read before wiring up:
+
+- **Search results are capped by Everything's index**. Only indexed locations are
+  searched: all local NTFS drives plus network shares added under Everything >
+  Options > Indexes > Folders. Un-indexed (or currently offline) shares return
+  0 results — tools attach a `folder_warning` on empty results to help you tell
+  "genuinely nothing" from "not indexed".
+- **`index_changes` depends on Everything's change journal**. Enable journal_log
+  in Everything's options (Indexes > Journal) first; without it there is no log
+  to parse and only empty results come back.
+- **`search_everywhere`'s review tier relies on the client honoring it**. The
+  server only publishes tool annotations (`readOnlyHint` / `destructiveHint`);
+  the confirmation dialog is the MCP client's job. Only the deny tier is
+  enforced server-side — this is an inherent boundary of MCP annotations.
+- **The transport is simple one-request-per-connection HTTP**: `Connection:
+  close`, no SSE channel, no GET notification stream (405). Concurrency is
+  capped at 64; excess connections get 503 immediately. Fine for a localhost,
+  serially-calling MCP client — do not use it as a high-concurrency web service.
+- **The HTTP server trusts localhost only**. The bind address defaults to the
+  loopback and any request carrying a non-localhost `Origin` header is rejected
+  with 403 (DNS-rebinding protection) — remote access is not a design goal.
+- **Text only**. `read_file` refuses binary content (by extension and content
+  sniffing) and clips lines longer than 16 KiB; `grep` likewise skips binary
+  files and files above 8 MiB.
+
 ### Debugging
 
 Diagnostics go to two places:
