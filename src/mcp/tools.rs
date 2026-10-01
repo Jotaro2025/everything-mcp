@@ -103,6 +103,13 @@ fn exclude_arg(args: &Value) -> Result<Vec<String>, (i32, String)> {
 /// 形如 `[...]` 且能解析成字符串数组的就地展开 —— 无歧义的书写错误就地
 /// 原谅，与 [`validate::normalize_exclude_term`] 同一哲学；形似数组却解析
 /// 失败的显式报错，不再静默放过（静默失效正是要修的病）。
+///
+/// **弃用计划**：这是给「按纯文本转发参数块」的缺陷客户端的兼容层，
+/// 不是长期 API。1.2.4 已把 tools/list 的 schema 收紧为纯数组（新客户端
+/// 不会再触发 String 分支），但老会话/旧客户端短期内仍会踩进来 —— 移除
+/// 前需要一段观察期：若连续两个 minor 版本（≥1.4）都没有真实复现（搜索
+/// 统计与 exclude 相关的报错为零），删掉 [`expand_stringified_exclude`]，
+/// String 分支改回单 NOT 词原样传递。
 fn expand_stringified_exclude(s: &str) -> Result<Vec<String>, (i32, String)> {
     let t = s.trim();
     if !(t.starts_with('[') && t.ends_with(']')) {
