@@ -209,7 +209,35 @@ pub fn grep(
     )?;
     let candidates = outcome.total;
     let candidates_truncated = outcome.total > outcome.results.len();
+    let entries: Vec<(String, bool)> = outcome
+        .results
+        .iter()
+        .map(|r| (r.path.clone(), r.is_folder))
+        .collect();
+    Ok(scan_candidates(
+        &re,
+        candidates,
+        candidates_truncated,
+        &entries,
+        mode,
+        head_limit,
+    ))
+}
 
+/// 对给定候选集执行逐行匹配 —— grep 的运行时主体，与候选来源无关。
+///
+/// 生产路径的候选来自 Everything 查询（按修改时间倒序，见 [`grep`]）；
+/// 测试路径用临时文件夹具直接喂。`entries` 是 `(完整路径, 是否文件夹)`
+/// 对，顺序即处理顺序 —— 结果里「最近改动的文件先出」这一性质也由
+/// 调用方保证。
+fn scan_candidates(
+    re: &Regex,
+    candidates: usize,
+    candidates_truncated: bool,
+    entries: &[(String, bool)],
+    mode: OutputMode,
+    head_limit: usize,
+) -> GrepOutcome {
     let mut hits: Vec<Hit> = Vec::new();
     let mut per_file: Vec<(String, usize)> = Vec::new();
     let mut files_scanned = 0usize;
@@ -220,8 +248,8 @@ pub fn grep(
     // 它才是真正防「一次 grep 把上下文炸掉」的闸门。
     let mut budget = read::MAX_WINDOW_BYTES;
 
-    'files: for r in &outcome.results {
-        if r.is_folder {
+    'files: for (path, is_folder) in entries {
+        if *is_folder {
             continue;
         }
         // 到量就停：content 模式按命中行数算，其余模式按文件数算。
@@ -238,25 +266,25 @@ pub fn grep(
             break;
         }
         // 二进制 / 超大 / 黑名单 / 读不了 —— 跳过这个文件，不中断整次搜索。
-        let Some(text) = read::read_text_for_matching(&r.path) else {
+        let Some(text) = read::read_text_for_matching(path) else {
             continue;
         };
         files_scanned += 1;
         bytes_scanned += text.len() as u64;
 
         let (file_hits, clipped, stopped) =
-            scan_text(&re, &r.path, &text, mode, head_limit, &mut hits, &mut budget);
+            scan_text(re, path, &text, mode, head_limit, &mut hits, &mut budget);
         clipped_lines += clipped;
         if file_hits > 0 {
             // 非 content 模式的载荷是路径，也要计账。
             if mode != OutputMode::Content {
-                if r.path.len() + 8 > budget {
+                if path.len() + 8 > budget {
                     truncated = true;
                     break;
                 }
-                budget -= r.path.len() + 8;
+                budget -= path.len() + 8;
             }
-            per_file.push((r.path.clone(), file_hits));
+            per_file.push((path.clone(), file_hits));
         }
         if stopped {
             truncated = true;
@@ -277,7 +305,7 @@ pub fn grep(
         OutputMode::Count => GrepPayload::Counts(per_file),
     };
 
-    Ok(GrepOutcome {
+    GrepOutcome {
         mode,
         head_limit,
         candidates,
@@ -288,7 +316,7 @@ pub fn grep(
         clipped_lines,
         truncated,
         payload,
-    })
+    }
 }
 
 #[cfg(test)]
@@ -477,5 +505,201 @@ mod tests {
         assert_eq!(read::MAX_WINDOW_BYTES, 128 * 1024);
         assert_eq!(read::MAX_LINE_CHARS * 4, 64 * 1024, "裁过的行必须放得进预算");
         const { assert!(read::MAX_LINE_CHARS * 4 < read::MAX_WINDOW_BYTES) };
+    }
+
+    // ------------------------------------------------------------------
+    // fixture 测试：scan_candidates + read_text_for_matching 的运行时路径，
+    // 用临时文件夹具直接喂候选（生产路径的候选来自 Everything，CI 上没有）。
+    // ------------------------------------------------------------------
+
+    /// 一次够用的夹具树，返回 (夹具根, 候选条目按生产顺序)。
+    ///
+    /// 覆盖六种候选形态：纯文本命中 / 纯文本不命中 / 二进制（跳过）/
+    /// 敏感名（跳过）/ 超大（跳过）/ 文件夹与不存在的路径（跳过）。
+    fn fixture() -> (std::path::PathBuf, Vec<(String, bool)>) {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("everything_mcp_grep_fix_{unique}"));
+        std::fs::create_dir_all(&root).unwrap();
+
+        std::fs::write(
+            root.join("hits.txt"),
+            "first plain line\nhas TODO here\nno match\nsecond TODO line\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("clean.txt"), "nothing\nto see\n").unwrap();
+        // NUL 字节触发内容嗅探 → 二进制跳过。
+        std::fs::write(root.join("bin.dat"), [0x68, 0x69, 0x00, 0x0a]).unwrap();
+        // 敏感名：正文里有命中也不能带出来。
+        std::fs::write(root.join(".env"), "TODO=secret\n").unwrap();
+        // 超大：超过 MAX_FILE_BYTES 直接跳过（读都不读）。
+        let big = vec![b'a'; read::MAX_FILE_BYTES as usize + 1];
+        std::fs::write(root.join("big.txt"), &big).unwrap();
+
+        let p = |name: &str| root.join(name).to_string_lossy().into_owned();
+        let entries = vec![
+            (p("hits.txt"), false),
+            (p("clean.txt"), false),
+            (p("bin.dat"), false),
+            (p(".env"), false),
+            (p("big.txt"), false),
+            (p("subdir"), true),
+            (p("missing.txt"), false),
+        ];
+        (root, entries)
+    }
+
+    /// 按生产路径同款方式编译正则。
+    fn build_re(pattern: &str, case_insensitive: bool) -> Regex {
+        RegexBuilder::new(pattern)
+            .case_insensitive(case_insensitive)
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn scan_candidates_content_mode_reports_hits_with_line_numbers() {
+        let (root, entries) = fixture();
+        let o = scan_candidates(
+            &build_re("TODO", false),
+            7,
+            false,
+            &entries,
+            OutputMode::Content,
+            200,
+        );
+        let GrepPayload::Content(hits) = &o.payload else {
+            panic!("content 模式应产出 Content 载荷");
+        };
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].line, 2);
+        assert_eq!(hits[0].text, "has TODO here");
+        assert_eq!(hits[1].line, 4);
+        assert_eq!(hits[1].text, "second TODO line");
+        // 跳过的四类（二进制/敏感/超大/目录）不计入 files_scanned；
+        // 不存在的路径同样只是跳过。实际读的只有两个纯文本文件。
+        assert_eq!(o.files_scanned, 2);
+        assert_eq!(o.files_with_matches, 1);
+        assert_eq!(o.candidates, 7);
+        assert!(!o.truncated);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn scan_candidates_files_and_count_modes() {
+        let (root, entries) = fixture();
+        let hits_path = root.join("hits.txt").to_string_lossy().into_owned();
+
+        let o = scan_candidates(
+            &build_re("TODO", false),
+            7,
+            false,
+            &entries,
+            OutputMode::FilesWithMatches,
+            200,
+        );
+        let GrepPayload::Files(files) = &o.payload else {
+            panic!("filesWithMatches 模式应产出 Files 载荷");
+        };
+        assert_eq!(files, std::slice::from_ref(&hits_path));
+
+        let o = scan_candidates(
+            &build_re("TODO", false),
+            7,
+            false,
+            &entries,
+            OutputMode::Count,
+            200,
+        );
+        let GrepPayload::Counts(counts) = &o.payload else {
+            panic!("count 模式应产出 Counts 载荷");
+        };
+        assert_eq!(counts, &[(hits_path, 2)]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn scan_candidates_case_insensitive_flag_goes_through_the_regex_builder() {
+        let (root, entries) = fixture();
+        let o = scan_candidates(
+            &build_re("todo", true),
+            7,
+            false,
+            &entries,
+            OutputMode::Content,
+            200,
+        );
+        let GrepPayload::Content(hits) = &o.payload else {
+            panic!("content 模式应产出 Content 载荷");
+        };
+        assert_eq!(hits.len(), 2, "大小写不敏感时 TODO 全部命中");
+        // 同 pattern 大小写敏感时一个都没有（夹具里只有大写 TODO）。
+        let o = scan_candidates(
+            &build_re("todo", false),
+            7,
+            false,
+            &entries,
+            OutputMode::Content,
+            200,
+        );
+        assert_eq!(o.payload.len(), 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn scan_candidates_reports_truncation_at_head_limit() {
+        let (root, entries) = fixture();
+        let o = scan_candidates(
+            &build_re("TODO", false),
+            7,
+            false,
+            &entries,
+            OutputMode::Content,
+            1,
+        );
+        let GrepPayload::Content(hits) = &o.payload else {
+            panic!("content 模式应产出 Content 载荷");
+        };
+        assert_eq!(hits.len(), 1);
+        assert!(o.truncated, "head_limit 触顶要如实上报");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn scan_candidates_skips_sensitive_and_binary_files_even_when_they_match() {
+        // 独立夹具：候选里只有「必然命中但必须被跳过」的文件 ——
+        // 一个 NUL 字节的二进制，一个敏感名 .env，一个 .git\objects 路径。
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("everything_mcp_grep_skip_{unique}"));
+        std::fs::create_dir_all(root.join(".git\\objects\\ab")).unwrap();
+        std::fs::write(root.join("bin.dat"), [0x00, b'T', b'O', b'D', b'O']).unwrap();
+        std::fs::write(root.join(".env"), "TODO=1\n").unwrap();
+        std::fs::write(root.join(".git\\objects\\ab\\cd"), "TODO blob\n").unwrap();
+
+        let p = |rel: &str| root.join(rel).to_string_lossy().into_owned();
+        let entries = vec![
+            (p("bin.dat"), false),
+            (p(".env"), false),
+            (p(".git\\objects\\ab\\cd"), false),
+        ];
+        let o = scan_candidates(
+            &build_re("TODO", false),
+            3,
+            false,
+            &entries,
+            OutputMode::Content,
+            200,
+        );
+        assert_eq!(o.files_scanned, 0, "三类候选全部应被跳过");
+        assert_eq!(o.payload.len(), 0);
+        assert!(!o.truncated, "跳过不算截断");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
