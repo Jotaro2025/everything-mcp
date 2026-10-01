@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: Build & Test & Clippy (${{ matrix.target }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x86_64-pc-windows-msvc, i686-pc-windows-msvc]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ci-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
+
+      # [lints] 里 clippy.all = deny，这里显式 -- -D warnings 双保险。
+      # 只查默认 target（host 是 x64，x86 的 clippy 结果相同），省一半时间。
+      - name: Clippy
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Build (release)
+        run: cargo build --release --target ${{ matrix.target }}
+
+      # 绝大多数测试不需要 Everything 宿主：search 走宿主 FFI（单测里已桩化），
+      # read_file / grep 用临时文件，HTTP / 分发 / 协议走 tests/mcp.rs 的本地套接字。
+      - name: Test
+        run: cargo test --target ${{ matrix.target }}
+
+      # cdylib 产物存在性检查：插件 DLL 是唯一交付物，编译成功但没出 DLL 也算失败。
+      - name: Verify DLL artifact
+        shell: pwsh
+        run: |
+          $dll = Get-ChildItem "target/${{ matrix.target }}/release/*.dll" | Select-Object -First 1
+          if (-not $dll) { throw "no DLL produced for ${{ matrix.target }}" }
+          "artifact: $($dll.Name) ($([math]::Round($dll.Length/1KB)) KB)"

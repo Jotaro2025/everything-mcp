@@ -45,6 +45,14 @@ features = [
     "Win32_Graphics_Gdi",
 ]
 
+# ====== Lint 门禁 ======
+# clippy 曾被手工清到 0（88 → 0），这里把门禁固化进构建：任何 clippy 警告
+# 都会让 cargo clippy / cargo check 报错，防止警告回潮。CI 里额外跑
+# cargo clippy --all-targets 双保险。
+[lints.clippy]
+all = "deny"
+pedantic = "allow"
+
 [profile.release]
 opt-level = 3
 lto = true
