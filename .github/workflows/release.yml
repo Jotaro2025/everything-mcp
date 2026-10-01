@@ -46,4 +46,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           $tag = $env:GITHUB_REF_NAME
-          gh release create $tag --title $tag --generate-notes installer\dist\everything-mcp-*-setup.exe
+          # 发布说明用仓库根目录的 RELEASE_NOTES.md（中英双语，每次发版随
+          # 版本号一起更新）；文件不存在时退回自动生成的提交列表。
+          if (Test-Path RELEASE_NOTES.md) {
+            gh release create $tag --title $tag --notes-file RELEASE_NOTES.md installer\dist\everything-mcp-*-setup.exe
+          } else {
+            gh release create $tag --title $tag --generate-notes installer\dist\everything-mcp-*-setup.exe
+          }
