@@ -965,17 +965,17 @@ fn refresh_stats_page_text(page_hwnd: HWND, restore_button: bool) {
     let prev = *last;
     unsafe {
         // 汇总三行：逐行 diff。
-        if prev.map_or(true, |p| p.total_calls != cache.total_calls) {
+        if prev.is_none_or(|p| p.total_calls != cache.total_calls) {
             let t = format!("{} {}", labels.stats_total, cache.total_calls);
             let b = cstr_bytes(&t);
             set_text(page_hwnd, ID_STATS_TOTAL, b.as_ptr());
         }
-        if prev.map_or(true, |p| p.connections != cache.connections) {
+        if prev.is_none_or(|p| p.connections != cache.connections) {
             let t = format!("{} {}", labels.stats_connections, cache.connections);
             let b = cstr_bytes(&t);
             set_text(page_hwnd, ID_STATS_CONNECTIONS, b.as_ptr());
         }
-        if prev.map_or(true, |p| p.requests_total != cache.requests_total) {
+        if prev.is_none_or(|p| p.requests_total != cache.requests_total) {
             let t = format!("{} {}", labels.stats_requests, cache.requests_total);
             let b = cstr_bytes(&t);
             set_text(page_hwnd, ID_STATS_REQUESTS, b.as_ptr());
@@ -983,7 +983,7 @@ fn refresh_stats_page_text(page_hwnd: HWND, restore_button: bool) {
         // 8 行 = 7 真实工具 + 兜底行，与 load_stats_page 一一对应。
         // 整行 diff：数值没变的行跳过（名字列只在创建时写一次，永不变化）。
         for i in 0..crate::plugin::stats::TOOL_SLOT_COUNT {
-            if prev.map_or(false, |p| p.rows[i] == cache.rows[i]) {
+            if prev.is_some_and(|p| p.rows[i] == cache.rows[i]) {
                 continue;
             }
             let name = crate::plugin::stats::TOOL_NAMES

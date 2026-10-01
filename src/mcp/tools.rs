@@ -377,568 +377,574 @@ fn optional_text_arg(args: &Value, key: &str) -> Result<Option<String>, (i32, St
 }
 
 /// 分发工具调用。`name` 是工具名，`args` 是参数对象。
+///
+/// 每个工具的执行体独立成下方同名函数；这里只做名字分发，坏参数在触达
+/// 搜索层/磁盘前就报 INVALID_PARAMS（各函数内部保证这一顺序）。
 pub fn dispatch(name: &str, args: &Value) -> Result<ToolOutput, (i32, String)> {
     match name {
-        "search_in_folder" => {
-            let folder = require_folder(args)?;
-            let pattern = pattern_arg(args)?;
-            let excludes = exclude_arg(args)?;
-            let match_regex = bool_arg(args, "match_regex", false)?;
-            // 正则改用 `regex:` 搜索函数（见 regex_term 注释），只包 pattern，
-            // 排除项 `!term` 保持独立。
-            let query = combine_query(&regex_term(&pattern, match_regex), &excludes);
-            let offset = u64_arg(args, "offset", 0)? as usize;
-            let max_results = u64_arg(args, "max_results", 50)? as usize;
-            // 窗口上限与另外两个搜索工具一致；0 是写错而不是「不限」。
-            if max_results == 0 || max_results > RESULT_WINDOW_MAX {
-                return Err((
-                    INVALID_PARAMS,
-                    format!(
-                        "'max_results' must be between 1 and {}; received {}. Page through the rest with \
-                         'offset' — but prefer narrowing 'pattern'/'exclude' first, because every page re-runs the search.",
-                        RESULT_WINDOW_MAX, max_results
-                    ),
-                ));
-            }
-            let timeout_ms = timeout_arg(args, 10_000)?;
-            let sort = sort_arg(args)?;
-            let descending = bool_arg(args, "descending", false)?;
-            let options = plugin::search::SearchOptions {
-                scope: plugin::search::SearchScope::Recursive,
-                match_case: bool_arg(args, "match_case", false)?,
-                match_whole_word: bool_arg(args, "match_whole_word", false)?,
-                sort,
-                descending,
-            };
-
-            match plugin::search::search_in_folder(
-                &folder,
-                &query,
-                offset,
-                max_results,
-                timeout_ms,
-                options,
-            ) {
-                Ok(outcome) => {
-                    let entries: Vec<Value> = outcome
-                        .results
-                        .iter()
-                        .map(|r| {
-                            json!({
-                                "name": r.name,
-                                "path": r.path,
-                                "kind": if r.is_folder { "folder" } else { "file" },
-                                "size": r.size,
-                                "modified": r.modified,
-                                "created": r.created,
-                            })
-                        })
-                        .collect();
-                    let returned = entries.len();
-                    let mut payload = json!({
-                        "folder": folder,
-                        "pattern": pattern,
-                        "exclude": excludes,
-                        "sort": sort.as_str(),
-                        "descending": descending,
-                        "offset": outcome.offset,
-                        "count": returned,
-                        "total": outcome.total,
-                        // 还有命中没返回 —— 用 offset 翻下一页（与 list_folder 同形）。
-                        // 窗口被 max_results 或字节预算任一处截断都会是 true。
-                        "truncated": outcome.offset + returned < outcome.total,
-                        "results": entries,
-                    });
-                    // 一条都没搜到时才去探目录 —— 分得清「空目录」与「路径不对」。
-                    if outcome.total == 0 {
-                        if let Some(w) = folder_warning(&folder) {
-                            payload["folder_warning"] = json!(w);
-                        }
-                    }
-                    let text = serde_json::to_string_pretty(&payload)
-                        .unwrap_or_else(|_| "{\"error\":\"serialization failed\"}".into());
-
-                    Ok((content_text(&text), false))
-                }
-                Err(e) => Ok((content_text(&format!("search error: {}", e)), true)),
-            }
-        }
-
-        "list_folder" => {
-            let folder = require_folder(args)?;
-            let excludes = exclude_arg(args)?;
-            let query = combine_query("", &excludes);
-            let offset = u64_arg(args, "offset", 0)? as usize;
-            // 窗口必须能翻页：大目录的直接子项可以上千（实测 C:\Windows\System32
-            // 有 4889 个），旧实现写死 500 条且没有 offset，第 501 项之后拿不到。
-            let max_results = u64_arg(args, "max_results", LIST_DEFAULT_MAX_RESULTS as u64)? as usize;
-            if max_results == 0 || max_results > RESULT_WINDOW_MAX {
-                return Err((
-                    INVALID_PARAMS,
-                    format!(
-                        "'max_results' must be between 1 and {}; received {}",
-                        RESULT_WINDOW_MAX, max_results
-                    ),
-                ));
-            }
-            // 用「直接子项」范围（SearchScope::Children → parent:"<folder>"）：
-            // 无排除项时 query 为空串，等价于列出该目录全部直接子项，不递归。
-            // 超时同样可调：一个挂着离线共享的目录要等多久，调用方说了算
-            // （原先写死 10 秒，与另外三个搜索类工具不对称）。
-            let timeout_ms = timeout_arg(args, 10_000)?;
-            match plugin::search::search_in_folder(
-                &folder,
-                &query,
-                offset,
-                max_results,
-                timeout_ms,
-                plugin::search::SearchOptions::for_scope(plugin::search::SearchScope::Children),
-            ) {
-                Ok(outcome) => {
-                    let entries: Vec<Value> = outcome
-                        .results
-                        .iter()
-                        .map(|r| {
-                            json!({
-                                "name": r.name,
-                                "kind": if r.is_folder { "folder" } else { "file" },
-                                "size": r.size,
-                                "modified": r.modified,
-                                "created": r.created,
-                            })
-                        })
-                        .collect();
-                    let returned = entries.len();
-                    let mut payload = json!({
-                        "folder": folder,
-                        "exclude": excludes,
-                        "offset": outcome.offset,
-                        "count": returned,
-                        "total": outcome.total,
-                        // 还有子项没返回 —— 用 offset 翻下一页（与 search_in_folder 同形）。
-                        "truncated": outcome.offset + returned < outcome.total,
-                        "items": entries,
-                    });
-                    if outcome.total == 0 {
-                        if let Some(w) = folder_warning(&folder) {
-                            payload["folder_warning"] = json!(w);
-                        }
-                    }
-                    let text = serde_json::to_string_pretty(&payload)
-                        .unwrap_or_else(|_| "{}".into());
-                    Ok((content_text(&text), false))
-                }
-                Err(e) => Ok((content_text(&format!("list error: {}", e)), true)),
-            }
-        }
-
-        "count" => {
-            let folder = require_folder(args)?;
-            let pattern = pattern_arg(args)?;
-            let excludes = exclude_arg(args)?;
-            let query = combine_query(&pattern, &excludes);
-            // 快速路径：只取 db_query_get_result_count 的计数值，
-            // 不为每条结果拼 name/path 字符串。计数与 search_in_folder
-            // 同范围（递归子树）。
-            match plugin::search::count_in_folder(&folder, &query, 10_000) {
-                Ok(n) => {
-                    // 用 json! 而不是手拼 format! —— 手拼的 `{:?}` 走的是 Rust
-                    // Debug 转义（非 JSON 转义），只是个巧合才对得上。
-                    let mut payload = json!({
-                        "folder": folder,
-                        "pattern": pattern,
-                        "exclude": excludes,
-                        "count": n,
-                    });
-                    if n == 0 {
-                        if let Some(w) = folder_warning(&folder) {
-                            payload["folder_warning"] = json!(w);
-                        }
-                    }
-                    let text = serde_json::to_string(&payload)
-                        .unwrap_or_else(|_| "{\"error\":\"serialization failed\"}".into());
-                    Ok((content_text(&text), false))
-                }
-                Err(e) => Ok((content_text(&format!("count error: {}", e)), true)),
-            }
-        }
-
-        "index_changes" => {
-            // 所有入参先规范化完再触达插件：坏 action / 坏时间格式在这里就
-            // 报 INVALID_PARAMS，消息里带范例，LLM 一次就能改对。
-            let action = action_arg(args)?;
-            let path = optional_text_arg(args, "path")?;
-            let name = optional_text_arg(args, "name")?;
-            let since = timestamp_arg(args, "since")?;
-            let until = timestamp_arg(args, "until")?;
-            let max_results = u64_arg(args, "max_results", INDEX_CHANGES_DEFAULT)? as usize;
-
-            if max_results == 0 {
-                return Err((
-                    INVALID_PARAMS,
-                    format!(
-                        "'max_results' must be at least 1 (and at most {}); received 0",
-                        INDEX_CHANGES_LIMIT
-                    ),
-                ));
-            }
-            if max_results as u64 > INDEX_CHANGES_LIMIT {
-                return Err((
-                    INVALID_PARAMS,
-                    format!(
-                        "'max_results' must not exceed {}; received {}. \
-                         Narrow the query with 'action', 'path', 'name' or a 'since'/'until' window instead.",
-                        INDEX_CHANGES_LIMIT, max_results
-                    ),
-                ));
-            }
-            // since 晚于 until 是最容易犯的错：放过它只会得到 0 条且无从诊断。
-            if let (Some(s), Some(u)) = (&since, &until) {
-                if s > u {
-                    return Err((
-                        INVALID_PARAMS,
-                        format!("'since' ({}) must not be later than 'until' ({})", s, u),
-                    ));
-                }
-            }
-
-            let filter = plugin::journal::Filter {
-                action,
-                path,
-                name,
-                since,
-                until,
-                max_results,
-            };
-
-            match plugin::journal::query(&filter) {
-                Ok(outcome) => {
-                    let changes: Vec<Value> = outcome
-                        .changes
-                        .iter()
-                        .map(|c| {
-                            json!({
-                                "journal_id": c.journal_id,
-                                "change_id": c.change_id,
-                                "date": c.date,
-                                "action": c.action.as_str(),
-                                "action_text": c.action_text,
-                                "kind": if c.is_folder { "folder" } else { "file" },
-                                "path": c.path,
-                                "name": c.name(),
-                                "new_path": c.new_path,
-                            })
-                        })
-                        .collect();
-                    let text = serde_json::to_string_pretty(&json!({
-                        "action": filter.action.map(|a| a.as_str()),
-                        "path": filter.path,
-                        "name": filter.name,
-                        "since": filter.since,
-                        "until": filter.until,
-                        "count": outcome.count,
-                        "truncated": outcome.truncated,
-                        "days_searched": outcome.days_searched,
-                        "skipped_lines": outcome.skipped_lines,
-                        "log_directory": outcome.log_directory,
-                        "changes": changes,
-                    }))
-                    .unwrap_or_else(|_| "{\"error\":\"serialization failed\"}".into());
-
-                    Ok((content_text(&text), false))
-                }
-                Err(e) => Ok((content_text(&format!("index_changes error: {}", e)), true)),
-            }
-        }
-
-        "read_file" => {
-            // 纯入参问题（缺参数 / 相对路径 / 通配符）在触达磁盘之前就报
-            // INVALID_PARAMS —— 与 folder 参数的处理一致，CI 上无主程序也能跑。
-            let path = match args.get("path").and_then(Value::as_str) {
-                Some(p) => plugin::read::validate_path(p).map_err(|e| (INVALID_PARAMS, e))?,
-                None => {
-                    return Err((
-                        INVALID_PARAMS,
-                        "'path' is required and must be a string: the absolute path of the file to read".into(),
-                    ))
-                }
-            };
-            let start_line = u64_arg(args, "start_line", 1)? as usize;
-            let max_lines =
-                u64_arg(args, "max_lines", plugin::read::DEFAULT_MAX_LINES as u64)? as usize;
-            if start_line == 0 {
-                return Err((
-                    INVALID_PARAMS,
-                    "'start_line' is 1-based; use 1 for the first line".into(),
-                ));
-            }
-            // 与 PI-Desktop 的 schema 对齐：min 1 / max 4000，不再有「0 = 不限」。
-            if max_lines == 0 || max_lines > plugin::read::MAX_MAX_LINES {
-                return Err((
-                    INVALID_PARAMS,
-                    format!(
-                        "'max_lines' must be between 1 and {}; received {}",
-                        plugin::read::MAX_MAX_LINES,
-                        max_lines
-                    ),
-                ));
-            }
-
-            match plugin::read::read_file(&path, start_line, max_lines) {
-                Ok(c) => {
-                    let meta = serde_json::to_string_pretty(&json!({
-                        "path": c.path,
-                        "size": c.size,
-                        "total_lines": c.total_lines,
-                        "start_line": c.start_line,
-                        "lines_returned": c.lines_returned,
-                        "next_start_line": c.next_start_line,
-                        "truncated": c.truncated,
-                        "clipped_lines": c.clipped_lines,
-                        "encoding": c.encoding,
-                    }))
-                    .unwrap_or_else(|_| "{\"error\":\"serialization failed\"}".into());
-                    Ok((content_meta_and_body(&meta, &c.text), false))
-                }
-                Err(e) => {
-                    // 结构化错误：给机器可读的 code，调用方据此决定换工具还是
-                    // 改参数，不必解析文案。
-                    let plugin::read::ReadError {
-                        code,
-                        message,
-                        path,
-                    } = e;
-                    let mut payload = json!({ "error": message, "code": code });
-                    // 目录是唯一有明确替代品的情况 —— 直接把建议的调用参数
-                    // 一并给出，省掉一轮试错。
-                    if code == plugin::read::ERR_PATH_IS_DIRECTORY {
-                        payload["suggested_tool"] = json!("list_folder");
-                        payload["suggested_args"] = json!({ "folder": path });
-                    }
-                    let text = serde_json::to_string_pretty(&payload)
-                        .unwrap_or_else(|_| format!("read_file error: {}", code));
-                    Ok((content_text(&text), true))
-                }
-            }
-        }
-
-        "grep" => {
-            // 入参校验先行：这些都在触达 Everything 之前完成（CI 无主程序也能跑）。
-            let folder = require_folder(args)?;
-            let pattern = match args.get("pattern").and_then(Value::as_str) {
-                Some(p) if !p.trim().is_empty() => p.to_string(),
-                Some(_) => {
-                    return Err((
-                        INVALID_PARAMS,
-                        "'pattern' must not be empty: it is a regular expression matched per line".into(),
-                    ))
-                }
-                None => {
-                    return Err((
-                        INVALID_PARAMS,
-                        "'pattern' is required and must be a string: a regular expression matched per line".into(),
-                    ))
-                }
-            };
-            // 'filter' 是交给 Everything 的候选筛选串，不是正则 —— 与 pattern 分工不同。
-            let filter = optional_text_arg(args, "filter")?.unwrap_or_default();
-            let excludes = exclude_arg(args)?;
-            let candidate_filter = combine_query(&filter, &excludes);
-
-            // 正则能不能编译属于纯入参问题 —— 在触达 Everything 之前就报。
-            plugin::grep::validate_regex(&pattern).map_err(|e| (INVALID_PARAMS, e))?;
-
-            let mode = match args.get("output_mode") {
-                None | Some(Value::Null) => plugin::grep::OutputMode::Content,
-                Some(Value::String(s)) => plugin::grep::OutputMode::parse(s).ok_or_else(|| {
-                    (
-                        INVALID_PARAMS,
-                        format!(
-                            "'output_mode' must be one of content|filesWithMatches|count; received {:?}",
-                            s
-                        ),
-                    )
-                })?,
-                Some(v) => {
-                    return Err((
-                        INVALID_PARAMS,
-                        format!("'output_mode' must be a string; received {}", v),
-                    ))
-                }
-            };
-
-            let head_limit =
-                u64_arg(args, "head_limit", plugin::grep::DEFAULT_HEAD_LIMIT as u64)? as usize;
-            if head_limit == 0 || head_limit > plugin::grep::MAX_HEAD_LIMIT {
-                return Err((
-                    INVALID_PARAMS,
-                    format!(
-                        "'head_limit' must be between 1 and {}; received {}",
-                        plugin::grep::MAX_HEAD_LIMIT,
-                        head_limit
-                    ),
-                ));
-            }
-            let case_insensitive = bool_arg(args, "case_insensitive", false)?;
-            let timeout_ms = timeout_arg(args, plugin::grep::DEFAULT_TIMEOUT_MS)?;
-
-            match plugin::grep::grep(
-                &folder,
-                &pattern,
-                &candidate_filter,
-                mode,
-                head_limit,
-                case_insensitive,
-                timeout_ms,
-            ) {
-                Ok(o) => {
-                    let mut out = json!({
-                        "folder": folder,
-                        "pattern": pattern,
-                        "filter": candidate_filter,
-                        "exclude": excludes,
-                        "output_mode": o.mode.as_str(),
-                        "head_limit": o.head_limit,
-                        "candidates": o.candidates,
-                        "candidates_truncated": o.candidates_truncated,
-                        "files_scanned": o.files_scanned,
-                        "bytes_scanned": o.bytes_scanned,
-                        "files_with_matches": o.files_with_matches,
-                        "clipped_lines": o.clipped_lines,
-                        "count": o.payload.len(),
-                        "truncated": o.truncated,
-                    });
-                    // 载荷键随模式变：matches / files / counts。
-                    match &o.payload {
-                        plugin::grep::GrepPayload::Content(hits) => {
-                            out["matches"] = json!(hits
-                                .iter()
-                                .map(|h| json!({
-                                    "path": h.path,
-                                    "line": h.line,
-                                    "text": h.text,
-                                }))
-                                .collect::<Vec<_>>());
-                        }
-                        plugin::grep::GrepPayload::Files(files) => {
-                            out["files"] = json!(files);
-                        }
-                        plugin::grep::GrepPayload::Counts(counts) => {
-                            out["counts"] = json!(counts
-                                .iter()
-                                .map(|(path, count)| json!({ "path": path, "count": count }))
-                                .collect::<Vec<_>>());
-                        }
-                    }
-                    // 一个命中都没有时才探目录 —— 分得清「确实没有」与「路径不对」。
-                    if o.files_with_matches == 0 {
-                        if let Some(w) = folder_warning(&folder) {
-                            out["folder_warning"] = json!(w);
-                        }
-                    }
-                    let text = serde_json::to_string_pretty(&out)
-                        .unwrap_or_else(|_| "{\"error\":\"serialization failed\"}".into());
-                    Ok((content_text(&text), false))
-                }
-                Err(e) => Ok((content_text(&format!("grep error: {}", e)), true)),
-            }
-        }
-
-        "search_everywhere" => {
-            // 全局按名搜索：整个索引（所有本地盘 + 已索引网络共享），不限文件夹。
-            // 顺序刻意如此：入参校验先行（纯入参问题，无主程序环境的 CI 也能跑），
-            // 再过 mcp_global_search 模式闸门，最后才触达搜索层。
-            let pattern = pattern_arg(args)?;
-            let pattern =
-                validate::validate_global_pattern(&pattern).map_err(|e| (INVALID_PARAMS, e))?;
-            let excludes = exclude_arg(args)?;
-            // exclude 项会拼进同一条查询，content: 闸门必须两边都查 ——
-            // 只查 pattern 的话 `exclude: ["content:…"]` 就绕过去了。
-            validate::validate_global_excludes(&excludes).map_err(|e| (INVALID_PARAMS, e))?;
-            let match_regex = bool_arg(args, "match_regex", false)?;
-            let query = combine_query(&regex_term(&pattern, match_regex), &excludes);
-            let offset = u64_arg(args, "offset", 0)? as usize;
-            // 全局窗口与另外两个搜索工具同一套上限：0 不是「不限」而是写错
-            // （与 read_file 的 max_lines 同一形态）。
-            let max_results = u64_arg(args, "max_results", 50)?;
-            if max_results == 0 || max_results > RESULT_WINDOW_MAX as u64 {
-                return Err((
-                    INVALID_PARAMS,
-                    format!(
-                        "'max_results' must be between 1 and {}; received {}",
-                        RESULT_WINDOW_MAX, max_results
-                    ),
-                ));
-            }
-            let timeout_ms = timeout_arg(args, 10_000)?;
-            let sort = sort_arg(args)?;
-            let descending = bool_arg(args, "descending", false)?;
-
-            // 模式闸门：只有 Deny 档在这里硬拒（结构化错误 + 开启指引）。
-            // Review / Allow 都放行到搜索层 —— Review 档的把关是客户端的
-            // 确认弹窗（工具注解驱动），服务端不重复设卡。
-            let mode = crate::options::global_search_mode();
-            if mode == GlobalSearchMode::Deny {
-                let payload = serde_json::to_string_pretty(&json!({
-                    "error": "global search is disabled on this server (global search mode = 'deny')",
-                    "code": "GLOBAL_SEARCH_DISABLED",
-                    "mode": mode.as_str(),
-                    "how_to_enable": "set Everything > Options > Plugins > MCP > global search to 'review' or 'allow' and click Apply; until then use search_in_folder with a folder",
-                }))
-                .unwrap_or_else(|_| "{\"error\":\"serialization failed\"}".into());
-                return Ok((content_text(&payload), true));
-            }
-
-            let options = plugin::search::SearchOptions {
-                scope: plugin::search::SearchScope::Global,
-                match_case: bool_arg(args, "match_case", false)?,
-                match_whole_word: bool_arg(args, "match_whole_word", false)?,
-                sort,
-                descending,
-            };
-
-            match plugin::search::search_everywhere(
-                &query,
-                offset,
-                max_results as usize,
-                timeout_ms,
-                options,
-            ) {
-                Ok(outcome) => {
-                    let entries: Vec<Value> = outcome
-                        .results
-                        .iter()
-                        .map(|r| {
-                            json!({
-                                "name": r.name,
-                                "path": r.path,
-                                "kind": if r.is_folder { "folder" } else { "file" },
-                                "size": r.size,
-                                "modified": r.modified,
-                                "created": r.created,
-                            })
-                        })
-                        .collect();
-                    let text = serde_json::to_string_pretty(&json!({
-                        "mode": mode.as_str(),
-                        "pattern": pattern,
-                        "exclude": excludes,
-                        "sort": sort.as_str(),
-                        "descending": descending,
-                        "offset": outcome.offset,
-                        "count": entries.len(),
-                        "total": outcome.total,
-                        "results": entries,
-                    }))
-                    .unwrap_or_else(|_| "{\"error\":\"serialization failed\"}".into());
-
-                    Ok((content_text(&text), false))
-                }
-                Err(e) => Ok((content_text(&format!("search error: {}", e)), true)),
-            }
-        }
-
+        "search_in_folder" => tool_search_in_folder(args),
+        "list_folder" => tool_list_folder(args),
+        "count" => tool_count(args),
+        "index_changes" => tool_index_changes(args),
+        "read_file" => tool_read_file(args),
+        "grep" => tool_grep(args),
+        "search_everywhere" => tool_search_everywhere(args),
         other => Err((METHOD_NOT_FOUND, format!("unknown tool: {}", other))),
+    }
+}
+
+/// `search_in_folder`：递归子树内按 pattern 搜索文件与文件夹。
+fn tool_search_in_folder(args: &Value) -> Result<ToolOutput, (i32, String)> {
+    let folder = require_folder(args)?;
+    let pattern = pattern_arg(args)?;
+    let excludes = exclude_arg(args)?;
+    let match_regex = bool_arg(args, "match_regex", false)?;
+    // 正则改用 `regex:` 搜索函数（见 regex_term 注释），只包 pattern，
+    // 排除项 `!term` 保持独立。
+    let query = combine_query(&regex_term(&pattern, match_regex), &excludes);
+    let offset = u64_arg(args, "offset", 0)? as usize;
+    let max_results = u64_arg(args, "max_results", 50)? as usize;
+    // 窗口上限与另外两个搜索工具一致；0 是写错而不是「不限」。
+    if max_results == 0 || max_results > RESULT_WINDOW_MAX {
+        return Err((
+            INVALID_PARAMS,
+            format!(
+                "'max_results' must be between 1 and {}; received {}. Page through the rest with \
+                 'offset' — but prefer narrowing 'pattern'/'exclude' first, because every page re-runs the search.",
+                RESULT_WINDOW_MAX, max_results
+            ),
+        ));
+    }
+    let timeout_ms = timeout_arg(args, 10_000)?;
+    let sort = sort_arg(args)?;
+    let descending = bool_arg(args, "descending", false)?;
+    let options = plugin::search::SearchOptions {
+        scope: plugin::search::SearchScope::Recursive,
+        match_case: bool_arg(args, "match_case", false)?,
+        match_whole_word: bool_arg(args, "match_whole_word", false)?,
+        sort,
+        descending,
+    };
+
+    match plugin::search::search_in_folder(&folder, &query, offset, max_results, timeout_ms, options)
+    {
+        Ok(outcome) => {
+            let entries: Vec<Value> = outcome
+                .results
+                .iter()
+                .map(|r| {
+                    json!({
+                        "name": r.name,
+                        "path": r.path,
+                        "kind": if r.is_folder { "folder" } else { "file" },
+                        "size": r.size,
+                        "modified": r.modified,
+                        "created": r.created,
+                    })
+                })
+                .collect();
+            let returned = entries.len();
+            let mut payload = json!({
+                "folder": folder,
+                "pattern": pattern,
+                "exclude": excludes,
+                "sort": sort.as_str(),
+                "descending": descending,
+                "offset": outcome.offset,
+                "count": returned,
+                "total": outcome.total,
+                // 还有命中没返回 —— 用 offset 翻下一页（与 list_folder 同形）。
+                // 窗口被 max_results 或字节预算任一处截断都会是 true。
+                "truncated": outcome.offset + returned < outcome.total,
+                "results": entries,
+            });
+            // 一条都没搜到时才去探目录 —— 分得清「空目录」与「路径不对」。
+            if outcome.total == 0 {
+                if let Some(w) = folder_warning(&folder) {
+                    payload["folder_warning"] = json!(w);
+                }
+            }
+            let text = serde_json::to_string_pretty(&payload)
+                .unwrap_or_else(|_| "{\"error\":\"serialization failed\"}".into());
+
+            Ok((content_text(&text), false))
+        }
+        Err(e) => Ok((content_text(&format!("search error: {}", e)), true)),
+    }
+}
+
+/// `list_folder`：列出目录的直接子项（不递归）。
+fn tool_list_folder(args: &Value) -> Result<ToolOutput, (i32, String)> {
+    let folder = require_folder(args)?;
+    let excludes = exclude_arg(args)?;
+    let query = combine_query("", &excludes);
+    let offset = u64_arg(args, "offset", 0)? as usize;
+    // 窗口必须能翻页：大目录的直接子项可以上千（实测 C:\Windows\System32
+    // 有 4889 个），旧实现写死 500 条且没有 offset，第 501 项之后拿不到。
+    let max_results = u64_arg(args, "max_results", LIST_DEFAULT_MAX_RESULTS as u64)? as usize;
+    if max_results == 0 || max_results > RESULT_WINDOW_MAX {
+        return Err((
+            INVALID_PARAMS,
+            format!(
+                "'max_results' must be between 1 and {}; received {}",
+                RESULT_WINDOW_MAX, max_results
+            ),
+        ));
+    }
+    // 用「直接子项」范围（SearchScope::Children → parent:"<folder>"）：
+    // 无排除项时 query 为空串，等价于列出该目录全部直接子项，不递归。
+    // 超时同样可调：一个挂着离线共享的目录要等多久，调用方说了算
+    // （原先写死 10 秒，与另外三个搜索类工具不对称）。
+    let timeout_ms = timeout_arg(args, 10_000)?;
+    match plugin::search::search_in_folder(
+        &folder,
+        &query,
+        offset,
+        max_results,
+        timeout_ms,
+        plugin::search::SearchOptions::for_scope(plugin::search::SearchScope::Children),
+    ) {
+        Ok(outcome) => {
+            let entries: Vec<Value> = outcome
+                .results
+                .iter()
+                .map(|r| {
+                    json!({
+                        "name": r.name,
+                        "kind": if r.is_folder { "folder" } else { "file" },
+                        "size": r.size,
+                        "modified": r.modified,
+                        "created": r.created,
+                    })
+                })
+                .collect();
+            let returned = entries.len();
+            let mut payload = json!({
+                "folder": folder,
+                "exclude": excludes,
+                "offset": outcome.offset,
+                "count": returned,
+                "total": outcome.total,
+                // 还有子项没返回 —— 用 offset 翻下一页（与 search_in_folder 同形）。
+                "truncated": outcome.offset + returned < outcome.total,
+                "items": entries,
+            });
+            if outcome.total == 0 {
+                if let Some(w) = folder_warning(&folder) {
+                    payload["folder_warning"] = json!(w);
+                }
+            }
+            let text =
+                serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".into());
+            Ok((content_text(&text), false))
+        }
+        Err(e) => Ok((content_text(&format!("list error: {}", e)), true)),
+    }
+}
+
+/// `count`：快速路径计数，不为每条结果拼 name/path。
+fn tool_count(args: &Value) -> Result<ToolOutput, (i32, String)> {
+    let folder = require_folder(args)?;
+    let pattern = pattern_arg(args)?;
+    let excludes = exclude_arg(args)?;
+    let query = combine_query(&pattern, &excludes);
+    // 快速路径：只取 db_query_get_result_count 的计数值，
+    // 不为每条结果拼 name/path 字符串。计数与 search_in_folder
+    // 同范围（递归子树）。
+    match plugin::search::count_in_folder(&folder, &query, 10_000) {
+        Ok(n) => {
+            // 用 json! 而不是手拼 format! —— 手拼的 `{:?}` 走的是 Rust
+            // Debug 转义（非 JSON 转义），只是个巧合才对得上。
+            let mut payload = json!({
+                "folder": folder,
+                "pattern": pattern,
+                "exclude": excludes,
+                "count": n,
+            });
+            if n == 0 {
+                if let Some(w) = folder_warning(&folder) {
+                    payload["folder_warning"] = json!(w);
+                }
+            }
+            let text = serde_json::to_string(&payload)
+                .unwrap_or_else(|_| "{\"error\":\"serialization failed\"}".into());
+            Ok((content_text(&text), false))
+        }
+        Err(e) => Ok((content_text(&format!("count error: {}", e)), true)),
+    }
+}
+
+/// `index_changes`：Everything 索引变更日志查询。
+fn tool_index_changes(args: &Value) -> Result<ToolOutput, (i32, String)> {
+    // 所有入参先规范化完再触达插件：坏 action / 坏时间格式在这里就
+    // 报 INVALID_PARAMS，消息里带范例，LLM 一次就能改对。
+    let action = action_arg(args)?;
+    let path = optional_text_arg(args, "path")?;
+    let name = optional_text_arg(args, "name")?;
+    let since = timestamp_arg(args, "since")?;
+    let until = timestamp_arg(args, "until")?;
+    let max_results = u64_arg(args, "max_results", INDEX_CHANGES_DEFAULT)? as usize;
+
+    if max_results == 0 {
+        return Err((
+            INVALID_PARAMS,
+            format!(
+                "'max_results' must be at least 1 (and at most {}); received 0",
+                INDEX_CHANGES_LIMIT
+            ),
+        ));
+    }
+    if max_results as u64 > INDEX_CHANGES_LIMIT {
+        return Err((
+            INVALID_PARAMS,
+            format!(
+                "'max_results' must not exceed {}; received {}. \
+                 Narrow the query with 'action', 'path', 'name' or a 'since'/'until' window instead.",
+                INDEX_CHANGES_LIMIT, max_results
+            ),
+        ));
+    }
+    // since 晚于 until 是最容易犯的错：放过它只会得到 0 条且无从诊断。
+    if let (Some(s), Some(u)) = (&since, &until) {
+        if s > u {
+            return Err((
+                INVALID_PARAMS,
+                format!("'since' ({}) must not be later than 'until' ({})", s, u),
+            ));
+        }
+    }
+
+    let filter = plugin::journal::Filter {
+        action,
+        path,
+        name,
+        since,
+        until,
+        max_results,
+    };
+
+    match plugin::journal::query(&filter) {
+        Ok(outcome) => {
+            let changes: Vec<Value> = outcome
+                .changes
+                .iter()
+                .map(|c| {
+                    json!({
+                        "journal_id": c.journal_id,
+                        "change_id": c.change_id,
+                        "date": c.date,
+                        "action": c.action.as_str(),
+                        "action_text": c.action_text,
+                        "kind": if c.is_folder { "folder" } else { "file" },
+                        "path": c.path,
+                        "name": c.name(),
+                        "new_path": c.new_path,
+                    })
+                })
+                .collect();
+            let text = serde_json::to_string_pretty(&json!({
+                "action": filter.action.map(|a| a.as_str()),
+                "path": filter.path,
+                "name": filter.name,
+                "since": filter.since,
+                "until": filter.until,
+                "count": outcome.count,
+                "truncated": outcome.truncated,
+                "days_searched": outcome.days_searched,
+                "skipped_lines": outcome.skipped_lines,
+                "log_directory": outcome.log_directory,
+                "changes": changes,
+            }))
+            .unwrap_or_else(|_| "{\"error\":\"serialization failed\"}".into());
+
+            Ok((content_text(&text), false))
+        }
+        Err(e) => Ok((content_text(&format!("index_changes error: {}", e)), true)),
+    }
+}
+
+/// `read_file`：分窗口读文本文件（含敏感路径拒绝与编码探测）。
+fn tool_read_file(args: &Value) -> Result<ToolOutput, (i32, String)> {
+    // 纯入参问题（缺参数 / 相对路径 / 通配符）在触达磁盘之前就报
+    // INVALID_PARAMS —— 与 folder 参数的处理一致，CI 上无主程序也能跑。
+    let path = match args.get("path").and_then(Value::as_str) {
+        Some(p) => plugin::read::validate_path(p).map_err(|e| (INVALID_PARAMS, e))?,
+        None => {
+            return Err((
+                INVALID_PARAMS,
+                "'path' is required and must be a string: the absolute path of the file to read".into(),
+            ))
+        }
+    };
+    let start_line = u64_arg(args, "start_line", 1)? as usize;
+    let max_lines =
+        u64_arg(args, "max_lines", plugin::read::DEFAULT_MAX_LINES as u64)? as usize;
+    if start_line == 0 {
+        return Err((
+            INVALID_PARAMS,
+            "'start_line' is 1-based; use 1 for the first line".into(),
+        ));
+    }
+    // 与 PI-Desktop 的 schema 对齐：min 1 / max 4000，不再有「0 = 不限」。
+    if max_lines == 0 || max_lines > plugin::read::MAX_MAX_LINES {
+        return Err((
+            INVALID_PARAMS,
+            format!(
+                "'max_lines' must be between 1 and {}; received {}",
+                plugin::read::MAX_MAX_LINES,
+                max_lines
+            ),
+        ));
+    }
+
+    match plugin::read::read_file(&path, start_line, max_lines) {
+        Ok(c) => {
+            let meta = serde_json::to_string_pretty(&json!({
+                "path": c.path,
+                "size": c.size,
+                "total_lines": c.total_lines,
+                "start_line": c.start_line,
+                "lines_returned": c.lines_returned,
+                "next_start_line": c.next_start_line,
+                "truncated": c.truncated,
+                "clipped_lines": c.clipped_lines,
+                "encoding": c.encoding,
+            }))
+            .unwrap_or_else(|_| "{\"error\":\"serialization failed\"}".into());
+            Ok((content_meta_and_body(&meta, &c.text), false))
+        }
+        Err(e) => {
+            // 结构化错误：给机器可读的 code，调用方据此决定换工具还是
+            // 改参数，不必解析文案。
+            let plugin::read::ReadError {
+                code,
+                message,
+                path,
+            } = e;
+            let mut payload = json!({ "error": message, "code": code });
+            // 目录是唯一有明确替代品的情况 —— 直接把建议的调用参数
+            // 一并给出，省掉一轮试错。
+            if code == plugin::read::ERR_PATH_IS_DIRECTORY {
+                payload["suggested_tool"] = json!("list_folder");
+                payload["suggested_args"] = json!({ "folder": path });
+            }
+            let text = serde_json::to_string_pretty(&payload)
+                .unwrap_or_else(|_| format!("read_file error: {}", code));
+            Ok((content_text(&text), true))
+        }
+    }
+}
+
+/// `grep`：候选文件集内按行正则匹配。
+fn tool_grep(args: &Value) -> Result<ToolOutput, (i32, String)> {
+    // 入参校验先行：这些都在触达 Everything 之前完成（CI 无主程序也能跑）。
+    let folder = require_folder(args)?;
+    let pattern = match args.get("pattern").and_then(Value::as_str) {
+        Some(p) if !p.trim().is_empty() => p.to_string(),
+        Some(_) => {
+            return Err((
+                INVALID_PARAMS,
+                "'pattern' must not be empty: it is a regular expression matched per line".into(),
+            ))
+        }
+        None => {
+            return Err((
+                INVALID_PARAMS,
+                "'pattern' is required and must be a string: a regular expression matched per line".into(),
+            ))
+        }
+    };
+    // 'filter' 是交给 Everything 的候选筛选串，不是正则 —— 与 pattern 分工不同。
+    let filter = optional_text_arg(args, "filter")?.unwrap_or_default();
+    let excludes = exclude_arg(args)?;
+    let candidate_filter = combine_query(&filter, &excludes);
+
+    // 正则能不能编译属于纯入参问题 —— 在触达 Everything 之前就报。
+    plugin::grep::validate_regex(&pattern).map_err(|e| (INVALID_PARAMS, e))?;
+
+    let mode = match args.get("output_mode") {
+        None | Some(Value::Null) => plugin::grep::OutputMode::Content,
+        Some(Value::String(s)) => plugin::grep::OutputMode::parse(s).ok_or_else(|| {
+            (
+                INVALID_PARAMS,
+                format!(
+                    "'output_mode' must be one of content|filesWithMatches|count; received {:?}",
+                    s
+                ),
+            )
+        })?,
+        Some(v) => {
+            return Err((
+                INVALID_PARAMS,
+                format!("'output_mode' must be a string; received {}", v),
+            ))
+        }
+    };
+
+    let head_limit =
+        u64_arg(args, "head_limit", plugin::grep::DEFAULT_HEAD_LIMIT as u64)? as usize;
+    if head_limit == 0 || head_limit > plugin::grep::MAX_HEAD_LIMIT {
+        return Err((
+            INVALID_PARAMS,
+            format!(
+                "'head_limit' must be between 1 and {}; received {}",
+                plugin::grep::MAX_HEAD_LIMIT,
+                head_limit
+            ),
+        ));
+    }
+    let case_insensitive = bool_arg(args, "case_insensitive", false)?;
+    let timeout_ms = timeout_arg(args, plugin::grep::DEFAULT_TIMEOUT_MS)?;
+
+    match plugin::grep::grep(
+        &folder,
+        &pattern,
+        &candidate_filter,
+        mode,
+        head_limit,
+        case_insensitive,
+        timeout_ms,
+    ) {
+        Ok(o) => {
+            let mut out = json!({
+                "folder": folder,
+                "pattern": pattern,
+                "filter": candidate_filter,
+                "exclude": excludes,
+                "output_mode": o.mode.as_str(),
+                "head_limit": o.head_limit,
+                "candidates": o.candidates,
+                "candidates_truncated": o.candidates_truncated,
+                "files_scanned": o.files_scanned,
+                "bytes_scanned": o.bytes_scanned,
+                "files_with_matches": o.files_with_matches,
+                "clipped_lines": o.clipped_lines,
+                "count": o.payload.len(),
+                "truncated": o.truncated,
+            });
+            // 载荷键随模式变：matches / files / counts。
+            match &o.payload {
+                plugin::grep::GrepPayload::Content(hits) => {
+                    out["matches"] = json!(hits
+                        .iter()
+                        .map(|h| json!({
+                            "path": h.path,
+                            "line": h.line,
+                            "text": h.text,
+                        }))
+                        .collect::<Vec<_>>());
+                }
+                plugin::grep::GrepPayload::Files(files) => {
+                    out["files"] = json!(files);
+                }
+                plugin::grep::GrepPayload::Counts(counts) => {
+                    out["counts"] = json!(counts
+                        .iter()
+                        .map(|(path, count)| json!({ "path": path, "count": count }))
+                        .collect::<Vec<_>>());
+                }
+            }
+            // 一个命中都没有时才探目录 —— 分得清「确实没有」与「路径不对」。
+            if o.files_with_matches == 0 {
+                if let Some(w) = folder_warning(&folder) {
+                    out["folder_warning"] = json!(w);
+                }
+            }
+            let text = serde_json::to_string_pretty(&out)
+                .unwrap_or_else(|_| "{\"error\":\"serialization failed\"}".into());
+            Ok((content_text(&text), false))
+        }
+        Err(e) => Ok((content_text(&format!("grep error: {}", e)), true)),
+    }
+}
+
+/// `search_everywhere`：整个索引的全局按名搜索（受 mcp_global_search 闸门管）。
+fn tool_search_everywhere(args: &Value) -> Result<ToolOutput, (i32, String)> {
+    // 全局按名搜索：整个索引（所有本地盘 + 已索引网络共享），不限文件夹。
+    // 顺序刻意如此：入参校验先行（纯入参问题，无主程序环境的 CI 也能跑），
+    // 再过 mcp_global_search 模式闸门，最后才触达搜索层。
+    let pattern = pattern_arg(args)?;
+    let pattern =
+        validate::validate_global_pattern(&pattern).map_err(|e| (INVALID_PARAMS, e))?;
+    let excludes = exclude_arg(args)?;
+    // exclude 项会拼进同一条查询，content: 闸门必须两边都查 ——
+    // 只查 pattern 的话 `exclude: ["content:…"]` 就绕过去了。
+    validate::validate_global_excludes(&excludes).map_err(|e| (INVALID_PARAMS, e))?;
+    let match_regex = bool_arg(args, "match_regex", false)?;
+    let query = combine_query(&regex_term(&pattern, match_regex), &excludes);
+    let offset = u64_arg(args, "offset", 0)? as usize;
+    // 全局窗口与另外两个搜索工具同一套上限：0 不是「不限」而是写错
+    // （与 read_file 的 max_lines 同一形态）。
+    let max_results = u64_arg(args, "max_results", 50)?;
+    if max_results == 0 || max_results > RESULT_WINDOW_MAX as u64 {
+        return Err((
+            INVALID_PARAMS,
+            format!(
+                "'max_results' must be between 1 and {}; received {}",
+                RESULT_WINDOW_MAX, max_results
+            ),
+        ));
+    }
+    let timeout_ms = timeout_arg(args, 10_000)?;
+    let sort = sort_arg(args)?;
+    let descending = bool_arg(args, "descending", false)?;
+
+    // 模式闸门：只有 Deny 档在这里硬拒（结构化错误 + 开启指引）。
+    // Review / Allow 都放行到搜索层 —— Review 档的把关是客户端的
+    // 确认弹窗（工具注解驱动），服务端不重复设卡。
+    let mode = crate::options::global_search_mode();
+    if mode == GlobalSearchMode::Deny {
+        let payload = serde_json::to_string_pretty(&json!({
+            "error": "global search is disabled on this server (global search mode = 'deny')",
+            "code": "GLOBAL_SEARCH_DISABLED",
+            "mode": mode.as_str(),
+            "how_to_enable": "set Everything > Options > Plugins > MCP > global search to 'review' or 'allow' and click Apply; until then use search_in_folder with a folder",
+        }))
+        .unwrap_or_else(|_| "{\"error\":\"serialization failed\"}".into());
+        return Ok((content_text(&payload), true));
+    }
+
+    let options = plugin::search::SearchOptions {
+        scope: plugin::search::SearchScope::Global,
+        match_case: bool_arg(args, "match_case", false)?,
+        match_whole_word: bool_arg(args, "match_whole_word", false)?,
+        sort,
+        descending,
+    };
+
+    match plugin::search::search_everywhere(&query, offset, max_results as usize, timeout_ms, options)
+    {
+        Ok(outcome) => {
+            let entries: Vec<Value> = outcome
+                .results
+                .iter()
+                .map(|r| {
+                    json!({
+                        "name": r.name,
+                        "path": r.path,
+                        "kind": if r.is_folder { "folder" } else { "file" },
+                        "size": r.size,
+                        "modified": r.modified,
+                        "created": r.created,
+                    })
+                })
+                .collect();
+            let text = serde_json::to_string_pretty(&json!({
+                "mode": mode.as_str(),
+                "pattern": pattern,
+                "exclude": excludes,
+                "sort": sort.as_str(),
+                "descending": descending,
+                "offset": outcome.offset,
+                "count": entries.len(),
+                "total": outcome.total,
+                "results": entries,
+            }))
+            .unwrap_or_else(|_| "{\"error\":\"serialization failed\"}".into());
+
+            Ok((content_text(&text), false))
+        }
+        Err(e) => Ok((content_text(&format!("search error: {}", e)), true)),
     }
 }
 
