@@ -1,0 +1,49 @@
+name: Release
+
+# tag 触发（v1.2.5 之类）：跑测试 → build-installers.ps1 产出双架构 setup.exe
+# → 挂到 GitHub Release。打包脚本自包含（rustup / VS / 7-Zip / Python 在
+# windows-latest runner 上都已预装或自动定位）。
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: Build installers & publish release
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: release-${{ hashFiles('Cargo.lock') }}
+
+      - name: Test
+        run: cargo test
+
+      # 产物：installer\dist\everything-mcp-<版本>-{x64,x86}-setup.exe
+      - name: Build installers
+        shell: pwsh
+        run: installer\build-installers.ps1
+
+      - name: Create GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          gh release create $tag --title $tag --generate-notes installer\dist\everything-mcp-*-setup.exe
