@@ -1,15 +1,15 @@
-//! server.rs — MCP Streamable HTTP 服务（基于 std::net，单线程-per-conn）
+//! server.rs — MCP HTTP 服务（基于 std::net，单线程-per-conn）
 //!
 //! 传输层规格（dual-era：MCP 2024-11-05 legacy + 2026-07-28 modern）：
-//!   - 客户端 POST 单条 JSON-RPC 请求到服务端根路径；
+//!   - 客户端 POST 单条 JSON-RPC 请求到服务端根路径（`/` 或 `/mcp`）；
 //!   - 服务端返回 `Content-Type: application/json` 的单条 JSON-RPC 响应；
-//!   - 不实现 SSE 长连接通道（LLM 客户端按请求-响应使用工具调用足够）；
+//!   - **不是**带 SSE 的 Streamable HTTP：不实现 SSE 长连接通道；
 //!   - 客户端可发起 GET / 建立长连接监听服务端通知，我们不支持 —— 直接返回 405
 //!     （2026-07-28 已移除 GET 流端点，405 同时符合两代规范）。
 //!
 //! 版本协商（2026-07-28）：modern 客户端在每个请求的 `_meta` 里带
-//! `io.modelcontextprotocol/protocolVersion`，Streamable HTTP 上还必须在
-//! `MCP-Protocol-Version` 请求头里带同一个值。时代判定：
+//! `io.modelcontextprotocol/protocolVersion`，并应在 `MCP-Protocol-Version`
+//! 请求头里带同一个值。时代判定：
 //!   - 声明 modern 版本 → modern 语义：server/discover 可用、未知方法 404、
 //!     通知 202 空体、头/体不一致 -32020、版本不支持 400 + -32022、
 //!     每个 result 带 resultType（2026-07-28 MUST），tools/list 与

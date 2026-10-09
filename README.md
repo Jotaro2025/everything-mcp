@@ -20,7 +20,7 @@ Context Protocol）接口暴露给 LLM（如 Claude Desktop、Cursor 等）使�
   「配置」），专治「知道文件叫什么、不知道它在哪个共享里」。
 - **图形设置页** —— Everything 选项对话框内直接配置启用开关、绑定地址、端口、
   全局搜索档位，改动点「应用」即时生效，无需重启 Everything。
-- **MCP Streamable HTTP** —— 默认监听 `127.0.0.1:8285`，单条 JSON-RPC over HTTP。
+- **MCP HTTP（POST JSON-RPC）** —— 默认监听 `127.0.0.1:8285`；客户端对 `/`（或 `/mcp`）发 **POST**，一次请求一条 JSON-RPC 响应。**不实现 SSE**，`GET` 返回 **405**（见「已知限制」）。
 - **双时代 MCP 协议** —— 同一端点同时服务两代客户端：2024-11-05（`initialize`
   握手）与 2026-07-28（逐请求 `_meta` 版本声明 + `server/discover`）。版本不支持
   时返回 `-32022` 并附可用版本列表，老客户端行为完全不变。
@@ -64,7 +64,7 @@ everything-mcp/
 │       ├── mod.rs
 │       ├── protocol.rs         JSON-RPC 2.0 + MCP 双时代类型（2024-11-05 / 2026-07-28）
 │       ├── server.rs           基于 std::net 的 HTTP 服务，按请求协商协议版本、校验 Origin
-│       ├── tools.rs            工具实现（search_in_folder / list_folder / count / index_changes / read_file / grep / search_everywhere）
+│       ├── tools.rs            工具实现（search_in_folder / list_folder / count / index_changes / read_file / grep / search_everywhere / server_diagnostics）
 │       └── validate.rs         入参校验与路径规范化（folder 规范化、pattern 校验）
 ├── installer/
 │   ├── build-installers.ps1    一键打包脚本（x64 / x86 两个安装包）
@@ -216,7 +216,7 @@ Everything 官方插件页：<https://www.voidtools.com/support/everything/plugi
 或 `%APPDATA%\Everything\Plugins.ini` 的 `[everything_mcp64.dll]` 小节里
 `mcp_enabled=1`）。
 
-接入后 LLM 会自动发现以下七个工具：
+接入后 LLM 会自动发现以下**八个**工具：
 
 #### 1. `search_in_folder`
 
@@ -269,7 +269,7 @@ Everything 官方插件页：<https://www.voidtools.com/support/everything/plugi
   条数会少于 `max_results` —— 这种情况 `truncated` 同样是 `true`。
 
 
-`exclude` 参数（三个工具都支持）：字符串或字符串数组，每项作为一条
+`exclude` 参数（`search_in_folder` / `list_folder` / `count` / `grep` / `search_everywhere` 支持）：字符串或字符串数组，每项作为一条
 Everything NOT 项拼进搜索词。仓库噪声默认会进结果（Everything 不知道
 gitignore），常见做法：
 
@@ -516,7 +516,7 @@ gitignore），常见做法：
 - **默认关闭，按三档全局搜索开关管控**（Everything 选项 → 插件 → MCP →
   全局搜索）：
   - **拒绝**（默认）：调用一律返回 `GLOBAL_SEARCH_DISABLED`（服务端硬闸门，
-    立即生效），其余七个工具照常、仍限定在文件夹内。错误载荷里带开启方法，
+    立即生效），其余七个工具照常（文件夹范围搜索 / 列表 / 计数 / 变更 / 读文件 / grep / 自诊断）。错误载荷里带开启方法，
     LLM 可以直接转告用户。
   - **审核**：调用放行，但工具被标注为「非只读 / 破坏性」（`destructiveHint:
     true`），客户端据此先弹权限确认框。注意注解在规范里是**不可信的提示** ——
@@ -560,7 +560,7 @@ LLM 在工具行为异常时先自查一轮，再决定是重试、换工具还�
 - `stats`：终身计数 —— 总调用、请求数、连接数，以及每个工具的
   `calls` / `ok` / `err` / `avg_ms`。某个工具一直 `err` 是很强的线索。
 
-三个工具共用的入参规则：`folder` 必须是绝对路径（`C:\…` 或 `\\server\share\…`），
+带 `folder` 参数的工具共用的入参规则：`folder` 必须是绝对路径（`C:\…` 或 `\\server\share\…`），
 UNC 网络共享与本地盘同权。搜索范围以 Everything 的索引为准 —— 本地盘自动全收，
 网络共享要先在 Everything 的「工具 → 选项 → 索引 → 文件夹」里添加；没加进索引的
 共享不会出现在任何结果里（返回 0 条结果，而不是报错）。
@@ -647,6 +647,8 @@ rebinding）；`Mcp-Method` / `Mcp-Name` 镜像头存在时校验与请求体一
 值走 `=?base64?…?=` sentinel；`tools/call` 的参数校验（路径规范化）发生在触达
 Everything 主程序之前，因此非法入参绝不会变成一次真实搜索。
 
+**绑定与凭据边界（请如实评估）**：设置页允许把 `mcp_bind` 改成 `0.0.0.0`（监听所有网卡），但**当前没有鉴权**（无 token / 密码）——只有浏览器带的 `Origin` 校验能挡 DNS rebinding，局域网内的普通 HTTP 客户端仍可直接调用工具。默认请保持 `127.0.0.1`。`read_file` / `grep` 的敏感路径黑名单有意偏窄（拦私钥、`.env`、常见密钥库、`.git\objects`），**不**拦 `~/.aws/credentials`、`.npmrc`、`.docker/config.json` 这类「可能含 token 的配置文件」；除黑名单外，工具可读 Everything 进程有权读的任意路径。
+
 ### 已知限制
 
 集中列出各工具文档里散落的行为边界，接入前值得一读：
@@ -664,8 +666,9 @@ Everything 主程序之前，因此非法入参绝不会变成一次真实搜索
 - **传输是简单的一次一请求 HTTP**：每连接单请求（`Connection: close`）、无
   SSE 长连接通道、无 GET 通知流（405）。并发上限 64，超出直接 503。单机
   回环 + 串行调用的 MCP 客户端足够；不要把它当高并发 Web 服务用。
-- **HTTP 服务器只信任 localhost 来源**。绑定地址默认回环，带非 localhost
-  `Origin` 头的请求一律 403（防 DNS rebinding）—— 远程访问不在设计目标内。
+- **HTTP 服务器默认只服务本机**。绑定地址默认回环；带非 localhost `Origin`
+  头的请求一律 403（防 DNS rebinding）。若你主动绑到 `0.0.0.0`，局域网可达且
+  **无鉴权**——见上文「绑定与凭据边界」。远程公开暴露不在设计目标内。
 - **只处理文本**。`read_file` 拒绝二进制内容（按扩展名与内容双重嗅探），
   行长超 16 KiB 截断；`grep` 同样跳过二进制文件与超过 8 MiB 的文件。
 
