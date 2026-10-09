@@ -5,18 +5,23 @@
   "mcpServers": {
     "everything": {
       "_comment": "MCP 协议要求本地进程或 HTTP 端点。",
-      "_comment_2": "Everything MCP 插件以 Streamable HTTP 方式暴露服务。",
+      "_comment_2": "Everything MCP 以本机 HTTP 暴露：对 url 发 POST，一次一条 JSON-RPC；无 SSE，GET 返回 405。",
       "_comment_3": "默认监听 127.0.0.1:8285 —— 与 Everything 主进程同机部署。",
       "_comment_4": "端点双时代：老客户端走 initialize 握手，2026-07-28 客户端免握手直接发请求，无需在客户端配置协议版本。",
 
       "url": "http://127.0.0.1:8285/",
 
-      "_transport": "http",
+      "_transport": "http-post-jsonrpc",
 
       "_example_tools": [
-        "search_in_folder  在指定文件夹下按 Everything 语法搜索",
-        "list_folder       列出某个目录的直接子项（文件/文件夹）",
-        "count             统计匹配文件数量"
+        "search_in_folder     在指定文件夹下按 Everything 语法搜索",
+        "list_folder          列出某个目录的直接子项（文件/文件夹）",
+        "count                统计匹配文件数量",
+        "index_changes        读索引变更日志（需 Everything journal_log）",
+        "read_file            按绝对路径读文本文件（有敏感路径黑名单）",
+        "grep                 在文件夹内按正则搜文件正文",
+        "search_everywhere    全盘按名搜索（设置里默认拒绝，需开启）",
+        "server_diagnostics   零参数自诊断（监听状态 / 档位 / 统计）"
       ],
 
       "_argument_rules": [

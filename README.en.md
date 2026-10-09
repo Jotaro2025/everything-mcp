@@ -23,8 +23,9 @@ an **MCP (Model Context Protocol)** server for LLMs (Claude Desktop, Cursor, …
 - **Settings page** — enable switch, bind address, port and the global-search
   mode are configurable in Everything's own options dialog; clicking Apply
   takes effect immediately, without restarting Everything.
-- **MCP Streamable HTTP** — listens on `127.0.0.1:8285` by default, one
-  JSON-RPC message over HTTP per request.
+- **MCP HTTP (POST JSON-RPC)** — listens on `127.0.0.1:8285` by default.
+  Clients **POST** one JSON-RPC request to `/` (or `/mcp`) and get one JSON
+  response. **No SSE**; `GET` returns **405** (see Known limitations).
 - **Dual-era MCP protocol** — one endpoint serves both client generations:
   2024-11-05 (`initialize` handshake) and 2026-07-28 (per-request `_meta`
   protocol version + `server/discover`). Unsupported versions get `-32022`
@@ -75,7 +76,7 @@ everything-mcp/
 │       ├── protocol.rs          JSON-RPC 2.0 + dual-era MCP types (2024-11-05 / 2026-07-28)
 │       ├── server.rs            HTTP server on std::net; per-request version
 │       │                         negotiation and Origin validation
-│       ├── tools.rs             Tool implementations (search_in_folder / list_folder / count / index_changes / read_file / grep / search_everywhere)
+│       ├── tools.rs             Tool implementations (search_in_folder / list_folder / count / index_changes / read_file / grep / search_everywhere / server_diagnostics)
 │       └── validate.rs          Argument validation & path normalization
 ├── installer/
 │   ├── build-installers.ps1     One-command packaging script (x64 + x86 installers)
@@ -242,7 +243,7 @@ plugin is enabled (the Plugins → MCP page in Everything's options dialog, or
 `mcp_enabled=1` under `[everything_mcp64.dll]` in
 `%APPDATA%\Everything\Plugins.ini`).
 
-Once connected, the LLM discovers seven tools automatically:
+Once connected, the LLM discovers **eight** tools automatically:
 
 #### 1. `search_in_folder`
 
@@ -304,7 +305,7 @@ Recursively find files/folders under a given folder using Everything search synt
   there is a limit measured in bytes, so unusually long paths can come back
   fewer than `max_results` — `truncated` is `true` in that case too.
 
-`exclude` (all three tools accept it): a string or an array of strings,
+`exclude` (`search_in_folder` / `list_folder` / `count` / `grep` / `search_everywhere`): a string or an array of strings,
 each appended as an Everything NOT term. Repository noise is in the
 results by default (Everything knows nothing about gitignore), so:
 
@@ -603,9 +604,10 @@ follow-up work.
 - **Off by default, governed by a three-mode global-search switch**
   (Everything → Options → Plugins → MCP → global search):
   - **Deny** (default): every call returns `GLOBAL_SEARCH_DISABLED` (a hard
-    server-side gate, effective immediately); the other seven tools are
-    unaffected and stay folder-scoped. The error payload names the fix, so the
-    LLM can relay it to the user.
+    server-side gate, effective immediately); the other seven tools keep
+    working (folder-scoped search / list / count / journal / read / grep /
+    diagnostics). The error payload names the fix, so the LLM can relay it to
+    the user.
   - **Review**: calls go through, but the tool is annotated as NOT read-only /
     destructive (`destructiveHint: true`), so the client shows its permission
     prompt first. Note that annotations are **untrusted hints** by the spec —
@@ -662,7 +664,7 @@ ask the user to open the options page:
   `calls` / `ok` / `err` / `avg_ms` per tool. A tool that keeps erring is a
   strong hint.
 
-Argument rules shared by all three tools: `folder` must be an absolute path
+Argument rules shared by tools that take `folder`: `folder` must be an absolute path
 (`C:\…` or `\\server\share\…`) — UNC network shares are on equal footing with
 local drives. Search scope follows Everything's index: local drives are
 included automatically, while a network share must be added under
@@ -769,6 +771,16 @@ the request body (non-ASCII values use the `=?base64?…?=` sentinel); and
 reaches the Everything host, so a malformed argument never becomes a real
 search.
 
+**Bind address and credential boundaries (evaluate honestly):** the settings
+page lets you set `mcp_bind` to `0.0.0.0` (all interfaces), but there is
+**no authentication** today (no token / password) — only the browser `Origin`
+check blocks DNS rebinding; any LAN HTTP client can still call the tools.
+Keep `127.0.0.1` unless you know what you are doing. The sensitive-path
+denylist used by `read_file` / `grep` is intentionally narrow (private keys,
+`.env`, common keystores, `.git\objects`) and does **not** cover files like
+`~/.aws/credentials`, `.npmrc`, or `.docker/config.json`. Outside that list,
+the tools can read any path the Everything process can read.
+
 ### Known limitations
 
 Behavior boundaries collected from the per-tool docs — worth a read before wiring up:
@@ -789,9 +801,11 @@ Behavior boundaries collected from the per-tool docs — worth a read before wir
   close`, no SSE channel, no GET notification stream (405). Concurrency is
   capped at 64; excess connections get 503 immediately. Fine for a localhost,
   serially-calling MCP client — do not use it as a high-concurrency web service.
-- **The HTTP server trusts localhost only**. The bind address defaults to the
-  loopback and any request carrying a non-localhost `Origin` header is rejected
-  with 403 (DNS-rebinding protection) — remote access is not a design goal.
+- **The HTTP server defaults to this machine only**. The bind address defaults
+  to the loopback; non-localhost `Origin` headers get 403 (DNS-rebinding
+  protection). If you deliberately bind `0.0.0.0`, the endpoint is reachable on
+  the LAN **with no auth** — see "Bind address and credential boundaries"
+  above. Public remote exposure is not a design goal.
 - **Text only**. `read_file` refuses binary content (by extension and content
   sniffing) and clips lines longer than 16 KiB; `grep` likewise skips binary
   files and files above 8 MiB.
