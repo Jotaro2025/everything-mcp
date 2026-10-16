@@ -7,6 +7,12 @@
 一个 Everything 1.5 的进程内插件，把 Everything 的文件搜索能力以 **MCP**（Model
 Context Protocol）接口暴露给 LLM（如 Claude Desktop、Cursor 等）使用。
 
+
+<p align="center">
+  <a href="https://linux.do/"><img src="docs/images/linux-do-banner.png" alt="LINUX DO — 新的理想型社区 / Where possible begins." width="520"></a>
+</p>
+
+
 ### 特性
 
 - **进程内插件** —— 编译为单个 `everything_mcp.dll`，被 Everything 1.5 通过
@@ -35,6 +41,34 @@ Context Protocol）接口暴露给 LLM（如 Claude Desktop、Cursor 等）使�
   用 `offset` 翻页取完；匹配支持大小写敏感、全字、正则开关。
 - **可打包安装** —— 一条命令产出 x64 / x86 两个安装包；安装与卸载都由
   Everything 自己完成（与官方插件同一套机制）。
+
+
+### 截图
+
+#### 安装：添加插件
+
+<p align="center">
+  <img src="docs/images/install-add-plugin.png" alt="Everything「设置插件」对话框：添加 Everything MCP" width="560">
+</p>
+
+运行安装包后，Everything 弹出「添加插件」对话框，确认名称与版本后点「添加」。
+
+#### 配置：MCP 服务器选项
+
+<p align="center">
+  <img src="docs/images/config-mcp-server.png" alt="Everything 选项 → 插件 → MCP 服务器" width="720">
+</p>
+
+在 **选项 → 插件 → MCP 服务器** 中启用服务，设置绑定地址、端口与全局搜索档位（拒绝 / 审核 / 允许）。
+
+#### 统计：MCP 服务器调用数据
+
+<p align="center">
+  <img src="docs/images/stats-mcp-server.png" alt="Everything 选项 → 插件 → MCP 服务器统计" width="720">
+</p>
+
+**选项 → 插件 → MCP 服务器统计** 可查看各工具调用次数、成功率、平均耗时与输出体积。
+
 
 ### 仓库结构
 

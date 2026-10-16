@@ -7,6 +7,12 @@
 An in-process plugin for Everything 1.5 that exposes Everything's file search as
 an **MCP (Model Context Protocol)** server for LLMs (Claude Desktop, Cursor, …).
 
+
+<p align="center">
+  <a href="https://linux.do/"><img src="docs/images/linux-do-banner.png" alt="LINUX DO — Where possible begins." width="520"></a>
+</p>
+
+
 ### Features
 
 - **In-process plugin** — builds to a single `everything_mcp.dll` that
@@ -45,6 +51,34 @@ an **MCP (Model Context Protocol)** server for LLMs (Claude Desktop, Cursor, …
 - **Installable** — one command produces x64 and x86 installers; Everything
   itself performs the install and uninstall (same mechanism as the official
   plugins).
+
+
+### Screenshots
+
+#### Install: add plugin
+
+<p align="center">
+  <img src="docs/images/install-add-plugin.png" alt="Everything Add Plugin dialog for Everything MCP" width="560">
+</p>
+
+After running the setup package, Everything shows the Add Plugin dialog — confirm name/version and click **Add**.
+
+#### Config: MCP Server options
+
+<p align="center">
+  <img src="docs/images/config-mcp-server.png" alt="Everything Options → Plugins → MCP Server" width="720">
+</p>
+
+Under **Options → Plugins → MCP Server**, enable the service and set bind address, port, and global-search mode (deny / review / allow).
+
+#### Stats: MCP Server invocations
+
+<p align="center">
+  <img src="docs/images/stats-mcp-server.png" alt="Everything Options → Plugins → MCP Server Statistics" width="720">
+</p>
+
+**Options → Plugins → MCP Server Statistics** shows per-tool call counts, success rate, average latency, and output size.
+
 
 ### Repository layout
 
