@@ -15,7 +15,7 @@
 //!     每个 result 带 resultType（2026-07-28 MUST），tools/list 与
 //!     server/discover 的结果另带 ttlMs / cacheScope（CacheableResult 必填）；
 //!   - 声明 legacy 版本或什么都没带 → legacy 语义：initialize 握手、
-//!     200 + JSON-RPC 错误体，老客户端完全不受影响。
+//!     请求错误返回 200 + JSON-RPC 错误体；通知统一返回 202 空体。
 //!
 //! 安全：校验 Origin 头防 DNS rebinding（非 localhost 来源 403）。
 //!
@@ -329,10 +329,7 @@ fn read_bounded(
 /// 就是几百次系统调用）；body 原来每 1 KiB 块独立 `from_utf8_lossy`，
 /// 跨块边界的多字节 UTF-8 序列（中文搜索词很常见）前后两半各变 U+FFFD，
 /// 属于静默数据损坏 —— 现在整个 body 攒齐后一次性解码。
-fn read_http_request(
-    stream: &mut TcpStream,
-    deadline: Instant,
-) -> std::io::Result<HttpRequest> {
+fn read_http_request(stream: &mut TcpStream, deadline: Instant) -> std::io::Result<HttpRequest> {
     let mut buf = Vec::with_capacity(4096);
     let mut chunk = [0u8; 4096];
     let mut search_from = 0usize;
@@ -446,6 +443,8 @@ pub fn dispatch_rpc(body: &str) -> String {
 /// `_meta` 里的版本键；两者都在但不一致 → -32020）：
 ///   - modern（2026-07-28）：server/discover、未知方法 404、通知 202 空体；
 ///   - legacy（2024-11-05 或未声明）：initialize 握手、200 + JSON-RPC 错误体。
+///
+/// 两种时代接受通知时均返回 202 空体，不生成 JSON-RPC 响应。
 pub fn dispatch_rpc_http(body: &str, head: &RequestHead) -> (u16, String) {
     stats::record_request();
     // 可能有批量和单条两种；MCP 客户端实际只发单条，这里也只处理单条。
@@ -527,8 +526,9 @@ pub fn dispatch_rpc_http(body: &str, head: &RequestHead) -> (u16, String) {
         }
     }
 
-    // modern：通知（无 id）一律 202 空体 —— 规范规定接受通知时不得返回响应体。
-    if modern && is_notification {
+    // 两种协议的通知均不返回 JSON-RPC 响应。旧版的 200 + {jsonrpc, id:null}
+    // 不是合法响应，会使 Codex/rmcp 在 initialized 阶段反序列化失败并断开。
+    if is_notification {
         return (202, String::new());
     }
 
@@ -537,11 +537,6 @@ pub fn dispatch_rpc_http(body: &str, head: &RequestHead) -> (u16, String) {
         // 应答一个版本全带的 discover 是最友好的双时代行为。
         "server/discover" => protocol::ok_response(&id, protocol::make_discover_result()),
         "initialize" => protocol::ok_response(&id, protocol::make_initialize_result(params)),
-        "notifications/initialized" => {
-            // legacy：通知不返回业务内容，回一个 id 为 null 的空响应（200）。
-            // modern 客户端走上面的 202 空体分支，到不了这里。
-            return (200, r#"{"jsonrpc":"2.0","id":null}"#.to_string());
-        }
         "ping" => protocol::ok_response(
             &id,
             protocol::with_result_type(serde_json::json!({}), modern),
