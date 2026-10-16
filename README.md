@@ -7,12 +7,6 @@
 一个 Everything 1.5 的进程内插件，把 Everything 的文件搜索能力以 **MCP**（Model
 Context Protocol）接口暴露给 LLM（如 Claude Desktop、Cursor 等）使用。
 
-
-<p align="center">
-  <a href="https://linux.do/"><img src="docs/images/linux-do-banner.png" alt="LINUX DO — 新的理想型社区 / Where possible begins." width="520"></a>
-</p>
-
-
 ### 特性
 
 - **进程内插件** —— 编译为单个 `everything_mcp.dll`，被 Everything 1.5 通过
@@ -753,3 +747,7 @@ curl -X POST http://127.0.0.1:8285/ -H "Content-Type: application/json" -d "{\"j
 ### 许可证
 
 MIT，见 [LICENSE](LICENSE)。
+
+<p align="center">
+  <a href="https://linux.do/"><img src="docs/images/linux-do-banner.png" alt="LINUX DO — 新的理想型社区 / Where possible begins." width="520"></a>
+</p>

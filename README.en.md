@@ -7,12 +7,6 @@
 An in-process plugin for Everything 1.5 that exposes Everything's file search as
 an **MCP (Model Context Protocol)** server for LLMs (Claude Desktop, Cursor, …).
 
-
-<p align="center">
-  <a href="https://linux.do/"><img src="docs/images/linux-do-banner.png" alt="LINUX DO — Where possible begins." width="520"></a>
-</p>
-
-
 ### Features
 
 - **In-process plugin** — builds to a single `everything_mcp.dll` that
@@ -898,3 +892,7 @@ derived from `reference/etp_server-1.0.2.5`. Licenses for each item are listed i
 ### License
 
 MIT, see [LICENSE](LICENSE).
+
+<p align="center">
+  <a href="https://linux.do/"><img src="docs/images/linux-do-banner.png" alt="LINUX DO — Where possible begins." width="520"></a>
+</p>
