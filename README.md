@@ -246,6 +246,45 @@ Everything 官方插件页：<https://www.voidtools.com/support/everything/plugi
 
 接入后 LLM 会自动发现以下**八个**工具：
 
+#### 高频搜索语法速查
+
+`search_in_folder` / `count` 的 `pattern`、`grep` 的 `filter`、`search_everywhere` 的 `pattern` 都走 **Everything 搜索语法**（不是 shell glob，也不是 Rust 正则）。下面只列日常最高频的几项；不要把完整语法手册贴进对话。
+
+| 写法 | 含义 |
+| --- | --- |
+| `foo bar` | 空格 = **AND**（同时匹配） |
+| `foo\|bar` | `\|` = **OR** |
+| `!foo` | `!` = **NOT**（排除） |
+| `<a\|b> c` | `<>` 分组 |
+| `"exact phrase"` | 双引号：精确短语 / 转义 |
+
+常用函数：
+
+| 函数 | 含义 | 备注 |
+| --- | --- | --- |
+| `ext:rs;toml` | 按后缀 | 多后缀用 `;` |
+| `dm:lastweek` | 修改日期 | 也可用 `today` / `thismonth` 等 |
+| `size:>1mb` | 按大小 | |
+| `content:"fn main"` | 正文检索 | **仅文件夹范围**（`search_in_folder`）；见下 |
+
+`exclude`（字符串或字符串数组）会被拼成 `!…` 接进搜索词：例如 `exclude: ["\\obj\\", "\\.git\\"]` 等价于在 pattern 里写 `!\\obj\\ !\\.git\\`。
+
+务必记住：
+
+- **不是 shell glob**：写 `*.rs`，不要写 `**/*.rs`（文件夹范围已经限定了目录树）。
+- **`search_everywhere` 拒绝 `content:`**（`pattern` 与 `exclude` 都不许带）——正文检索请用 `search_in_folder`。
+- **`grep.filter` 用本表语法；`grep.pattern` 是 Rust 正则**（逐行匹配），两者不要混。
+
+实用例子：
+
+```
+ext:rs !\target\
+ext:md;txt "getting started"
+dm:lastweek size:>100kb
+ext:rs content:"db_query"
+*.cs !\obj\ !\.git\
+```
+
 #### 1. `search_in_folder`
 
 递归搜索指定文件夹下的文件 / 文件夹（Everything 搜索语法）。
