@@ -170,8 +170,8 @@ powershell -ExecutionPolicy Bypass -File build-installers.ps1
 
 | 安装包                              | 架构 | 内嵌插件 dll           |
 | ----------------------------------- | ---- | ---------------------- |
-| `everything-mcp-1.1.7-x64-setup.exe` | x64  | `everything_mcp64.dll` |
-| `everything-mcp-1.1.7-x86-setup.exe` | x86  | `everything_mcp32.dll` |
+| `everything-mcp-1.3.1-x64-setup.exe` | x64  | `everything_mcp64.dll` |
+| `everything-mcp-1.3.1-x86-setup.exe` | x86  | `everything_mcp32.dll` |
 
 安装：运行对应架构的安装包 → Everything 弹出「设置插件」对话框 → 点「安装」。
 两个安装包可以一起分发，`Plugins\` 下 `everything_mcp64.dll` 与
@@ -639,7 +639,7 @@ curl -X POST http://127.0.0.1:8285/ -H "Content-Type: application/json" -H "MCP-
 | HTTP 状态 | JSON-RPC 错误码 | 含义与处理 |
 | --- | --- | --- |
 | 200 | — | 正常响应 |
-| 202 | — | modern 通知已接受（规范要求空响应体） |
+| 202 | — | 通知已接受（两个协议时代均返回空响应体，规范要求） |
 | 400 | `-32020` | `MCP-Protocol-Version` 头与 `_meta` 里的版本不一致 —— 两侧改成同值 |
 | 400 | `-32022` | 请求的协议版本不支持 —— 按 `data.supported` 列出的版本重试 |
 | 403 | `-32600` | 请求带了非 localhost 的 `Origin` 头（浏览器页面被挡）—— 改用本机客户端访问 |
@@ -655,7 +655,7 @@ curl -X POST http://127.0.0.1:8285/ -H "Content-Type: application/json" -H "MCP-
 
 | 客户端形态             | 版本声明方式                                                       | 行为                                                                 |
 | ---------------------- | ------------------------------------------------------------------ | -------------------------------------------------------------------- |
-| legacy（2024-11-05）   | `initialize` 握手，或不带任何版本信息                              | 200 + JSON-RPC 响应；未知方法 200 + `-32601`；通知回 `id: null` 空响应 |
+| legacy（2024-11-05）   | `initialize` 握手，或不带任何版本信息                              | 200 + JSON-RPC 响应；未知方法 200 + `-32601`；通知 202 空体 |
 | modern（2026-07-28）   | `MCP-Protocol-Version` 请求头 + `_meta` 里的 `io.modelcontextprotocol/protocolVersion` | `server/discover` 可用；未知方法 404；通知 202 空体；头/体不一致 `-32020`；版本不支持 400 + `-32022`（`data.supported` 列出可用版本） |
 
 **`resultType`（2026-07-28）**：modern 时代的每个响应 result 都带
