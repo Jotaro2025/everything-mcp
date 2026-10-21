@@ -186,8 +186,8 @@ Outputs (in `installer\dist\`):
 
 | Installer                            | Arch | Embedded plugin dll   |
 | ------------------------------------ | ---- | --------------------- |
-| `everything-mcp-1.1.7-x64-setup.exe` | x64  | `everything_mcp64.dll` |
-| `everything-mcp-1.1.7-x86-setup.exe` | x86  | `everything_mcp32.dll` |
+| `everything-mcp-1.3.1-x64-setup.exe` | x64  | `everything_mcp64.dll` |
+| `everything-mcp-1.3.1-x86-setup.exe` | x86  | `everything_mcp32.dll` |
 
 To install, run the installer for your architecture; Everything then shows its
 "Setup Plugin" dialog, where you click Install. Both installers can be
@@ -756,7 +756,7 @@ this endpoint speaks.
 | HTTP status | JSON-RPC code | Meaning and fix |
 | --- | --- | --- |
 | 200 | — | Normal response |
-| 202 | — | Modern notification accepted (the spec requires an empty body) |
+| 202 | — | Notification accepted in both protocol eras (empty body required by the spec) |
 | 400 | `-32020` | `MCP-Protocol-Version` header and `_meta` version disagree — make both the same value |
 | 400 | `-32022` | Requested protocol version not supported — retry with a version from `data.supported` |
 | 403 | `-32600` | Request carried a non-localhost `Origin` header (a browser page was blocked) — use a local client instead |
@@ -774,7 +774,7 @@ request declares, so both client generations work:
 
 | Client era              | How the version is declared                                            | Behavior                                                                 |
 | ----------------------- | ---------------------------------------------------------------------- | ------------------------------------------------------------------------ |
-| legacy (2024-11-05)     | `initialize` handshake, or no version information at all               | 200 + JSON-RPC response; unknown methods 200 + `-32601`; notifications get an `id: null` ack |
+| legacy (2024-11-05)     | `initialize` handshake, or no version information at all               | 200 + JSON-RPC response; unknown methods 200 + `-32601`; notifications 202 with empty body |
 | modern (2026-07-28)     | `MCP-Protocol-Version` request header + `io.modelcontextprotocol/protocolVersion` in `_meta` | `server/discover` available; unknown methods 404; notifications 202 with empty body; header/body mismatch `-32020`; unsupported version 400 + `-32022` (`data.supported` lists the usable versions) |
 
 **`resultType` (2026-07-28):** every modern-era response result carries
