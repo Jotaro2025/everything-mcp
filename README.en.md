@@ -273,6 +273,45 @@ plugin is enabled (the Plugins → MCP page in Everything's options dialog, or
 
 Once connected, the LLM discovers **eight** tools automatically:
 
+#### High-frequency search-syntax cheat sheet
+
+`search_in_folder` / `count`'s `pattern`, `grep`'s `filter`, and `search_everywhere`'s `pattern` all use **Everything search syntax** (not shell glob, not Rust regex). Only the everyday operators are listed here — do not paste the full Everything syntax dump into a chat.
+
+| Syntax | Meaning |
+| --- | --- |
+| `foo bar` | Space = **AND** |
+| `foo\|bar` | `\|` = **OR** |
+| `!foo` | `!` = **NOT** (exclude) |
+| `<a\|b> c` | `<>` grouping |
+| `"exact phrase"` | Quotes: exact phrase / escaping |
+
+Common functions:
+
+| Function | Meaning | Notes |
+| --- | --- | --- |
+| `ext:rs;toml` | Extension(s) | Separate multiple with `;` |
+| `dm:lastweek` | Date modified | Also `today` / `thismonth`, … |
+| `size:>1mb` | Size | |
+| `content:"fn main"` | Content search | **Folder-scoped only** (`search_in_folder`); see below |
+
+The `exclude` parameter (string or array of strings) is appended as `!…` terms: e.g. `exclude: ["\\obj\\", "\\.git\\"]` is the same as writing `!\\obj\\ !\\.git\\` in the pattern.
+
+Remember:
+
+- **Not shell glob**: write `*.rs`, not `**/*.rs` (the folder scope already restricts the tree).
+- **`search_everywhere` rejects `content:`** in both `pattern` and `exclude` — use `search_in_folder` for content search.
+- **`grep.filter` uses this syntax; `grep.pattern` is a Rust regex** (matched per line) — do not mix them up.
+
+Practical examples:
+
+```
+ext:rs !\target\
+ext:md;txt "getting started"
+dm:lastweek size:>100kb
+ext:rs content:"db_query"
+*.cs !\obj\ !\.git\
+```
+
 #### 1. `search_in_folder`
 
 Recursively find files/folders under a given folder using Everything search syntax.
