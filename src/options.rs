@@ -661,37 +661,45 @@ pub fn save_settings(data: *mut c_void) -> *mut c_void {
 
 /// 把当前设置应用到 MCP 服务。返回 false 表示应用失败（调用方应保持
 /// 选项页的 Apply 启用）。必须在主线程调用（PM_START / PM_SAVE_OPTIONS_PAGE）。
+///
+/// 锁纪律（2026-10 审计修复）：start/stop 是耗时操作（join 监听与连接
+/// 线程），绝不能持有 OPTS 锁去做 —— MCP 工作线程的 global_search_mode()
+/// / settings_snapshot() 都在等这把锁，在途请求会被卡到停机结束。
+/// 模式是「快照 → 释放锁 → 应用 → 短暂持锁写回 running」。
 fn apply() -> bool {
-    let mut st = state();
-    if st.enabled {
-        let target = (st.bind.clone(), st.port);
-        if st.running.as_ref() == Some(&target) {
+    let (enabled, target, was_running) = {
+        let st = state();
+        (st.enabled, (st.bind.clone(), st.port), st.running.clone())
+    };
+
+    if enabled {
+        if was_running.as_ref() == Some(&target) {
             // 配置未变且已在监听 —— 不重启，避免打断已有连接。
             return true;
         }
-        match mcp::server::start(&st.bind, st.port) {
+        match mcp::server::start(&target.0, target.1) {
             Ok(()) => {
-                let msg = format!("options: MCP listening on {}:{}", st.bind, st.port);
+                let msg = format!("options: MCP listening on {}:{}", target.0, target.1);
                 diag::write(&msg);
                 Host::debug(&msg);
-                st.running = Some(target);
+                state().running = Some(target);
                 true
             }
             Err(e) => {
                 let msg = format!("options: MCP start failed: {}", e);
                 diag::write(&msg);
                 Host::debug(&msg);
-                st.running = None;
+                state().running = None;
                 false
             }
         }
     } else {
-        if st.running.is_some() {
+        if was_running.is_some() {
             mcp::server::stop();
             diag::write("options: MCP stopped (disabled)");
             Host::debug("everything_mcp: MCP stopped");
         }
-        st.running = None;
+        state().running = None;
         true
     }
 }

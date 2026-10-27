@@ -103,10 +103,16 @@ pub unsafe fn ensure_query() -> Result<DbQueryHandle, String> {
 /// 在 PM_START 时调用：只做自检，不创建 db/query（见模块文档）。
 pub fn create() -> PluginState {
     let host = Host::get();
-    if host.os_thread_create.is_none() {
-        super::diag::write("WARNING: os_thread_create MISSING — search calls will fail");
+    // 搜索的真正依赖是主线程 marshal 基础设施（os_register_class /
+    // os_create_window）—— os_thread_create 在本插件的实现里从未被调用
+    // （旧警告指向了不存在的依赖，误导排查）。
+    if host.os_register_class.is_none() || host.os_create_window.is_none() {
+        super::diag::write(
+            "WARNING: os_register_class/os_create_window MISSING — search calls will fail \
+             (db_query_search2 needs main-thread marshaling)",
+        );
     } else {
-        super::diag::write("PM_START: os_thread_create available");
+        super::diag::write("PM_START: main-thread window infrastructure available");
     }
     PluginState {
         shutdown: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),

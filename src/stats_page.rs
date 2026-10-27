@@ -73,7 +73,10 @@ static STATS_CLEAR_ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::Ato
 /// Statistics 页最小尺寸（逻辑像素）。内容区 = 数值列 242 + 工具名列 ~130
 /// + 24 边距；比 MCP 页宽 —— 逐列布局要给最长工具名留出不挤的宽度。
 pub(crate) const STATS_PAGE_MIN_WIDE: i32 = 400;
-pub(crate) const STATS_PAGE_MIN_HIGH: i32 = 240;
+// 布局算术反推：3 汇总行 + 表头 + 9 数据行 = 13 行 × (15+3) + 顶部 12 +
+// 按钮 23 + 底部 12 ≈ 281 —— 最小高度必须盖住最后一行，否则按钮压住
+// 数据行、第 9 行被裁掉（8→9 槽位迁移时曾漏算）。
+pub(crate) const STATS_PAGE_MIN_HIGH: i32 = 290;
 
 // ============================================================
 // 渲染缓存与布局

@@ -6,7 +6,7 @@
 
 use serde_json::{json, Value};
 
-use crate::mcp::protocol::{GlobalSearchMode, INVALID_PARAMS, METHOD_NOT_FOUND};
+use crate::mcp::protocol::{GlobalSearchMode, INVALID_PARAMS};
 use crate::mcp::validate;
 use crate::plugin;
 
@@ -180,6 +180,27 @@ fn u64_arg(args: &Value, key: &str, default: u64) -> Result<u64, (i32, String)> 
             format!("'{}' must be a non-negative integer; received {}", key, v),
         )),
     }
+}
+
+/// 取带 usize 上界校验的非负整数参数。
+///
+/// 与 `u64_arg(...)? as usize` 的区别：发布的是 x86/x64 双架构，x86 的
+/// `usize` 是 32 位 —— 传 2^32 会被 `as usize` 静默截断成 0（调用方以为
+/// 在翻第 N 页，实际拿到第 0 页）。这里先按 u64 完成范围校验再收窄。
+fn usize_arg(
+    args: &Value,
+    key: &str,
+    default: u64,
+    max: u64,
+) -> Result<usize, (i32, String)> {
+    let v = u64_arg(args, key, default)?;
+    if v > max {
+        return Err((
+            INVALID_PARAMS,
+            format!("'{}' must be between 0 and {}; received {}", key, max, v),
+        ));
+    }
+    Ok(v as usize)
 }
 
 /// 取 `timeout_ms`：必须是能装进 u32 的正整数。
@@ -397,7 +418,13 @@ pub fn dispatch(name: &str, args: &Value) -> Result<ToolOutput, (i32, String)> {
         "grep" => tool_grep(args),
         "search_everywhere" => tool_search_everywhere(args),
         "server_diagnostics" => tool_server_diagnostics(args),
-        other => Err((METHOD_NOT_FOUND, format!("unknown tool: {}", other))),
+        other => Err((
+            INVALID_PARAMS,
+            format!(
+                "unknown tool: {} — call tools/list for the available tool names",
+                other
+            ),
+        )),
     }
 }
 
@@ -425,8 +452,13 @@ fn tool_server_diagnostics(_args: &Value) -> Result<ToolOutput, (i32, String)> {
 
     // 终身统计：哪个工具一直在错，一眼可见。
     let snap = plugin::stats::snapshot();
+    // total_calls 对全部 9 个槽位求和 —— tools 明细也必须列出全部 9 行
+    // （最后一行是未知工具兜底），否则总数与行之和对不上。stats_page 的
+    // 渲染不变式（stats_page.rs：兜底行要显示）对诊断输出同样成立。
     let total_calls: u64 = snap.tools.iter().map(|t| t.calls).sum();
-    let tools: Vec<Value> = plugin::stats::TOOL_NAMES
+    let mut tool_names: Vec<&str> = plugin::stats::TOOL_NAMES.to_vec();
+    tool_names.push("(unknown)");
+    let tools: Vec<Value> = tool_names
         .iter()
         .enumerate()
         .map(|(i, name)| {
@@ -494,7 +526,9 @@ fn tool_search_in_folder(args: &Value) -> Result<ToolOutput, (i32, String)> {
     // 正则改用 `regex:` 搜索函数（见 regex_term 注释），只包 pattern，
     // 排除项 `!term` 保持独立。
     let query = combine_query(&regex_term(&pattern, match_regex), &excludes);
-    let offset = u64_arg(args, "offset", 0)? as usize;
+    // offset 无上界（超大值按空页处理，见 page_window 的钳制）；max_results
+    // 走带范围的显式校验。x86 下 usize 是 32 位，必须先校验再收窄。
+    let offset = usize_arg(args, "offset", 0, usize::MAX as u64)?;
     let max_results = u64_arg(args, "max_results", 50)? as usize;
     // 窗口上限与另外两个搜索工具一致；0 是写错而不是「不限」。
     if max_results == 0 || max_results > RESULT_WINDOW_MAX {
@@ -570,7 +604,7 @@ fn tool_list_folder(args: &Value) -> Result<ToolOutput, (i32, String)> {
     let folder = require_folder(args)?;
     let excludes = exclude_arg(args)?;
     let query = combine_query("", &excludes);
-    let offset = u64_arg(args, "offset", 0)? as usize;
+    let offset = usize_arg(args, "offset", 0, usize::MAX as u64)?;
     // 窗口必须能翻页：大目录的直接子项可以上千（实测 C:\Windows\System32
     // 有 4889 个），旧实现写死 500 条且没有 offset，第 501 项之后拿不到。
     let max_results = u64_arg(args, "max_results", LIST_DEFAULT_MAX_RESULTS as u64)? as usize;
@@ -768,16 +802,21 @@ fn tool_read_file(args: &Value) -> Result<ToolOutput, (i32, String)> {
             ))
         }
     };
-    let start_line = u64_arg(args, "start_line", 1)? as usize;
-    let max_lines =
-        u64_arg(args, "max_lines", plugin::read::DEFAULT_MAX_LINES as u64)? as usize;
+    let start_line = usize_arg(args, "start_line", 1, usize::MAX as u64)?;
+    let max_lines = usize_arg(
+        args,
+        "max_lines",
+        plugin::read::DEFAULT_MAX_LINES as u64,
+        plugin::read::MAX_MAX_LINES as u64,
+    )?;
     if start_line == 0 {
         return Err((
             INVALID_PARAMS,
             "'start_line' is 1-based; use 1 for the first line".into(),
         ));
     }
-    // 与 PI-Desktop 的 schema 对齐：min 1 / max 4000，不再有「0 = 不限」。
+    // 与 PI-Desktop 的 schema 对齐：min 1 / max 4000（范围由 usize_arg 校验，
+    // 这里只拦 0 —— schema 上 0 不是「不限」而是写错）。
     if max_lines == 0 || max_lines > plugin::read::MAX_MAX_LINES {
         return Err((
             INVALID_PARAMS,
@@ -874,7 +913,12 @@ fn tool_grep(args: &Value) -> Result<ToolOutput, (i32, String)> {
     };
 
     let head_limit =
-        u64_arg(args, "head_limit", plugin::grep::DEFAULT_HEAD_LIMIT as u64)? as usize;
+        usize_arg(
+            args,
+            "head_limit",
+            plugin::grep::DEFAULT_HEAD_LIMIT as u64,
+            plugin::grep::MAX_HEAD_LIMIT as u64,
+        )?;
     if head_limit == 0 || head_limit > plugin::grep::MAX_HEAD_LIMIT {
         return Err((
             INVALID_PARAMS,
@@ -964,7 +1008,7 @@ fn tool_search_everywhere(args: &Value) -> Result<ToolOutput, (i32, String)> {
     validate::validate_global_excludes(&excludes).map_err(|e| (INVALID_PARAMS, e))?;
     let match_regex = bool_arg(args, "match_regex", false)?;
     let query = combine_query(&regex_term(&pattern, match_regex), &excludes);
-    let offset = u64_arg(args, "offset", 0)? as usize;
+    let offset = usize_arg(args, "offset", 0, usize::MAX as u64)?;
     // 全局窗口与另外两个搜索工具同一套上限：0 不是「不限」而是写错
     // （与 read_file 的 max_lines 同一形态）。
     let max_results = u64_arg(args, "max_results", 50)?;
@@ -1021,6 +1065,7 @@ fn tool_search_everywhere(args: &Value) -> Result<ToolOutput, (i32, String)> {
                     })
                 })
                 .collect();
+            let returned = entries.len();
             let text = serde_json::to_string_pretty(&json!({
                 "mode": mode.as_str(),
                 "pattern": pattern,
@@ -1028,8 +1073,13 @@ fn tool_search_everywhere(args: &Value) -> Result<ToolOutput, (i32, String)> {
                 "sort": sort.as_str(),
                 "descending": descending,
                 "offset": outcome.offset,
-                "count": entries.len(),
+                "count": returned,
                 "total": outcome.total,
+                // 与 search_in_folder / list_folder 同形：max_results 或
+                // 字节预算任一处截断都为 true —— 工具描述承诺了
+                // 「truncated 时用 offset 翻页」，响应里没有这个键调用方
+                // 就分不清「本页被预算截短」与「正常取完」。
+                "truncated": outcome.offset + returned < outcome.total,
                 "results": entries,
             }))
             .unwrap_or_else(|_| "{\"error\":\"serialization failed\"}".into());

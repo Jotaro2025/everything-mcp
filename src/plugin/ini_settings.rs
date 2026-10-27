@@ -33,7 +33,7 @@ pub struct PersistedSettings {
 pub fn read_persisted() -> Option<PersistedSettings> {
     for path in candidate_paths() {
         if let Ok(bytes) = std::fs::read(&path) {
-            let content = String::from_utf8_lossy(&bytes);
+            let content = decode_ini(&bytes);
             if let Some(s) = parse_section(&content) {
                 super::diag::write(&format!(
                     "ini_settings: loaded from {} (enabled={})",
@@ -45,6 +45,71 @@ pub fn read_persisted() -> Option<PersistedSettings> {
         }
     }
     None
+}
+
+/// Plugins.ini 的宽容解码：UTF-16 LE/BE BOM → UTF-8（含 UTF-8 BOM 剥除）→
+/// 本机 ANSI → UTF-8 lossy。
+///
+/// 与 journal.rs 对 Everything.ini 的处理对齐：Windows 的 ini 写入器可能
+/// 按系统区域写出 UTF-16，按 UTF-8 硬解会得到 NUL 交错的乱码、段名匹配
+/// 全部落空 —— 「重启后变回未启用」的兜底就无声失效了。
+fn decode_ini(bytes: &[u8]) -> String {
+    if bytes.starts_with(&[0xFF, 0xFE]) || bytes.starts_with(&[0xFE, 0xFF]) {
+        let little = bytes[0] == 0xFF;
+        let units: Vec<u16> = bytes[2..]
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| {
+                if little {
+                    u16::from_le_bytes(*c)
+                } else {
+                    u16::from_be_bytes(*c)
+                }
+            })
+            .collect();
+        return String::from_utf16_lossy(&units);
+    }
+    let body = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes);
+    if let Ok(s) = core::str::from_utf8(body) {
+        return s.to_string();
+    }
+    // 不是合法 UTF-8 且无 BOM —— 按本机 ANSI 代码页解（read.rs 对文件正文
+    // 同样如此；中文 Windows 即 GBK）。
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Globalization::{CP_ACP, MultiByteToWideChar};
+        if !body.is_empty() && body.len() <= i32::MAX as usize {
+            let units = unsafe {
+                MultiByteToWideChar(
+                    CP_ACP,
+                    0,
+                    body.as_ptr(),
+                    body.len() as i32,
+                    core::ptr::null_mut(),
+                    0,
+                )
+            };
+            if units > 0 {
+                let mut buf = vec![0u16; units as usize];
+                let written = unsafe {
+                    MultiByteToWideChar(
+                        CP_ACP,
+                        0,
+                        body.as_ptr(),
+                        body.len() as i32,
+                        buf.as_mut_ptr(),
+                        units,
+                    )
+                };
+                if written > 0 {
+                    buf.truncate(written as usize);
+                    return String::from_utf16_lossy(&buf);
+                }
+            }
+        }
+    }
+    String::from_utf8_lossy(body).into_owned()
 }
 
 fn candidate_paths() -> Vec<PathBuf> {
@@ -170,5 +235,24 @@ mod tests {
     fn section_match_is_case_insensitive_and_trims() {
         let content = "[ Everything_MCP64.DLL ]\nmcp_enabled=1\n";
         assert!(parse_section(content).is_some());
+    }
+
+    #[test]
+    fn decodes_utf16_le_ini_with_bom() {
+        // Windows ini 写入器可能按 UTF-16 写出 —— 硬按 UTF-8 解会得到
+        // NUL 交错的乱码，段匹配全落空，兜底无声失效。
+        let mut bytes = vec![0xFF, 0xFE];
+        for unit in "[everything_mcp64.dll]\nmcp_enabled=1\n".encode_utf16() {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        let s = parse_section(&decode_ini(&bytes)).expect("utf16 ini must parse");
+        assert!(s.enabled);
+    }
+
+    #[test]
+    fn decodes_utf8_bom_ini() {
+        let mut bytes = vec![0xEF, 0xBB, 0xBF];
+        bytes.extend_from_slice(b"[everything_mcp64.dll]\nmcp_enabled=1\n");
+        assert!(parse_section(&decode_ini(&bytes)).is_some());
     }
 }
