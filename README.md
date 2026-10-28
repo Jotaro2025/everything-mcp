@@ -217,11 +217,16 @@ Everything 官方插件页：<https://www.voidtools.com/support/everything/plugi
 | `mcp_bind`    | string | `127.0.0.1`   | 绑定地址（仅本机访问）        |
 | `mcp_global_search` | int | `0`        | 全局搜索档位：`0` 拒绝（默认，`search_everywhere` 调用一律返回 `GLOBAL_SEARCH_DISABLED`）/ `1` 审核（可用，但工具被标注为需用户确认，客户端先弹权限确认框）/ `2` 允许（直接可用，不弹确认） |
 
+此外，设置页还提供「启用内容索引」复选框，直接读写 Everything 的核心设置
+`content_indexing_enabled`（新版 Everything 把它移到了「高级」页）：
+勾选后通过官方 `-add-config` 立即应用，只对已配置「索引文件内容」的文件夹
+生效，首次开启可能触发重建索引，部分版本需重启 Everything 生效。
+
 设置存放于 `%APPDATA%\Everything\Plugins.ini` 的本插件专属小节
 `[everything_mcp64.dll]`（32 位系统上是 `[everything_mcp32.dll]`）——
 不是 Everything 的 `Settings.ini`，也不与 http_server 等官方插件共用小节。
 也可以直接在 Everything 选项对话框的「插件 → MCP」页修改（启用开关、绑定地址、
-端口、全局搜索档位、恢复默认），点「应用」后立即生效，无需重启 Everything。
+端口、全局搜索档位、内容索引、恢复默认），点「应用」后立即生效，无需重启 Everything。
 
 ### MCP 客户端接入
 

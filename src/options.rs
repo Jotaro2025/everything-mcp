@@ -72,6 +72,8 @@ const ID_GLOBAL_STATIC: i32 = 7;
 const ID_GLOBAL_DENY: i32 = 8;
 const ID_GLOBAL_REVIEW: i32 = 9;
 const ID_GLOBAL_ALLOW: i32 = 10;
+const ID_CONTENT_INDEXING: i32 = 11;
+const ID_CONTENT_NOTE: i32 = 12;
 
 pub(crate) const WM_COMMAND: u32 = 0x0111;
 const EN_CHANGE: u32 = 0x0300;
@@ -90,7 +92,8 @@ const DLG_SEPARATOR: i32 = 6;
 
 /// 选项页最小尺寸（逻辑像素）—— PM_GET_OPTIONS_PAGE_MINMAX 报告给主程序。
 const PAGE_MIN_WIDE: i32 = 200;
-const PAGE_MIN_HIGH: i32 = 155;
+// 底部多出「内容索引」复选框 + 一行说明（2026-10），最小高度相应加 35。
+const PAGE_MIN_HIGH: i32 = 190;
 
 /// Everything 选项对话框里 Apply 按钮的固定 ID（http_server.c 的
 /// http_server_enable_options_apply 用的同一个值）。
@@ -297,6 +300,9 @@ pub fn load_page(data: *mut c_void) -> *mut c_void {
             st.global_search,
         )
     };
+    // 内容索引是 Everything 的核心设置（不在 Plugins.ini），从 Everything.ini
+    // 读当前值；读不到按未勾选显示（与官方默认一致）。
+    let content_indexing = read_content_indexing().unwrap_or(false) as i32;
 
     unsafe {
         // 启用复选框
@@ -393,6 +399,27 @@ pub fn load_page(data: *mut c_void) -> *mut c_void {
             cstr_bytes(labels.global_allow_help).as_ptr(),
         );
 
+        // 内容索引（Everything 高级设置 content_indexing_enabled 的直达开关）。
+        create_checkbox(
+            page_hwnd,
+            ID_CONTENT_INDEXING,
+            0,
+            content_indexing,
+            cstr_bytes(labels.content_indexing).as_ptr(),
+        );
+        add_tooltip(
+            tooltip_hwnd,
+            page_hwnd,
+            ID_CONTENT_INDEXING,
+            cstr_bytes(labels.content_indexing_help).as_ptr(),
+        );
+        create_static(
+            page_hwnd,
+            ID_CONTENT_NOTE,
+            SS_LEFTNOWORDWRAP,
+            cstr_bytes(labels.content_indexing_note).as_ptr(),
+        );
+
         // 恢复默认按钮
         create_button(
             page_hwnd,
@@ -435,6 +462,22 @@ pub fn save_page(data: *mut c_void) -> *mut c_void {
     if bind.trim().is_empty() {
         // 空地址按「仅本机」处理，避免误暴露到所有网卡。
         bind = DEFAULT_BIND.to_string();
+    }
+
+    // 内容索引与 MCP 服务无关，独立应用（先于端口校验，端口写错也不该
+    // 拦下这个开关）。只在值真的变化时才写 ini / 调 -add-config。
+    let content_indexing = unsafe { is_checked(page_hwnd, ID_CONTENT_INDEXING) };
+    if read_content_indexing() != Some(content_indexing) {
+        match apply_content_indexing(content_indexing) {
+            Ok(()) => diag::write(&format!(
+                "options: content_indexing set to {}",
+                content_indexing as i32
+            )),
+            Err(e) => {
+                diag::write(&format!("options: content_indexing apply failed: {}", e));
+                Host::debug("everything_mcp: content indexing apply failed");
+            }
+        }
     }
 
     let ok = if port == 0 || port > 65535 {
@@ -561,6 +604,12 @@ pub fn size_page(data: *mut c_void) -> *mut c_void {
         cx += wide + 6;
     }
 
+    // 内容索引开关 + 一行说明（紧跟全局搜索行下方）。
+    y += DLG_CHECKBOX_HIGH + DLG_SEPARATOR;
+    set_rect(page_hwnd, ID_CONTENT_INDEXING, x, y, wide, DLG_CHECKBOX_HIGH);
+    y += DLG_CHECKBOX_HIGH + 3;
+    set_rect(page_hwnd, ID_CONTENT_NOTE, x, y, wide, DLG_STATIC_HIGH);
+
     // 恢复默认按钮贴在页面底部右角。
     let button_wide = expand_min_wide(page_hwnd, labels.restore, 75 - 24) + 24;
     set_rect(
@@ -601,6 +650,10 @@ pub fn page_proc(data: *mut c_void) -> *mut c_void {
         ID_RESTORE_DEFAULTS => {
             restore_defaults(page_hwnd);
             unsafe { update_page(page_hwnd) };
+            enable_apply(p.options_hwnd);
+        }
+        ID_CONTENT_INDEXING => {
+            // 内容索引是独立于 MCP 服务的核心设置，勾选变化也要 Apply。
             enable_apply(p.options_hwnd);
         }
         ID_GLOBAL_DENY | ID_GLOBAL_REVIEW | ID_GLOBAL_ALLOW => {
@@ -702,6 +755,282 @@ fn apply() -> bool {
         state().running = None;
         true
     }
+}
+
+// ============================================================
+// 内容索引（Everything 核心设置 content_indexing_enabled）
+//
+// 新版 Everything 把这个开关从「索引 → 文件夹」挪到了「高级」页，位置不
+// 直观。本页提供一个直达开关：
+//   - 读：解析 Everything.ini 的 [Everything] 段；
+//   - 写：原位改键（保留编码与行尾），并调官方命令行 `-add-config`
+//     合并进运行中实例（1.5 实机验证：改 window_title_format 后窗口
+//     标题立刻变化）；配合 db_save_on_exit=1，退出时落盘。
+// 不用推测出来的 config_set_int_value：签名未公开，调错会崩宿主。
+// ============================================================
+
+/// Everything 核心 ini 键：内容索引总开关。
+const CORE_KEY_CONTENT_INDEXING: &str = "content_indexing_enabled";
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum IniEncoding {
+    Utf8,
+    Utf16Le,
+    Utf16Be,
+}
+
+/// Everything.ini 的候选路径：app_data 安装（默认）与便携安装（exe 旁）。
+fn core_ini_candidates() -> Vec<std::path::PathBuf> {
+    let mut paths = Vec::new();
+    if let Ok(appdata) = std::env::var("APPDATA") {
+        paths.push(
+            std::path::PathBuf::from(appdata)
+                .join("Everything")
+                .join("Everything.ini"),
+        );
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            paths.push(dir.join("Everything.ini"));
+        }
+    }
+    paths
+}
+
+/// 解码 ini 并保留编码 —— 写回时用同一种编码，避免把 UTF-16 的 ini 变成
+/// UTF-8（Everything 自己写得出来 UTF-16，journal.rs 也为此专门处理过）。
+///
+/// 非 UTF-8/UTF-16 的 ANSI ini 返回 None：那种文件里可能含本机代码页的
+/// 非 ASCII 路径，重写有损坏风险，宁可只走 `-add-config` 不落盘。
+fn decode_core_ini(bytes: &[u8]) -> Option<(String, IniEncoding)> {
+    if bytes.starts_with(&[0xFF, 0xFE]) {
+        let units: Vec<u16> = bytes[2..]
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| u16::from_le_bytes(*c))
+            .collect();
+        return Some((String::from_utf16_lossy(&units), IniEncoding::Utf16Le));
+    }
+    if bytes.starts_with(&[0xFE, 0xFF]) {
+        let units: Vec<u16> = bytes[2..]
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| u16::from_be_bytes(*c))
+            .collect();
+        return Some((String::from_utf16_lossy(&units), IniEncoding::Utf16Be));
+    }
+    let body = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes);
+    core::str::from_utf8(body)
+        .ok()
+        .map(|s| (s.to_string(), IniEncoding::Utf8))
+}
+
+fn encode_core_ini(content: &str, enc: IniEncoding) -> Vec<u8> {
+    match enc {
+        IniEncoding::Utf8 => content.as_bytes().to_vec(),
+        IniEncoding::Utf16Le => {
+            let mut out = vec![0xFF, 0xFE];
+            for unit in content.encode_utf16() {
+                out.extend_from_slice(&unit.to_le_bytes());
+            }
+            out
+        }
+        IniEncoding::Utf16Be => {
+            let mut out = vec![0xFE, 0xFF];
+            for unit in content.encode_utf16() {
+                out.extend_from_slice(&unit.to_be_bytes());
+            }
+            out
+        }
+    }
+}
+
+/// 在 [Everything] 段里找键（大小写不敏感，跳过其它段）。
+fn find_core_value(content: &str, key: &str) -> Option<String> {
+    let mut in_section = false;
+    for line in content.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix('[') {
+            in_section = rest
+                .trim_end_matches(']')
+                .trim()
+                .eq_ignore_ascii_case("Everything");
+            continue;
+        }
+        if !in_section {
+            continue;
+        }
+        if let Some((k, v)) = line.split_once('=') {
+            if k.trim().eq_ignore_ascii_case(key) {
+                return Some(v.trim().to_string());
+            }
+        }
+    }
+    None
+}
+
+/// 当前内容索引开关（供 server_diagnostics 回显；ini 不可读时为 None）。
+pub(crate) fn content_indexing_enabled() -> Option<bool> {
+    read_content_indexing()
+}
+
+/// 读取内容索引开关的当前值；ini 不存在或键缺失时返回 None。
+fn read_content_indexing() -> Option<bool> {
+    for path in core_ini_candidates() {
+        if let Ok(bytes) = std::fs::read(&path) {
+            if let Some((content, _)) = decode_core_ini(&bytes) {
+                if let Some(v) = find_core_value(&content, CORE_KEY_CONTENT_INDEXING) {
+                    return Some(v.parse::<i64>().map(|n| n != 0).unwrap_or(false));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// 把 [Everything] 段里的键改成 `value`；键不存在时插到段头后（没有段头
+/// 就先补 `[Everything]`）。其余行、行尾风格（CRLF/LF）原样保留。
+fn set_core_value(content: &str, key: &str, value: &str) -> String {
+    let mut out = String::with_capacity(content.len() + 40);
+    let mut in_section = false;
+    let mut replaced = false;
+    for line in content.split_inclusive('\n') {
+        let no_nl = line.strip_suffix('\n').unwrap_or(line);
+        let raw = no_nl.strip_suffix('\r').unwrap_or(no_nl);
+        let ending = &line[raw.len()..];
+        let trimmed = raw.trim();
+        if let Some(rest) = trimmed.strip_prefix('[') {
+            in_section = rest
+                .trim_end_matches(']')
+                .trim()
+                .eq_ignore_ascii_case("Everything");
+            out.push_str(line);
+            continue;
+        }
+        if in_section {
+            if let Some((k, _)) = raw.split_once('=') {
+                if k.trim().eq_ignore_ascii_case(key) {
+                    out.push_str(k.trim());
+                    out.push('=');
+                    out.push_str(value);
+                    out.push_str(ending);
+                    replaced = true;
+                    continue;
+                }
+            }
+        }
+        out.push_str(line);
+    }
+    if replaced {
+        return out;
+    }
+
+    // 键不在段里：插到 [Everything] 段头后面。
+    let mut inserted = false;
+    let mut final_out = String::with_capacity(out.len() + key.len() + value.len() + 16);
+    for line in out.split_inclusive('\n') {
+        final_out.push_str(line);
+        let raw = line.trim_end_matches(['\r', '\n']);
+        if let Some(rest) = raw.trim().strip_prefix('[') {
+            let is_everything = rest
+                .trim_end_matches(']')
+                .trim()
+                .eq_ignore_ascii_case("Everything");
+            if is_everything && !inserted {
+                // 段头在文件末尾且没有换行时，先把行断开再插键。
+                let nl = if content.contains("\r\n") { "\r\n" } else { "\n" };
+                if !line.ends_with('\n') {
+                    final_out.push_str(nl);
+                }
+                final_out.push_str(key);
+                final_out.push('=');
+                final_out.push_str(value);
+                final_out.push_str(nl);
+                inserted = true;
+            }
+        }
+    }
+    if !inserted {
+        final_out.insert_str(0, &format!("[Everything]\r\n{}={}\r\n", key, value));
+    }
+    final_out
+}
+
+/// 持久化内容索引开关到 Everything.ini（原子替换）。
+fn write_content_indexing(enabled: bool) -> Result<(), String> {
+    let path = core_ini_candidates()
+        .into_iter()
+        .find(|p| p.exists())
+        .ok_or_else(|| "Everything.ini not found".to_string())?;
+    let bytes = std::fs::read(&path).map_err(|e| format!("read {}: {}", path.display(), e))?;
+    let (content, enc) = decode_core_ini(&bytes)
+        .ok_or_else(|| format!("{} is not UTF-8/UTF-16; not rewriting it", path.display()))?;
+    let updated = set_core_value(
+        &content,
+        CORE_KEY_CONTENT_INDEXING,
+        &(enabled as i32).to_string(),
+    );
+    if updated == content {
+        return Ok(());
+    }
+    let out = encode_core_ini(&updated, enc);
+    let tmp = path.with_extension("ini.emcp.tmp");
+    std::fs::write(&tmp, &out).map_err(|e| format!("write {}: {}", tmp.display(), e))?;
+    std::fs::rename(&tmp, &path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("replace {}: {}", path.display(), e)
+    })
+}
+
+/// 应用内容索引开关：写 ini + 通过官方 `-add-config` 合并进运行中实例。
+///
+/// `-add-config` 让新的配置进入 Everything 内存（实机验证），配合
+/// `db_save_on_exit=1` 退出时落盘；只写 ini 不够 —— Everything 退出时
+/// 会用内存值覆盖，等于白改。
+fn apply_content_indexing(enabled: bool) -> Result<(), String> {
+    if let Err(e) = write_content_indexing(enabled) {
+        // 落盘失败不阻塞内存应用；但要在诊断日志里留痕。
+        diag::write(&format!(
+            "options: content_indexing ini write failed: {}",
+            e
+        ));
+    }
+
+    let tmp = std::env::temp_dir().join(format!(
+        "everything_mcp_content_indexing_{}.ini",
+        std::process::id()
+    ));
+    std::fs::write(
+        &tmp,
+        format!(
+            "[Everything]\r\n{}={}\r\n",
+            CORE_KEY_CONTENT_INDEXING, enabled as i32
+        ),
+    )
+    .map_err(|e| format!("write temp config: {}", e))?;
+
+    let exe = std::env::current_exe().map_err(|e| format!("current_exe: {}", e))?;
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let mut child = std::process::Command::new(&exe)
+        .arg("-add-config")
+        .arg(&tmp)
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn()
+        .map_err(|e| format!("spawn -add-config: {}", e))?;
+
+    // 正常情况下转发进程毫秒级退出；最多等 5 秒，绝不长时间卡 UI 线程。
+    for _ in 0..500 {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(10)),
+            Err(_) => break,
+        }
+    }
+    let _ = std::fs::remove_file(&tmp);
+    Ok(())
 }
 
 // ============================================================
@@ -902,6 +1231,9 @@ pub(crate) struct Labels {
     global_review_help: &'static str,
     global_allow: &'static str,
     global_allow_help: &'static str,
+    content_indexing: &'static str,
+    content_indexing_help: &'static str,
+    content_indexing_note: &'static str,
     restore: &'static str,
     restore_help: &'static str,
     // ---- Statistics 页 ----
@@ -936,6 +1268,9 @@ const LABELS_EN: Labels = Labels {
     global_review_help: "search_everywhere works, but is marked as needing user confirmation: the MCP client shows a permission prompt before calling it. Nothing is modified on disk either way — the call only reads the index.",
     global_allow: "Allow",
     global_allow_help: "search_everywhere works directly without a confirmation prompt: it searches all indexed locations by file name and returns full paths.",
+    content_indexing: "Enable content indexing",
+    content_indexing_help: "Everything 1.5 moved this switch to the Advanced page (Tools > Options > Advanced: content_indexing_enabled). Ticking this applies it directly: on folders configured to index file content, grep and content: searches become possible. Only folders with 'Index file content' enabled are covered; the first enable may start a reindex, and a restart may be required on some builds.",
+    content_indexing_note: "Advanced setting: content_indexing_enabled (a restart may be required)",
     restore: "Restore Defaults",
     restore_help: "Reset to 127.0.0.1:8285 with the server disabled and global search set to Deny.",
     stats_page_name: "MCP Server Statistics",
@@ -969,6 +1304,9 @@ const LABELS_ZH: Labels = Labels {
     global_review_help: "search_everywhere 可用，但被标注为「需用户确认」：MCP 客户端在调用前先弹权限确认框。无论是否放行都不会改动磁盘 —— 调用只读索引。",
     global_allow: "允许",
     global_allow_help: "search_everywhere 直接可用，不再弹确认框：按文件名搜索全部已索引位置，返回完整路径。",
+    content_indexing: "启用内容索引",
+    content_indexing_help: "新版 Everything 把这个开关移到了「高级」页（工具 → 选项 → 高级：content_indexing_enabled）。勾选后本页直接应用：对已配置「索引文件内容」的文件夹，grep 与 content: 搜索才可用。只覆盖勾选了「索引文件内容」的文件夹；首次开启可能触发重建索引，部分版本需重启 Everything 生效。",
+    content_indexing_note: "对应高级页设置 content_indexing_enabled（可能需重启生效）",
     restore: "恢复默认",
     restore_help: "恢复为 127.0.0.1:8285、不启用服务、全局搜索为「拒绝」。",
     stats_page_name: "MCP 服务器统计",
@@ -1045,4 +1383,67 @@ pub(crate) fn cstr_bytes(s: &str) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     // Statistics 页的测试随实现迁到了 stats_page.rs。
+
+    use super::*;
+
+    #[test]
+    fn core_ini_finds_value_only_inside_everything_section() {
+        let content = "[Everything]\r\ncontent_indexing_enabled=1\r\nother=2\r\n[Plugins]\r\ncontent_indexing_enabled=0\r\n";
+        assert_eq!(
+            find_core_value(content, "content_indexing_enabled"),
+            Some("1".into())
+        );
+        // 大小写不敏感
+        assert_eq!(
+            find_core_value(content, "CONTENT_INDEXING_ENABLED"),
+            Some("1".into())
+        );
+        // 段外的同名键不算
+        let without = "[Other]\r\ncontent_indexing_enabled=1\r\n";
+        assert_eq!(find_core_value(without, "content_indexing_enabled"), None);
+    }
+
+    #[test]
+    fn core_ini_replaces_value_preserving_rest() {
+        let content =
+            "; comment\r\n[Everything]\r\nfoo=1\r\ncontent_indexing_enabled=0\r\nbar=2\r\n";
+        let out = set_core_value(content, "content_indexing_enabled", "1");
+        assert!(out.contains("content_indexing_enabled=1"));
+        assert!(out.contains("foo=1") && out.contains("bar=2"));
+        assert!(out.contains("; comment"));
+        assert!(!out.contains("content_indexing_enabled=0"));
+    }
+
+    #[test]
+    fn core_ini_inserts_after_section_header_when_missing() {
+        let content = "[Everything]\r\nfoo=1\r\n[Other]\r\nbar=2\r\n";
+        let out = set_core_value(content, "content_indexing_enabled", "1");
+        let pos_key = out.find("content_indexing_enabled=1").expect("key 应被插入");
+        let pos_other = out.find("[Other]").unwrap();
+        assert!(pos_key < pos_other, "必须插在 [Everything] 段内: {out}");
+        assert!(out.contains("foo=1"));
+        // 没有 [Everything] 段时补一个
+        let out2 = set_core_value("foo=1\r\n", "content_indexing_enabled", "0");
+        assert!(out2.starts_with("[Everything]\r\ncontent_indexing_enabled=0"));
+        assert!(out2.contains("foo=1"));
+    }
+
+    #[test]
+    fn core_ini_roundtrips_utf16le() {
+        let mut bytes = vec![0xFF, 0xFE];
+        for unit in "[Everything]\r\ncontent_indexing_enabled=0\r\n".encode_utf16() {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        let (content, enc) = decode_core_ini(&bytes).unwrap();
+        assert_eq!(enc, IniEncoding::Utf16Le);
+        let updated = set_core_value(&content, "content_indexing_enabled", "1");
+        let out = encode_core_ini(&updated, enc);
+        assert_eq!(&out[..2], &[0xFF, 0xFE], "保留 BOM");
+        let (again, enc2) = decode_core_ini(&out).unwrap();
+        assert_eq!(enc2, IniEncoding::Utf16Le);
+        assert_eq!(
+            find_core_value(&again, "content_indexing_enabled"),
+            Some("1".into())
+        );
+    }
 }

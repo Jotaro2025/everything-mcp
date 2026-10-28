@@ -240,12 +240,19 @@ when absent):
 | `mcp_bind`     | string | `127.0.0.1`   | Bind address (localhost only)  |
 | `mcp_global_search` | int | `0`     | Global-search mode: `0` deny (default — `search_everywhere` calls return `GLOBAL_SEARCH_DISABLED`) / `1` review (usable, but the tool is annotated as needing user confirmation, so the client prompts first) / `2` allow (served directly, no prompt) |
 
+The options page also exposes an "Enable content indexing" checkbox for
+Everything's core setting `content_indexing_enabled` (newer Everything builds
+moved it to the Advanced page). Ticking it applies the value via the official
+`-add-config` command line; it only covers folders configured to index file
+content, the first enable may start a reindex, and a restart may be required on
+some builds.
+
 Settings live in `%APPDATA%\Everything\Plugins.ini`, in this plugin's own
 section `[everything_mcp64.dll]` (`[everything_mcp32.dll]` on 32-bit) — not in
 Everything's `Settings.ini`, and not shared with the official http_server
 plugin's section. They can also be edited in Everything's options dialog under
-Plugins → MCP (enable switch, bind address, port, global-search mode, restore
-defaults); clicking
+Plugins → MCP (enable switch, bind address, port, global-search mode, content
+indexing, restore defaults); clicking
 Apply takes effect immediately — no Everything restart needed.
 
 ### Connecting an MCP client

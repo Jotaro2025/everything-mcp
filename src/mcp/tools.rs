@@ -498,6 +498,13 @@ fn tool_server_diagnostics(_args: &Value) -> Result<ToolOutput, (i32, String)> {
                 "search_everywhere is served; 'review' additionally relies on the client honoring the tool annotations"
             },
         },
+        "content_indexing": {
+            // 只读回显：设置页的「启用内容索引」开关读写的就是这个核心设置。
+            // 读不到（ini 缺失/键缺失）时为 null —— 设置页会按未勾选显示。
+            "enabled": crate::options::content_indexing_enabled(),
+            "setting": "content_indexing_enabled",
+            "note": "Everything core setting (Advanced page in newer builds). Only folders with 'Index file content' enabled are covered.",
+        },
         "index_changes_prerequisite": {
             "journal_log_directory": journal_dir_str,
             "journal_log_directory_exists": journal_dir_exists,
