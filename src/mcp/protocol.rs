@@ -374,10 +374,10 @@ fn search_everywhere_entry(mode: GlobalSearchMode) -> Value {
                 },
                 "timeout_ms": {
                     "type": "integer",
-                    "description": "Maximum time in milliseconds to wait for results (1..4294967295, default 10000).",
+                    "description": "Maximum time in milliseconds to wait for results (1..300000, default 10000).",
                     "default": 10000,
                     "minimum": 1,
-                    "maximum": 4294967295u64
+                    "maximum": 300000u64
                 }
             },
             "required": ["pattern"]
@@ -480,10 +480,10 @@ fn build_tools_list(mode: GlobalSearchMode) -> Value {
                         },
                         "timeout_ms": {
                             "type": "integer",
-                            "description": "Maximum time in milliseconds to wait for results (1..4294967295, default 10000).",
+                            "description": "Maximum time in milliseconds to wait for results (1..300000, default 10000).",
                             "default": 10000,
                             "minimum": 1,
-                            "maximum": 4294967295u64
+                            "maximum": 300000u64
                         }
                     },
                     "required": ["folder", "pattern"]
@@ -515,10 +515,10 @@ fn build_tools_list(mode: GlobalSearchMode) -> Value {
                         },
                         "timeout_ms": {
                             "type": "integer",
-                            "description": "Maximum time in milliseconds to wait for results (1..4294967295, default 10000). Raise it for a folder on a slow or offline network share.",
+                            "description": "Maximum time in milliseconds to wait for results (1..300000, default 10000). Raise it for a folder on a slow or offline network share.",
                             "default": 10000,
                             "minimum": 1,
-                            "maximum": 4294967295u64
+                            "maximum": 300000u64
                         }
                     },
                     "required": ["folder"]
@@ -651,10 +651,10 @@ fn build_tools_list(mode: GlobalSearchMode) -> Value {
                         },
                         "timeout_ms": {
                             "type": "integer",
-                            "description": "Maximum time in milliseconds to wait for the Everything candidate query (1..4294967295, default 10000). Reading the candidates afterwards is not covered by it.",
+                            "description": "Maximum time in milliseconds to wait for the Everything candidate query (1..300000, default 10000). Reading the candidates afterwards is not covered by it.",
                             "default": 10000,
                             "minimum": 1,
-                            "maximum": 4294967295u64
+                            "maximum": 300000u64
                         }
                     },
                     "required": ["pattern", "folder"]

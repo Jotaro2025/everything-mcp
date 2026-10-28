@@ -90,7 +90,13 @@ pub unsafe fn ensure_query() -> Result<DbQueryHandle, String> {
     };
 
     let create = host.db_query_create.ok_or("db_query_create null")?;
-    let query = create(db, super::search::query_event_proc, core::ptr::null_mut());
+    // user_data 传归属标记：宿主会原样回传给事件回调，用于观测/将来过滤
+    // 外来查询的完成事件（见 search::QUERY_USER_DATA_TAG 的文档）。
+    let query = create(
+        db,
+        super::search::query_event_proc,
+        super::search::QUERY_USER_DATA_TAG as *mut core::ffi::c_void,
+    );
     if query.is_null() {
         return Err("db_query_create returned NULL".to_string());
     }

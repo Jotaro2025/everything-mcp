@@ -203,7 +203,14 @@ fn usize_arg(
     Ok(v as usize)
 }
 
-/// 取 `timeout_ms`：必须是能装进 u32 的正整数。
+/// `timeout_ms` 的服务端上限（2026-10 审计遗留项收口）。
+///
+/// 一次搜索在等待期间持有全局 `HOST_LOCK` 与共享 query 对象的使用权 ——
+/// 客户端传 49 天就能把整个搜索子系统锁到进程重启（默认值只有 10 秒）。
+/// 300 秒对本地索引的查询绰绰有余，同时给锁的占用封顶。
+pub const MAX_TIMEOUT_MS: u32 = 300_000;
+
+/// 取 `timeout_ms`：必须是 1..=MAX_TIMEOUT_MS 的整数。
 ///
 /// 原先三处都是 `u64_arg(...)? as u32` —— 传 4294967296（2^32）截断成 0，
 /// 等待循环一次都不跑，调用方拿到 "search timeout after 0 ms" 这种毫无线索的
@@ -211,13 +218,12 @@ fn usize_arg(
 /// exclude 的重复反斜杠是同一类毛病，一律改成带范围的显式校验。
 fn timeout_arg(args: &Value, default: u32) -> Result<u32, (i32, String)> {
     let v = u64_arg(args, "timeout_ms", default as u64)?;
-    if v == 0 || v > u32::MAX as u64 {
+    if v == 0 || v > MAX_TIMEOUT_MS as u64 {
         return Err((
             INVALID_PARAMS,
             format!(
-                "'timeout_ms' must be between 1 and {}; received {}",
-                u32::MAX,
-                v
+                "'timeout_ms' must be between 1 and {}; received {} (the cap keeps one search from holding the shared Everything query lock indefinitely)",
+                MAX_TIMEOUT_MS, v
             ),
         ));
     }
@@ -1229,15 +1235,22 @@ mod tests {
         // 缺省走默认值。
         assert_eq!(timeout_arg(&json!({}), 10_000).unwrap(), 10_000);
         assert_eq!(timeout_arg(&json!({ "timeout_ms": null }), 7).unwrap(), 7);
-        // 正常值原样通过。
+        // 正常值原样通过；服务端上限本身可用。
         assert_eq!(timeout_arg(&json!({ "timeout_ms": 30_000 }), 1).unwrap(), 30_000);
         assert_eq!(
-            timeout_arg(&json!({ "timeout_ms": u32::MAX }), 1).unwrap(),
-            u32::MAX
+            timeout_arg(&json!({ "timeout_ms": MAX_TIMEOUT_MS }), 1).unwrap(),
+            MAX_TIMEOUT_MS
         );
         // 2^32 原先 `as u32` 截成 0 → 等待循环一次不跑 → "search timeout after 0 ms"。
-        // 0 等价于立刻放弃，同样按写错处理。
-        for bad in [0u64, 1u64 << 32, u64::MAX] {
+        // 0 等价于立刻放弃，同样按写错处理；超过服务端上限同样拒绝
+        // （防止单次搜索长期占住共享查询锁）。
+        for bad in [
+            0u64,
+            MAX_TIMEOUT_MS as u64 + 1,
+            u32::MAX as u64,
+            1u64 << 32,
+            u64::MAX,
+        ] {
             let e = timeout_arg(&json!({ "timeout_ms": bad }), 1).unwrap_err();
             assert_eq!(e.0, INVALID_PARAMS, "timeout_ms={bad}");
             assert!(e.1.contains("timeout_ms"), "{}", e.1);

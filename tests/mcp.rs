@@ -98,7 +98,7 @@ fn tools_list_contains_eight_tools_with_required_params() {
     assert_eq!(search["inputSchema"]["properties"]["timeout_ms"]["minimum"], 1);
     assert_eq!(
         search["inputSchema"]["properties"]["timeout_ms"]["maximum"],
-        4294967295u64
+        tools::MAX_TIMEOUT_MS as u64
     );
 
     // 排序 / 分页 / 匹配开关：全部可选，且带默认值。
@@ -151,7 +151,7 @@ fn tools_list_contains_eight_tools_with_required_params() {
     assert_eq!(grep_props["case_insensitive"]["default"], false);
     assert_eq!(grep_props["timeout_ms"]["default"], 10_000);
     assert_eq!(grep_props["timeout_ms"]["minimum"], 1);
-    assert_eq!(grep_props["timeout_ms"]["maximum"], 4294967295u64);
+    assert_eq!(grep_props["timeout_ms"]["maximum"], tools::MAX_TIMEOUT_MS as u64);
 
     // search_everywhere：只要求 pattern；max_results 与另外两个搜索工具同一套硬窗口。
     assert_eq!(tools[6]["inputSchema"]["required"], json!(["pattern"]));
@@ -162,7 +162,7 @@ fn tools_list_contains_eight_tools_with_required_params() {
     assert_eq!(global_props["offset"]["default"], 0);
     assert_eq!(global_props["timeout_ms"]["default"], 10_000);
     assert_eq!(global_props["timeout_ms"]["minimum"], 1);
-    assert_eq!(global_props["timeout_ms"]["maximum"], 4294967295u64);
+    assert_eq!(global_props["timeout_ms"]["maximum"], tools::MAX_TIMEOUT_MS as u64);
     assert_eq!(global_props["sort"]["default"], "name");
     assert_eq!(
         global_props["sort"]["enum"],
@@ -716,7 +716,7 @@ fn list_folder_description_documents_zero_folder_size() {
     // 超时也要可调，与另外三个搜索类工具对齐（原先写死 10 秒）。
     assert_eq!(schema["properties"]["timeout_ms"]["default"], 10000);
     assert_eq!(schema["properties"]["timeout_ms"]["minimum"], 1);
-    assert_eq!(schema["properties"]["timeout_ms"]["maximum"], 4294967295u64);
+    assert_eq!(schema["properties"]["timeout_ms"]["maximum"], tools::MAX_TIMEOUT_MS as u64);
     assert!(desc.contains("timeout_ms"), "desc: {desc}");
 }
 
@@ -748,7 +748,8 @@ fn result_window_is_validated_identically_across_the_three_search_tools() {
 
 #[test]
 fn timeout_ms_is_validated_identically_across_the_four_search_tools() {
-    // 四个搜索类工具的 timeout_ms 共用 tools.rs 的 timeout_arg：0 与 > u32::MAX
+    // 四个搜索类工具的 timeout_ms 共用 tools.rs 的 timeout_arg：0 与服务端
+    // 上限（MAX_TIMEOUT_MS = 300s，防止单次搜索长期占住共享查询锁）之外的值
     // 都按写错处理，返回带范围的 INVALID_PARAMS。
     //
     // 这条不变式曾被 search_everywhere 打破 —— 它写的是 `u64_arg(...)? as u32`，
@@ -764,7 +765,12 @@ fn timeout_ms_is_validated_identically_across_the_four_search_tools() {
         ("search_everywhere", json!({"pattern": "ab"})),
     ];
     for (tool, base) in cases {
-        for bad in [0u64, 1u64 << 32, u64::MAX] {
+        for bad in [
+            0u64,
+            tools::MAX_TIMEOUT_MS as u64 + 1,
+            1u64 << 32,
+            u64::MAX,
+        ] {
             let mut args = base.clone();
             args["timeout_ms"] = json!(bad);
             let err = tools::dispatch(tool, &args).unwrap_err();

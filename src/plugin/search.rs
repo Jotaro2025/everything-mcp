@@ -36,6 +36,16 @@ type Handle = *mut c_void;
 use super::ffi_types::*;
 use super::host::Host;
 
+/// 事件回调的归属标记 —— 创建 query 对象时作为 `user_data` 传给宿主，
+/// 宿主在回调里原样回传。
+///
+/// 2026-10 审计遗留项（事件归属无法区分）的**埋点**方案：当前只在
+/// `query_event_proc` 里把 `user_data` 与等待状态一起落盘到 plugin.log。
+/// 等实机数据确认「外来事件的 user_data 确实不等于本标记」后，再把它
+/// 升级成过滤器（`user_data != TAG` 直接忽略）—— 在那之前直接过滤有
+/// 让所有搜索超时的风险（宿主行为与 SDK 契约不符时），所以只观测。
+pub const QUERY_USER_DATA_TAG: usize = 0xE7C0_5CA1;
+
 /// 主程序查询事件的 Rust 入口 —— 由主程序在查询完成时回调。
 ///
 /// **注意**：这个 event_proc 会收到*所有*查询的完成事件，包括主程序 UI 自己
@@ -44,18 +54,40 @@ use super::host::Host;
 /// 否则会被无关事件提前唤醒、读到空结果（etp_server.c 用 `c->is_query`
 /// 做同样的过滤）。
 ///
+/// **埋点**（不影响行为）：只在两类「可能影响正确性」的事件上写日志 ——
+/// 等待窗口内到达的事件（可能是外来事件，会误唤醒）与我们自己的迟到事件
+/// （`user_data` 命中标记但已不在等待，可能污染下一次等待）。日志形态：
+/// `query_event: evtype=... user_data=0x... ours=true|false submitted=true|false`
+/// 收集一段时间后即可判断能否用 user_data 做归属过滤。
+///
 /// # Safety
-/// `user_data` 目前未使用；我们通过 `EVENT_SLOT` 全局槽位传递事件句柄。
-pub unsafe extern "system" fn query_event_proc(_user_data: *mut core::ffi::c_void, evtype: i32) {
-    if evtype == db_event::QUERY_COMPLETE || evtype == db_event::SORT_COMPLETE {
-        // 只有「我们已提交查询且正在等待」时才响应。
-        if !QUERY_SUBMITTED.load(Ordering::SeqCst) {
-            return;
-        }
-        // 通知等待方：查询完成。锁内读句柄并 SetEvent —— 与等待方的
-        // 「取走 + 关闭」互斥，见 EventSlot 文档。
-        EventSlot::signal();
+/// `user_data` 由宿主原样回传，只做数值比较；事件句柄通过 `EVENT_SLOT` 传递。
+pub unsafe extern "system" fn query_event_proc(user_data: *mut core::ffi::c_void, evtype: i32) {
+    if evtype != db_event::QUERY_COMPLETE && evtype != db_event::SORT_COMPLETE {
+        return;
     }
+    let submitted = QUERY_SUBMITTED.load(Ordering::SeqCst);
+    let ours = user_data as usize == QUERY_USER_DATA_TAG;
+    if submitted || ours {
+        super::diag::write(&format!(
+            "query_event: evtype={} user_data=0x{:x} ours={} submitted={}",
+            if evtype == db_event::QUERY_COMPLETE {
+                "QUERY_COMPLETE"
+            } else {
+                "SORT_COMPLETE"
+            },
+            user_data as usize,
+            ours,
+            submitted
+        ));
+    }
+    // 只有「我们已提交查询且正在等待」时才响应。
+    if !submitted {
+        return;
+    }
+    // 通知等待方：查询完成。锁内读句柄并 SetEvent —— 与等待方的
+    // 「取走 + 关闭」互斥，见 EventSlot 文档。
+    EventSlot::signal();
 }
 
 /// 「当前有一次由本插件提交、尚未读完结果的查询」标志。
