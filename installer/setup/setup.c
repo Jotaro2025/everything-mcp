@@ -174,6 +174,7 @@ static int setup_browse_for_folder(wchar_t* everything_exe_filename_wbuf)
 {
 	BROWSEINFOW bi;
 	ITEMIDLIST* iil;
+	wchar_t display_name[SETUP_MAX_STRING];
 	int ret;
 
 	ret = 0;
@@ -183,8 +184,8 @@ static int setup_browse_for_folder(wchar_t* everything_exe_filename_wbuf)
 	// BIF_NEWDIALOGSTYLE allows computer to be selected, and keeps the OK button focused which keeps the dialog focused. Otherwise keyboard focus is lost
 	ZeroMemory(&bi, sizeof(BROWSEINFOW));
 	bi.lpszTitle = L"Select Everything.exe Location";
-	bi.pszDisplayName = L"";
-	bi.ulFlags = BIF_USENEWUI | BIF_NOTRANSLATETARGETS | BIF_NEWDIALOGSTYLE;
+	bi.pszDisplayName = display_name;
+	bi.ulFlags = BIF_USENEWUI | BIF_NOTRANSLATETARGETS | BIF_NEWDIALOGSTYLE | BIF_RETURNONLYFSDIRS;
 	bi.hwndOwner = NULL;
 
 	iil = (ITEMIDLIST*)SHBrowseForFolderW(&bi);
@@ -197,6 +198,33 @@ static int setup_browse_for_folder(wchar_t* everything_exe_filename_wbuf)
 		}
 
 		ILFree(iil);
+
+		if (ret)
+		{
+			DWORD length;
+			DWORD attributes;
+			const wchar_t* separator;
+
+			// The picker returns a directory, but CreateProcessW needs an executable.
+			length = lstrlenW(everything_exe_filename_wbuf);
+			separator = (length && everything_exe_filename_wbuf[length - 1] == L'\\') ? L"" : L"\\";
+			if (length + lstrlenW(separator) + lstrlenW(L"Everything.exe") >= SETUP_MAX_STRING)
+			{
+				setup_fatal(ERROR_FILENAME_EXCED_RANGE, "Selected Everything path is too long.");
+			}
+
+			setup_cat_wstring(everything_exe_filename_wbuf, SETUP_MAX_STRING, separator);
+			setup_cat_wstring(everything_exe_filename_wbuf, SETUP_MAX_STRING, L"Everything.exe");
+			attributes = GetFileAttributesW(everything_exe_filename_wbuf);
+			if (attributes == INVALID_FILE_ATTRIBUTES)
+			{
+				setup_fatal(GetLastError(), "Unable to access Everything.exe in the selected folder.");
+			}
+			if (attributes & FILE_ATTRIBUTE_DIRECTORY)
+			{
+				setup_fatal(ERROR_FILE_NOT_FOUND, "Everything.exe in the selected folder is not a file.");
+			}
+		}
 	}
 	else
 	{

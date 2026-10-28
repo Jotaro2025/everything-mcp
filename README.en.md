@@ -186,8 +186,8 @@ Outputs (in `installer\dist\`):
 
 | Installer                            | Arch | Embedded plugin dll   |
 | ------------------------------------ | ---- | --------------------- |
-| `everything-mcp-1.1.7-x64-setup.exe` | x64  | `everything_mcp64.dll` |
-| `everything-mcp-1.1.7-x86-setup.exe` | x86  | `everything_mcp32.dll` |
+| `everything-mcp-1.3.1-x64-setup.exe` | x64  | `everything_mcp64.dll` |
+| `everything-mcp-1.3.1-x86-setup.exe` | x86  | `everything_mcp32.dll` |
 
 To install, run the installer for your architecture; Everything then shows its
 "Setup Plugin" dialog, where you click Install. Both installers can be
@@ -272,6 +272,45 @@ plugin is enabled (the Plugins → MCP page in Everything's options dialog, or
 `%APPDATA%\Everything\Plugins.ini`).
 
 Once connected, the LLM discovers **eight** tools automatically:
+
+#### High-frequency search-syntax cheat sheet
+
+`search_in_folder` / `count`'s `pattern`, `grep`'s `filter`, and `search_everywhere`'s `pattern` all use **Everything search syntax** (not shell glob, not Rust regex). Only the everyday operators are listed here — do not paste the full Everything syntax dump into a chat.
+
+| Syntax | Meaning |
+| --- | --- |
+| `foo bar` | Space = **AND** |
+| `foo\|bar` | `\|` = **OR** |
+| `!foo` | `!` = **NOT** (exclude) |
+| `<a\|b> c` | `<>` grouping |
+| `"exact phrase"` | Quotes: exact phrase / escaping |
+
+Common functions:
+
+| Function | Meaning | Notes |
+| --- | --- | --- |
+| `ext:rs;toml` | Extension(s) | Separate multiple with `;` |
+| `dm:lastweek` | Date modified | Also `today` / `thismonth`, … |
+| `size:>1mb` | Size | |
+| `content:"fn main"` | Content search | **Folder-scoped only** (`search_in_folder`); see below |
+
+The `exclude` parameter (string or array of strings) is appended as `!…` terms: e.g. `exclude: ["\\obj\\", "\\.git\\"]` is the same as writing `!\\obj\\ !\\.git\\` in the pattern.
+
+Remember:
+
+- **Not shell glob**: write `*.rs`, not `**/*.rs` (the folder scope already restricts the tree).
+- **`search_everywhere` rejects `content:`** in both `pattern` and `exclude` — use `search_in_folder` for content search.
+- **`grep.filter` uses this syntax; `grep.pattern` is a Rust regex** (matched per line) — do not mix them up.
+
+Practical examples:
+
+```
+ext:rs !\target\
+ext:md;txt "getting started"
+dm:lastweek size:>100kb
+ext:rs content:"db_query"
+*.cs !\obj\ !\.git\
+```
 
 #### 1. `search_in_folder`
 
@@ -756,7 +795,7 @@ this endpoint speaks.
 | HTTP status | JSON-RPC code | Meaning and fix |
 | --- | --- | --- |
 | 200 | — | Normal response |
-| 202 | — | Modern notification accepted (the spec requires an empty body) |
+| 202 | — | Notification accepted in both protocol eras (empty body required by the spec) |
 | 400 | `-32020` | `MCP-Protocol-Version` header and `_meta` version disagree — make both the same value |
 | 400 | `-32022` | Requested protocol version not supported — retry with a version from `data.supported` |
 | 403 | `-32600` | Request carried a non-localhost `Origin` header (a browser page was blocked) — use a local client instead |
@@ -774,7 +813,7 @@ request declares, so both client generations work:
 
 | Client era              | How the version is declared                                            | Behavior                                                                 |
 | ----------------------- | ---------------------------------------------------------------------- | ------------------------------------------------------------------------ |
-| legacy (2024-11-05)     | `initialize` handshake, or no version information at all               | 200 + JSON-RPC response; unknown methods 200 + `-32601`; notifications get an `id: null` ack |
+| legacy (2024-11-05)     | `initialize` handshake, or no version information at all               | 200 + JSON-RPC response; unknown methods 200 + `-32601`; notifications 202 with empty body |
 | modern (2026-07-28)     | `MCP-Protocol-Version` request header + `io.modelcontextprotocol/protocolVersion` in `_meta` | `server/discover` available; unknown methods 404; notifications 202 with empty body; header/body mismatch `-32020`; unsupported version 400 + `-32022` (`data.supported` lists the usable versions) |
 
 **`resultType` (2026-07-28):** every modern-era response result carries

@@ -899,11 +899,25 @@ fn dispatch_tools_list_returns_eight_tools() {
 }
 
 #[test]
-fn dispatch_notification_gets_empty_body() {
-    // 通知 MUST NOT 回响应体（JSON-RPC 2.0）—— 返回 202 空体。
-    // （旧实现回 {"jsonrpc":"2.0","id":null}，2026-10 审计修正。）
-    let out = server::dispatch_rpc(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#);
-    assert_eq!(out, "");
+fn legacy_notifications_are_202_with_empty_body() {
+    // Codex 会将 200 + {jsonrpc, id:null} 当作 JSON-RPC 响应解析并断开握手。
+    for version in [None, Some("2024-11-05")] {
+        let head = server::RequestHead {
+            protocol_version: version.map(str::to_owned),
+            ..Default::default()
+        };
+        for method in [
+            "notifications/initialized",
+            "notifications/cancelled",
+            "notifications/unknown",
+        ] {
+            let body = json!({"jsonrpc": "2.0", "method": method}).to_string();
+            assert_eq!(
+                server::dispatch_rpc_http(&body, &head),
+                (202, String::new())
+            );
+        }
+    }
 }
 
 #[test]
@@ -1887,6 +1901,25 @@ fn end_to_end_over_real_tcp() {
     assert!(head.starts_with("HTTP/1.1 200"), "{}", head);
     let resp: Value = serde_json::from_str(&body).unwrap();
     assert_eq!(resp["result"]["protocolVersion"], "2024-11-05");
+
+    // 完整复现 Codex 的 legacy 握手：initialize → initialized → tools/list。
+    let (head, body) = http_post(
+        port,
+        r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+        &[("MCP-Protocol-Version", "2024-11-05")],
+    );
+    assert!(head.starts_with("HTTP/1.1 202"), "{}", head);
+    assert!(head.contains("Content-Length: 0"), "{}", head);
+    assert!(body.is_empty(), "{}", body);
+    let (head, body) = http_post(
+        port,
+        r#"{"jsonrpc":"2.0","id":7,"method":"tools/list"}"#,
+        &[("MCP-Protocol-Version", "2024-11-05")],
+    );
+    assert!(head.starts_with("HTTP/1.1 200"), "{}", head);
+    let resp: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(resp["id"], 7);
+    assert_eq!(resp["result"]["tools"].as_array().unwrap().len(), 8);
 
     // modern discover：不握手，_meta 带版本。
     let (head, body) = http_post(

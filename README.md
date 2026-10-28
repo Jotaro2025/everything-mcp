@@ -170,8 +170,8 @@ powershell -ExecutionPolicy Bypass -File build-installers.ps1
 
 | 安装包                              | 架构 | 内嵌插件 dll           |
 | ----------------------------------- | ---- | ---------------------- |
-| `everything-mcp-1.1.7-x64-setup.exe` | x64  | `everything_mcp64.dll` |
-| `everything-mcp-1.1.7-x86-setup.exe` | x86  | `everything_mcp32.dll` |
+| `everything-mcp-1.3.1-x64-setup.exe` | x64  | `everything_mcp64.dll` |
+| `everything-mcp-1.3.1-x86-setup.exe` | x86  | `everything_mcp32.dll` |
 
 安装：运行对应架构的安装包 → Everything 弹出「设置插件」对话框 → 点「安装」。
 两个安装包可以一起分发，`Plugins\` 下 `everything_mcp64.dll` 与
@@ -245,6 +245,45 @@ Everything 官方插件页：<https://www.voidtools.com/support/everything/plugi
 `mcp_enabled=1`）。
 
 接入后 LLM 会自动发现以下**八个**工具：
+
+#### 高频搜索语法速查
+
+`search_in_folder` / `count` 的 `pattern`、`grep` 的 `filter`、`search_everywhere` 的 `pattern` 都走 **Everything 搜索语法**（不是 shell glob，也不是 Rust 正则）。下面只列日常最高频的几项；不要把完整语法手册贴进对话。
+
+| 写法 | 含义 |
+| --- | --- |
+| `foo bar` | 空格 = **AND**（同时匹配） |
+| `foo\|bar` | `\|` = **OR** |
+| `!foo` | `!` = **NOT**（排除） |
+| `<a\|b> c` | `<>` 分组 |
+| `"exact phrase"` | 双引号：精确短语 / 转义 |
+
+常用函数：
+
+| 函数 | 含义 | 备注 |
+| --- | --- | --- |
+| `ext:rs;toml` | 按后缀 | 多后缀用 `;` |
+| `dm:lastweek` | 修改日期 | 也可用 `today` / `thismonth` 等 |
+| `size:>1mb` | 按大小 | |
+| `content:"fn main"` | 正文检索 | **仅文件夹范围**（`search_in_folder`）；见下 |
+
+`exclude`（字符串或字符串数组）会被拼成 `!…` 接进搜索词：例如 `exclude: ["\\obj\\", "\\.git\\"]` 等价于在 pattern 里写 `!\\obj\\ !\\.git\\`。
+
+务必记住：
+
+- **不是 shell glob**：写 `*.rs`，不要写 `**/*.rs`（文件夹范围已经限定了目录树）。
+- **`search_everywhere` 拒绝 `content:`**（`pattern` 与 `exclude` 都不许带）——正文检索请用 `search_in_folder`。
+- **`grep.filter` 用本表语法；`grep.pattern` 是 Rust 正则**（逐行匹配），两者不要混。
+
+实用例子：
+
+```
+ext:rs !\target\
+ext:md;txt "getting started"
+dm:lastweek size:>100kb
+ext:rs content:"db_query"
+*.cs !\obj\ !\.git\
+```
 
 #### 1. `search_in_folder`
 
@@ -639,7 +678,7 @@ curl -X POST http://127.0.0.1:8285/ -H "Content-Type: application/json" -H "MCP-
 | HTTP 状态 | JSON-RPC 错误码 | 含义与处理 |
 | --- | --- | --- |
 | 200 | — | 正常响应 |
-| 202 | — | modern 通知已接受（规范要求空响应体） |
+| 202 | — | 通知已接受（两个协议时代均返回空响应体，规范要求） |
 | 400 | `-32020` | `MCP-Protocol-Version` 头与 `_meta` 里的版本不一致 —— 两侧改成同值 |
 | 400 | `-32022` | 请求的协议版本不支持 —— 按 `data.supported` 列出的版本重试 |
 | 403 | `-32600` | 请求带了非 localhost 的 `Origin` 头（浏览器页面被挡）—— 改用本机客户端访问 |
@@ -655,7 +694,7 @@ curl -X POST http://127.0.0.1:8285/ -H "Content-Type: application/json" -H "MCP-
 
 | 客户端形态             | 版本声明方式                                                       | 行为                                                                 |
 | ---------------------- | ------------------------------------------------------------------ | -------------------------------------------------------------------- |
-| legacy（2024-11-05）   | `initialize` 握手，或不带任何版本信息                              | 200 + JSON-RPC 响应；未知方法 200 + `-32601`；通知回 `id: null` 空响应 |
+| legacy（2024-11-05）   | `initialize` 握手，或不带任何版本信息                              | 200 + JSON-RPC 响应；未知方法 200 + `-32601`；通知 202 空体 |
 | modern（2026-07-28）   | `MCP-Protocol-Version` 请求头 + `_meta` 里的 `io.modelcontextprotocol/protocolVersion` | `server/discover` 可用；未知方法 404；通知 202 空体；头/体不一致 `-32020`；版本不支持 400 + `-32022`（`data.supported` 列出可用版本） |
 
 **`resultType`（2026-07-28）**：modern 时代的每个响应 result 都带
