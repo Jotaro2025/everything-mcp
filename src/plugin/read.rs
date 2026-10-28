@@ -290,19 +290,22 @@ fn binary_reason(raw: &[u8], path: &str) -> Option<&'static str> {
     }
     if raw.starts_with(&[0xFF, 0xFE]) || raw.starts_with(&[0xFE, 0xFF]) {
         // BOM 豁免本是为了放过真正的 UTF-16 文本（其单元里天然有 NUL）。
-        // 乱码率复查：把 BOM 后字节当 UTF-16 解出来，若大量单元不可打印，
-        // 说明它只是恰好以 FFFE/FEFF 开头的二进制（如 UTF-32/加密 blob），
-        // 不能豁免。阈值放宽到 50% —— 真 UTF-16 文本里 U+FFFD 只出现在
-        // 编码错误的文件，正常文本远低于此。
-        let units: Vec<u16> = raw
-            .iter()
-            .skip(2)
-            .copied()
-            .collect::<Vec<u8>>()
+        // 乱码率复查：把 BOM 后字节按**BOM 指定的字节序**解开，若大量
+        // 单元不可打印，说明它只是恰好以 FFFE/FEFF 开头的二进制
+        // （如 UTF-32/加密 blob），不能豁免。字节序必须跟着 BOM 走 ——
+        // 一律按 LE 解会把大端文本解成字节交换后的乱码，嗅探结果失真。
+        let little_endian = raw[0] == 0xFF;
+        let units: Vec<u16> = raw[2..]
             .as_chunks::<2>()
             .0
             .iter()
-            .map(|c| u16::from_le_bytes(*c))
+            .map(|c| {
+                if little_endian {
+                    u16::from_le_bytes(*c)
+                } else {
+                    u16::from_be_bytes(*c)
+                }
+            })
             .collect();
         let decoded = String::from_utf16_lossy(&units);
         if looks_binary(decoded.as_bytes()) {
@@ -427,12 +430,16 @@ pub(crate) fn clip_line(line: &str) -> (String, bool) {
 
 /// 供 grep 用：读文件并解码成文本，任何不可用的情况都返回 `None`（跳过该文件）。
 ///
+/// 返回值是 `(解码后的文本, 从磁盘读入的原始字节数)` —— grep 的 64 MiB
+/// 扫描预算按**原始字节**计：UTF-16 文件解码后长度约为原字节的一半，
+/// 按文本长度计账会把实际 I/O 放行到预算的两倍（2026-10 审计补漏）。
+///
 /// 与 [`read_file`] 的关键区别是**不报错**：grep 扫的是一批文件，二进制、
 /// 超大、读不了、命中黑名单的都应该只是跳过 —— 一个坏文件不该让整次搜索失败。
 ///
 /// 二进制判定与 `read_file` 同一套（扩展名硬表 + 内容嗅探），黑名单也一样 ——
 /// 而且黑名单在这里更要紧：grep 绝不能把 `.env` / 私钥的正文带出来。
-pub fn read_text_for_matching(path: &str) -> Option<String> {
+pub fn read_text_for_matching(path: &str) -> Option<(String, u64)> {
     if sensitive::is_sensitive_path(path) {
         return None;
     }
@@ -453,8 +460,9 @@ pub fn read_text_for_matching(path: &str) -> Option<String> {
     if binary_reason(&raw, path).is_some() {
         return None;
     }
+    let raw_len = raw.len() as u64;
     let (text, _) = decode_bytes(&raw);
-    Some(text)
+    Some((text, raw_len))
 }
 
 /// 对已读入内存的文件做「打开后复核」：`std::fs::read` 拿到字节后没有句柄
@@ -865,6 +873,21 @@ mod tests {
         assert!(looks_binary(&utf16), "原始字节确实有 NUL");
         assert_eq!(binary_reason(&utf16, "a.txt"), None, "带 BOM 要放行");
         assert_eq!(binary_reason(&[0xFE, 0xFF, 0x00, b'h'], "a.txt"), None);
+    }
+
+    #[test]
+    fn binary_reason_sniffs_utf16_be_with_correct_endianness() {
+        // FE FF + 重复 U+0001：按 BOM 指定的大端解码是控制字符（二进制）；
+        // 若误按小端解码，字节对 00 01 会变成 U+0100（可打印的 Ā），
+        // 嗅探就会把这份二进制放行 —— 字节序必须跟着 BOM 走。
+        let mut raw = vec![0xFE, 0xFF];
+        for _ in 0..100 {
+            raw.extend_from_slice(&[0x00, 0x01]);
+        }
+        assert_eq!(binary_reason(&raw, "a.txt"), Some("content"));
+        // 对照：同样的码位按可打印字符编码时嗅探必须放行 —— 证明上面的
+        // Some("content") 来自「控制字符」而非误判。
+        assert!(!looks_binary("\u{0100}".repeat(100).as_bytes()));
     }
 
     #[test]

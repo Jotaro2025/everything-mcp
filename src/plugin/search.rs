@@ -18,7 +18,8 @@
 //! **互斥**：调用 db_query_search 之前必须持有 HOST_LOCK，
 //! 因为 query 对象是全局唯一的 —— 不能并发提交两次查询。
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 
 // windows-sys 0.59 中：
 //   - HANDLE 是 *mut c_void
@@ -51,11 +52,9 @@ pub unsafe extern "system" fn query_event_proc(_user_data: *mut core::ffi::c_voi
         if !QUERY_SUBMITTED.load(Ordering::SeqCst) {
             return;
         }
-        // 通知等待方：查询完成。
-        let h = EventSlot::load();
-        if !h.is_null() {
-            unsafe { SetEvent(h) };
-        }
+        // 通知等待方：查询完成。锁内读句柄并 SetEvent —— 与等待方的
+        // 「取走 + 关闭」互斥，见 EventSlot 文档。
+        EventSlot::signal();
     }
 }
 
@@ -68,18 +67,40 @@ static QUERY_SUBMITTED: AtomicBool = AtomicBool::new(false);
 /// 全局事件句柄槽位。
 ///
 /// 约定：在持有 HOST_LOCK 的情况下设置 → 触发 search → 等待 → 清空。
+///
+/// 用 `Mutex<Option<Handle>>` 而不是裸 AtomicUsize（2026-10 审计补漏）：
+/// event_proc 在 Everything 主线程上跑、等待方在工作线程上跑，两者围绕
+/// 「读槽位 → SetEvent」与「清槽位 → CloseHandle」是四次独立操作 ——
+/// 原子槽位下 event_proc 可能先读到句柄、随后等待方关闭它，SetEvent
+/// 落在已关闭（甚至被系统复用给别的对象）的句柄上。互斥后 event_proc
+/// 的「读 + SetEvent」与等待方的「取走 + 关闭」不会交错：取值方把
+/// Option 掏空的动作排在 SetEvent 之后，关闭永远不会早于信号。
 struct EventSlot;
-static EVENT_SLOT: AtomicUsize = AtomicUsize::new(0);
+/// 句柄按 `usize` 存：裸指针不实现 Send，`Mutex<Option<Handle>>` 不能作
+/// static；锁内转换，语义不变（位模式保留，见 [`Handle`] 的别名注释）。
+static EVENT_SLOT: Mutex<Option<usize>> = Mutex::new(None);
 
 impl EventSlot {
     fn store(handle: Handle) {
-        EVENT_SLOT.store(handle as usize, Ordering::SeqCst);
+        *EVENT_SLOT.lock().unwrap_or_else(|p| p.into_inner()) = Some(handle as usize);
     }
-    fn clear() {
-        EVENT_SLOT.store(0, Ordering::SeqCst);
+    /// event_proc 用：在锁内对当前句柄 SetEvent（没有句柄时 no-op）。
+    fn signal() {
+        let guard = EVENT_SLOT.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(h) = *guard {
+            unsafe { SetEvent(h as Handle) };
+        }
     }
-    fn load() -> Handle {
-        EVENT_SLOT.load(Ordering::SeqCst) as Handle
+    /// 等待方用：先掏空槽位（锁内），再关闭句柄 —— 关闭必然发生在任何
+    /// 可能拿着该句柄的 signal() 之后。
+    fn take_and_close() {
+        let h = EVENT_SLOT
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
+        if let Some(h) = h {
+            unsafe { CloseHandle(h as Handle) };
+        }
     }
 }
 
@@ -451,8 +472,7 @@ fn submit_query(
     if let Some(e) = setup_err {
         // 查询未提交成功 —— 此时撤守卫是安全的。
         QUERY_SUBMITTED.store(false, Ordering::SeqCst);
-        EventSlot::clear();
-        unsafe { CloseHandle(event) };
+        EventSlot::take_and_close();
         return Err(e);
     }
 
@@ -487,8 +507,7 @@ fn submit_query(
         "submit_query: wait done signaled={} waited={}ms",
         signaled, waited
     ));
-    EventSlot::clear();
-    unsafe { CloseHandle(event) };
+    EventSlot::take_and_close();
 
     if !signaled {
         // 取消查询以免后续调用受影响 —— 主程序文档建议在放弃时调用。
@@ -1109,5 +1128,33 @@ mod tests {
         assert_eq!(o.sort, SortKey::Name);
         assert!(!o.descending);
         assert!(!o.match_case && !o.match_whole_word);
+    }
+
+    /// EventSlot 的互斥语义：signal 在锁内置位、take_and_close 先掏空再
+    /// 关闭，两次操作之间不存在「句柄已关闭但仍被 SetEvent」的窗口。
+    /// 这里验证行为契约（置位 → 取走关闭 → 之后 signal 是 no-op）。
+    #[test]
+    fn event_slot_signals_then_closes_without_stale_handle() {
+        let ev = unsafe {
+            CreateEventW(
+                core::ptr::null(),
+                1, // bManualReset = TRUE，便于用 0 超时观察是否已置位
+                0,
+                core::ptr::null(),
+            )
+        };
+        assert!(!ev.is_null(), "CreateEventW failed");
+
+        EventSlot::store(ev);
+        EventSlot::signal();
+        assert_eq!(
+            unsafe { WaitForSingleObject(ev, 0) },
+            WAIT_OBJECT_0,
+            "signal 应置位事件"
+        );
+
+        EventSlot::take_and_close();
+        // 槽位已空：再来信号是 no-op（不会去碰已关闭的句柄）。
+        EventSlot::signal();
     }
 }

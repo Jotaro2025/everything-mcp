@@ -266,11 +266,13 @@ fn scan_candidates(
             break;
         }
         // 二进制 / 超大 / 黑名单 / 读不了 —— 跳过这个文件，不中断整次搜索。
-        let Some(text) = read::read_text_for_matching(path) else {
+        let Some((text, raw_len)) = read::read_text_for_matching(path) else {
             continue;
         };
         files_scanned += 1;
-        bytes_scanned += text.len() as u64;
+        // 按**原始字节**计账（不是解码后长度）：64 MiB 的预算语义是
+        // 「从磁盘读了多少」，UTF-16 文件的解码文本只有原字节一半。
+        bytes_scanned += raw_len;
 
         let (file_hits, clipped, stopped) =
             scan_text(re, path, &text, mode, head_limit, &mut hits, &mut budget);
@@ -586,6 +588,39 @@ mod tests {
         assert_eq!(o.candidates, 7);
         assert!(!o.truncated);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 64 MiB 扫描预算按原始字节计账：UTF-16 解码后长度只有原字节一半，
+    /// 按文本长度计会把实际 I/O 放行到预算的两倍（2026-10 审计补漏）。
+    #[test]
+    fn bytes_scanned_counts_raw_bytes_not_decoded_length() {
+        let dir = std::env::temp_dir().join(format!("emcp_grep_utf16_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let text = "TODO 中文行\n";
+        let mut raw = vec![0xFF, 0xFE];
+        for unit in text.encode_utf16() {
+            raw.extend_from_slice(&unit.to_le_bytes());
+        }
+        let path = dir.join("utf16.txt");
+        std::fs::write(&path, &raw).unwrap();
+
+        let entries = vec![(path.to_string_lossy().into_owned(), false)];
+        let o = scan_candidates(
+            &build_re("TODO", false),
+            1,
+            false,
+            &entries,
+            OutputMode::Count,
+            200,
+        );
+        assert_eq!(o.files_scanned, 1);
+        assert_eq!(
+            o.bytes_scanned,
+            raw.len() as u64,
+            "预算应按原始字节计账（解码文本是 {} 字节）",
+            text.len()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
