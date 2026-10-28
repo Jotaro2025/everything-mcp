@@ -26,6 +26,71 @@ use windows_sys::Win32::Globalization::{MultiByteToWideChar, CP_ACP};
 
 use super::sensitive;
 
+// ====================================================================
+// 打开句柄后的真实路径复核
+// ====================================================================
+
+/// 打开文件句柄并取回它的最终（规范化）路径。
+///
+/// 黑名单匹配发生在 stat 之前（见三道闸门），但黑名单是对**调用方给的
+/// 字符串**判定的 —— 字符串拼写与 Win32 实际打开的文件之间还有符号链接、
+/// 挂载点、subst 盘这类重定向。这层复核在句柄已打开之后做：用
+/// `GetFinalPathNameByHandleW` 拿到内核解析后的真实路径，再过一遍黑名单。
+///
+/// 取不到最终路径（句柄在获取途中被关、网络盘不支持等）时返回 None，
+/// 调用方按 fail-closed 处理 —— 敏感拦截宁可错杀不可漏放。
+fn final_path_of(file: &std::fs::File) -> Option<String> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFinalPathNameByHandleW, FILE_NAME_NORMALIZED, VOLUME_NAME_DOS,
+    };
+    // 先探 buffer 大小，再分配调用一次。循环两次足够（路径不会在这
+    // 窗口里变长到第二次还装不下）。
+    for cap in [260usize, 1024, 4096] {
+        let mut buf = vec![0u16; cap];
+        let n = unsafe {
+            GetFinalPathNameByHandleW(
+                std::os::windows::io::AsRawHandle::as_raw_handle(file) as _,
+                buf.as_mut_ptr(),
+                cap as u32,
+                FILE_NAME_NORMALIZED | VOLUME_NAME_DOS,
+            )
+        };
+        if n == 0 {
+            return None;
+        }
+        if n < cap as u32 {
+            buf.truncate(n as usize);
+            return Some(String::from_utf16_lossy(&buf));
+        }
+    }
+    None
+}
+
+/// 对已打开句柄的真实路径做黑名单复核；命中时返回统一的拒绝错误。
+///
+/// `display_path` 是错误信息里回显的原始入参。fail-closed：复核阶段
+/// 出任何意外（拿不到最终路径）一律按命中处理。
+fn recheck_open_path(
+    file: &std::fs::File,
+    display_path: &str,
+) -> Result<(), ReadError> {
+    let final_path = final_path_of(file).ok_or_else(|| {
+        ReadError::at(
+            ERR_PATH_DENIED,
+            sensitive::denied_message(display_path),
+            display_path,
+        )
+    })?;
+    if sensitive::is_sensitive_path(&final_path) {
+        return Err(ReadError::at(
+            ERR_PATH_DENIED,
+            sensitive::denied_message(display_path),
+            display_path,
+        ));
+    }
+    Ok(())
+}
+
 /// 单次读取的字节上限。超过直接报错。
 pub const MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
 
@@ -224,6 +289,25 @@ fn binary_reason(raw: &[u8], path: &str) -> Option<&'static str> {
         }
     }
     if raw.starts_with(&[0xFF, 0xFE]) || raw.starts_with(&[0xFE, 0xFF]) {
+        // BOM 豁免本是为了放过真正的 UTF-16 文本（其单元里天然有 NUL）。
+        // 乱码率复查：把 BOM 后字节当 UTF-16 解出来，若大量单元不可打印，
+        // 说明它只是恰好以 FFFE/FEFF 开头的二进制（如 UTF-32/加密 blob），
+        // 不能豁免。阈值放宽到 50% —— 真 UTF-16 文本里 U+FFFD 只出现在
+        // 编码错误的文件，正常文本远低于此。
+        let units: Vec<u16> = raw
+            .iter()
+            .skip(2)
+            .copied()
+            .collect::<Vec<u8>>()
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| u16::from_le_bytes(*c))
+            .collect();
+        let decoded = String::from_utf16_lossy(&units);
+        if looks_binary(decoded.as_bytes()) {
+            return Some("content");
+        }
         return None;
     }
     looks_binary(raw).then_some("content")
@@ -357,11 +441,31 @@ pub fn read_text_for_matching(path: &str) -> Option<String> {
         return None;
     }
     let raw = std::fs::read(path).ok()?;
+    // stat 与 read 之间文件可能增长 —— 用实际字节数复核（TOCTOU）。
+    if raw.len() as u64 > MAX_FILE_BYTES {
+        return None;
+    }
+    // 与 read_file 同样的句柄级复核：grep 的候选路径来自 Everything 索引，
+    // 但索引与现实之间同样隔着符号链接/短名重定向。失败即跳过（None）。
+    if !handle_passes_denylist(path) {
+        return None;
+    }
     if binary_reason(&raw, path).is_some() {
         return None;
     }
     let (text, _) = decode_bytes(&raw);
     Some(text)
+}
+
+/// 对已读入内存的文件做「打开后复核」：`std::fs::read` 拿到字节后没有句柄
+/// 可查 —— 为保持与 read_file 相同的语义，这里用 `File::open` +
+/// `GetFinalPathNameByHandleW` 再过一遍黑名单。open 失败按 fail-closed
+/// 返回 false（文件已读进内存但无法证明它不是敏感路径，丢弃）。
+fn handle_passes_denylist(path: &str) -> bool {
+    let Ok(file) = std::fs::File::open(path) else {
+        return false;
+    };
+    recheck_open_path(&file, path).is_ok()
 }
 
 /// 按行窗口取出的正文。
@@ -494,6 +598,31 @@ pub fn read_file(
             &path,
         )
     })?;
+    // stat 与 read 之间文件可能增长（活跃日志）—— 用实际字节数复核上限，
+    // 不信任 stat 快照（TOCTOU）。
+    if raw.len() as u64 > MAX_FILE_BYTES {
+        return Err(ReadError::at(
+            ERR_TOO_LARGE,
+            format!(
+                "{:?} grew past read_file's {} byte limit while it was being read",
+                path, MAX_FILE_BYTES
+            ),
+            &path,
+        ));
+    }
+    // 句柄级黑名单复核：上面那层是对入参字符串的判定；符号链接、subst 盘、
+    // 8.3 短名这类重定向在这里才现出真实身份。fail-closed —— 拿不到真实
+    // 路径也拒。
+    {
+        let file = std::fs::File::open(&path).map_err(|e| {
+            ReadError::at(
+                ERR_READ_FAILED,
+                format!("cannot read {:?}: {}", path, e),
+                &path,
+            )
+        })?;
+        recheck_open_path(&file, &path)?;
+    }
     // 二进制在解码之前就判掉（按原始字节嗅探，比解码后再找 NUL 更准）。
     if let Some(reason) = binary_reason(&raw, &path) {
         return Err(ReadError::at(

@@ -468,6 +468,13 @@ fn submit_query(
         }
         if r == WAIT_TIMEOUT {
             waited += step;
+            // 停机感知：PM_STOP 正在 join 本线程（通过 HTTP 连接线程），
+            // 不能傻等到 timeout_ms —— 客户端可传 49 天。立即按超时收场
+            // （走下面的放弃路径，缓冲区会被泄漏而不是释放）。
+            if crate::mcp::server::shutting_down() {
+                waited = timeout_ms;
+                break;
+            }
             continue;
         }
         // 其他错误返回（WAIT_FAILED 等）：立即跳出
@@ -489,6 +496,10 @@ fn submit_query(
         // 对象归主线程所有），因此同样 marshal 过去，不能在本线程直接调。
         // 此刻仍持有 HOST_LOCK —— 主线程 wndproc 不取该锁，不会死锁。
         cancel_query(query);
+        // 关键：后台查询可能仍在读 search_string（cancel 可能不存在、
+        // 也无法证明已生效），缓冲区绝不能在这里 free —— 泄漏它。
+        // 见 LeakedBuf 的文档。查询对象本身由全局槽位复用，不动。
+        leaked.leak_forever();
         return Err(format!("search timeout after {} ms", timeout_ms));
     }
 
@@ -505,9 +516,22 @@ fn submit_query(
 ///
 /// db_query_search2 是异步的 —— 后台查询线程在整个查询期间都可能读取
 /// search_string 指针，因此提交方不能在调用返回后就释放它。这个守卫把
-/// 缓冲区保活到 CompletedQuery 析构（那时查询已完成、结果已复制，
-/// 或已取消），由 Drop 统一回收。
+/// 缓冲区保活到 CompletedQuery 析构（那时查询已完成、结果已复制），
+/// 由 Drop 统一回收。
+///
+/// **放弃路径（超时/取消）绝不能走 Drop**：`db_query_cancel` 可能不存在
+/// （宿主未导出），即便存在，返回也无法证明后台线程已停止读取指针。
+/// 提前 free 就是宿主进程内的 use-after-free。因此放弃时调用
+/// [`LeakedBuf::leak_forever`] 刻意泄漏 —— 每次超时最多泄一条搜索串
+/// （几个 KB），确定性的安全永远优先于理论上的回收。
 struct LeakedBuf(&'static mut [u8]);
+
+impl LeakedBuf {
+    /// 放弃查询时调用：让缓冲区活到进程结束，绝不归还分配器。
+    fn leak_forever(self) {
+        core::mem::forget(self);
+    }
+}
 
 impl Drop for LeakedBuf {
     fn drop(&mut self) {

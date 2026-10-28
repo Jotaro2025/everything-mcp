@@ -165,7 +165,7 @@ pub struct GlobalSnapshot {
 /// 完整快照（工具表 + 全局）。
 #[derive(Debug, Clone)]
 pub struct StatsSnapshot {
-    /// 长度 = TOOL_SLOT_COUNT（前 7 个是真实工具，最后一个是未知工具聚合）。
+    /// 长度 = TOOL_SLOT_COUNT（前 8 个是真实工具，最后一个是未知工具聚合）。
     pub tools: Vec<ToolSnapshot>,
     pub global: GlobalSnapshot,
 }

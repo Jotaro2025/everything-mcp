@@ -31,6 +31,22 @@ jobs:
             ~/.cargo/git
             target
           key: release-${{ hashFiles('Cargo.lock') }}
+          # 先续 release 自己的最近缓存，再回落到 CI 的 x64 缓存 ——
+          # 发版不再每次全冷启动（Cargo.lock 变更也不至于从零编译）。
+          restore-keys: |
+            release-
+            ci-x86_64-pc-windows-msvc-
+
+      # tag 与 Cargo.toml 版本必须一致 —— 打错 tag 会产出错版安装包还挂着
+      # 对不上的 Release 号。
+      - name: Verify tag matches Cargo.toml version
+        shell: pwsh
+        run: |
+          $cargoVersion = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
+          if ($env:GITHUB_REF_NAME -ne "v$cargoVersion") {
+            throw "tag '$env:GITHUB_REF_NAME' does not match Cargo.toml version '$cargoVersion' (expected 'v$cargoVersion')"
+          }
+          "tag $env:GITHUB_REF_NAME matches version $cargoVersion"
 
       - name: Test
         run: cargo test

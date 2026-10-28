@@ -412,8 +412,11 @@ impl Host {
         req!(utf8_buf_init, "utf8_buf_init");
         req!(utf8_buf_kill, "utf8_buf_kill");
 
-        // 同步原语 —— 强制（用于等待异步查询完成）
-        req!(os_event_create, "os_event_create");
+        // 同步原语 —— 全部可选。os_event_create/os_thread_* 在本插件的实际
+        // 实现里从未被调用（事件用 Win32 CreateEventW、marshal 用主线程
+        // 窗口消息）。历史上它们是强制项，会让缺这些导出的宿主版本连插件
+        // 都加载不了 —— 降级为可选（2026-10 审计修复）。
+        opt!(os_event_create, "os_event_create");
         // os_event_set 在头文件中未列名 —— 若不可用，回退到 Win32 SetEvent 系统调用，
         // 见 sync 模块。这里尝试获取，失败不致命。
         opt!(os_event_set, "os_event_set");

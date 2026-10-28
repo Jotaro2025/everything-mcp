@@ -665,9 +665,18 @@ pub fn query(filter: &Filter) -> Result<Outcome, String> {
     };
 
     'files: for (_, file_path) in selected {
-        let limit = match fs::metadata(file_path) {
-            Ok(m) => m.len().min(MAX_BYTES_PER_FILE),
+        let file_len = match fs::metadata(file_path) {
+            Ok(m) => m.len(),
             Err(_) => continue,
+        };
+        // 预算按「最新优先」裁：超过上限的文件只扫**尾部**（最新）的
+        // MAX_BYTES_PER_FILE 字节。倒序扫描从文件尾往回走，窗口必须开在
+        // 尾部 —— 旧实现把 limit 当作「只读前 64 MiB」，繁忙磁盘上一天
+        // 就能超限，最新的变更反而永远看不到，恰好与工具的契约相反。
+        let (start_offset, limit) = if file_len > MAX_BYTES_PER_FILE {
+            (file_len - MAX_BYTES_PER_FILE, MAX_BYTES_PER_FILE)
+        } else {
+            (0, file_len)
         };
         let mut handle = match fs::File::open(file_path) {
             Ok(h) => h,
@@ -685,12 +694,27 @@ pub fn query(filter: &Filter) -> Result<Outcome, String> {
             let start = end.saturating_sub(CHUNK as u64);
             let take = (end - start) as usize;
             let mut buf = vec![0u8; take];
-            if handle.seek(SeekFrom::Start(start)).is_err() || handle.read_exact(&mut buf).is_err()
+            let abs_start = start_offset + start;
+            if handle.seek(SeekFrom::Start(abs_start)).is_err()
+                || handle.read_exact(&mut buf).is_err()
             {
                 break;
             }
             bytes_scanned += take as u64;
-            let text = String::from_utf8_lossy(&buf).into_owned();
+            // 块尾可能是被截断的多字节 UTF-8 序列（中文路径是 3 字节字符，
+            // 256 KiB 边界撞上的概率不低）—— 逐块 from_utf8_lossy 会把
+            // 两半各自替换成 U+FFFD，路径永久损坏。剥掉块尾不完整的序列，
+            // 按原始字节与 carry 拼好后一次性解码；不完整序列的字节属于
+            // 更早一块的行首，留给下一轮。
+            let valid_end = match std::str::from_utf8(&buf) {
+                Ok(_) => buf.len(),
+                Err(e) => e.valid_up_to(),
+            };
+            let mut raw_line = buf[..valid_end].to_vec();
+            raw_line.extend_from_slice(carry.as_bytes());
+            let remainder = buf[valid_end..].to_vec();
+            carry.clear();
+            let text = String::from_utf8_lossy(&raw_line).into_owned();
 
             // split 出的第一段是更早一块的半行尾巴，最后一段则是通向
             // 更早一块的半行开头 —— 只有中间各段是完整行。
@@ -724,7 +748,9 @@ pub fn query(filter: &Filter) -> Result<Outcome, String> {
                     break 'files;
                 }
             }
-            carry = head.to_string();
+            // carry = 更早一块的行首片段：先接本块剥下的不完整序列字节，
+            // 再接 head（head 是本块开头那半行的文本）。
+            carry = format!("{}{}", String::from_utf8_lossy(&remainder), head);
             end = start;
         }
         // 走到这里 carry 是最老一块的开头片段 —— 它前面没有更多字节了，
@@ -934,7 +960,11 @@ fn local_civil_from_unix(secs: u64) -> Option<String> {
     use windows_sys::Win32::Foundation::{FILETIME, SYSTEMTIME};
     use windows_sys::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
     // Unix 纪元（1970）与 FILETIME 纪元（1601）相差 11644473600 秒。
-    let hundreds = (secs + 11_644_473_600).checked_mul(10_000_000)?;
+    // checked_add：接近 u64::MAX 的输入回绕后会产出「合法」的 1970 年代
+    // FILETIME，静默返回错误日期 —— 溢出就该报 None。
+    let hundreds = secs
+        .checked_add(11_644_473_600)?
+        .checked_mul(10_000_000)?;
     let utc_ft = FILETIME {
         dwLowDateTime: (hundreds & 0xFFFF_FFFF) as u32,
         dwHighDateTime: (hundreds >> 32) as u32,

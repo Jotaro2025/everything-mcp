@@ -935,11 +935,13 @@ fn dispatch_malformed_json_is_parse_error_with_null_id() {
 }
 
 #[test]
-fn dispatch_tools_call_unknown_tool_is_method_not_found() {
+fn dispatch_tools_call_unknown_tool_is_invalid_params() {
+    // 工具名是 params.name 的取值错误 —— 按 MCP 规范回 -32602（invalid
+    // params），-32601 保留给「方法不存在」（2026-10 审计修正）。
     let resp = dispatch(
         r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"nope","arguments":{}}}"#,
     );
-    assert_eq!(resp["error"]["code"], protocol::METHOD_NOT_FOUND);
+    assert_eq!(resp["error"]["code"], protocol::INVALID_PARAMS);
     assert!(resp["error"]["message"].as_str().unwrap().contains("nope"));
 }
 
@@ -971,8 +973,11 @@ fn server_diagnostics_reports_server_state_without_arguments() {
     assert_eq!(v["global_search"]["mode"], "deny");
     assert!(v["index_changes_prerequisite"]["journal_log_directory"].is_string());
     assert!(v["diagnostic_log"]["path"].as_str().unwrap().contains("plugin.log"));
-    // 每工具统计覆盖全部 8 个真实工具。
-    assert_eq!(v["stats"]["tools"].as_array().unwrap().len(), 8);
+    // 每工具统计覆盖 8 个真实工具 + 1 个未知兜底行（与 total_calls 的求和
+    // 范围一致 —— 少列一行总数就对不上）。
+    let tools = v["stats"]["tools"].as_array().unwrap();
+    assert_eq!(tools.len(), 9);
+    assert_eq!(tools[8]["name"], "(unknown)");
 }
 
 #[test]
@@ -1032,10 +1037,75 @@ fn folder_of_wrong_type_is_invalid_params() {
     assert_eq!(err.0, protocol::INVALID_PARAMS);
 }
 
+// ====================================================================
+// 2026-10 审计回归：敏感路径黑名单的 Win32 拼写绕过
+// ====================================================================
+
 #[test]
-fn unknown_tool_is_method_not_found() {
+fn read_file_rejects_trailing_dot_and_short_name_variants() {
+    // 真实文件：创建 id_rsa（内容无任何敏感信息），验证 Win32 拼写
+    // 变体（尾随点 / 8.3 短名）打开的是同一个文件、全部被拒。
+    let dir = std::env::temp_dir().join(format!("emcp_audit_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let key = dir.join("id_rsa");
+    std::fs::write(&key, b"-----BEGIN TEST KEY-----\nnot-a-real-key\n").unwrap();
+
+    // 敏感路径拒绝走的是 Ok + isError=true（结构化 PATH_DENIED），
+    // 不是 JSON-RPC Err —— 判定必须看 isError 标志。
+    let call = |p: String| {
+        matches!(
+            tools::dispatch("read_file", &json!({ "path": p })),
+            Ok((_, true))
+        )
+    };
+
+    // 直接路径与尾随点变体都拒绝。
+    assert!(call(key.to_string_lossy().into_owned()), "直接路径应被拒");
+    let trailed = format!("{}.", key.display());
+    assert!(call(trailed), "尾随点变体应被拒");
+    let trailed_sp = format!("{} .", key.display());
+    assert!(call(trailed_sp), "尾随空格+点变体应被拒");
+
+    // 8.3 短名（若该卷启用了短名生成）：解析回同一个文件，同样要拒。
+    if let Some(short) = short_name_of(&key) {
+        assert!(call(short.clone()), "8.3 短名 {short} 应被拒");
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 用 GetShortPathNameW 拿 8.3 短名；卷未启用短名生成时返回 None。
+fn short_name_of(path: &std::path::Path) -> Option<String> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::ffi::OsStringExt;
+    const BUF: usize = 1024;
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+    let mut out = vec![0u16; BUF];
+    // 0 unsafe-modifier: 只在文件存在时有效；返回 0 = 无短名。
+    let n = unsafe {
+        windows_sys::Win32::Storage::FileSystem::GetShortPathNameW(
+            wide.as_ptr(),
+            out.as_mut_ptr(),
+            BUF as u32,
+        )
+    };
+    if n == 0 || n as usize > BUF {
+        return None;
+    }
+    out.truncate(n as usize);
+    let s = std::ffi::OsString::from_wide(&out).to_string_lossy().into_owned();
+    // 只有当短名真的不同于长名（~ 存在）才算拿到短名。
+    if s != path.to_string_lossy() {
+        Some(s)
+    } else {
+        None
+    }
+}
+
+#[test]
+fn unknown_tool_is_invalid_params() {
     let err = tools::dispatch("delete_everything", &json!({"folder": "C:\\"})).unwrap_err();
-    assert_eq!(err.0, protocol::METHOD_NOT_FOUND);
+    assert_eq!(err.0, protocol::INVALID_PARAMS);
     assert!(err.1.contains("delete_everything"));
 }
 
@@ -1414,10 +1484,9 @@ fn with_cache_control_only_decorates_modern_era() {
 
 #[test]
 fn origin_error_allows_localhost_and_rejects_remote() {
-    // 放行：缺失（非浏览器客户端）、空、null（不透明来源）、本机来源。
+    // 放行：缺失（非浏览器客户端）、空、本机来源。
     assert!(server::origin_error(None).is_none());
     assert!(server::origin_error(Some("")).is_none());
-    assert!(server::origin_error(Some("null")).is_none());
     assert!(server::origin_error(Some("http://localhost:8285")).is_none());
     assert!(server::origin_error(Some("http://127.0.0.1:8285")).is_none());
     assert!(server::origin_error(Some("http://[::1]:8285")).is_none());
@@ -1426,6 +1495,114 @@ fn origin_error_allows_localhost_and_rejects_remote() {
     let err = server::origin_error(Some("https://evil.example.com")).expect("must reject");
     let v: Value = serde_json::from_str(&err).unwrap();
     assert_eq!(v["error"]["code"], protocol::INVALID_REQUEST);
+    // `null` 同样拒绝（2026-10 审计修复）：sandbox iframe / file:// 页面的
+    // Origin 都是 null，攻击页恰好能造出这个值穿过校验。
+    assert!(server::origin_error(Some("null")).is_some());
+    assert!(server::origin_error(Some("NULL")).is_some());
+    // 非白名单 scheme 与裸 authority 也不放行。
+    assert!(server::origin_error(Some("ftp://localhost")).is_some());
+    assert!(server::origin_error(Some("localhost:8285")).is_some());
+}
+
+// ====================================================================
+// 2026-10 审计回归：HTTP 防线顺序 / body 上限 / 预检 / 信封错误码
+// ====================================================================
+
+#[test]
+fn valid_json_with_invalid_envelope_is_invalid_request() {
+    // JSON 合法但缺 jsonrpc 字段 —— serde 会失败，但这不是 parse error：
+    // -32700 只留给非 JSON 文本，信封非法是 -32600（JSON-RPC 2.0）。
+    let resp = dispatch(r#"{"method":"ping","id":1}"#);
+    assert_eq!(resp["error"]["code"], protocol::INVALID_REQUEST);
+    // 真·非法 JSON 仍是 -32700。
+    let resp = dispatch("{not json");
+    assert_eq!(resp["error"]["code"], protocol::PARSE_ERROR);
+}
+
+#[test]
+fn oversized_content_length_is_rejected_before_body() {
+    // 伪造 Content-Length: 10 MiB（超 1 MiB 上限）必须在读 body 之前被拒 ——
+    // 真实 TCP 上发一个只带头的请求即可触发（不必真发 10 MiB）。
+    let _g = SERVER_TESTS.lock().unwrap_or_else(|p| p.into_inner());
+    server::start("127.0.0.1", 0).expect("test server must start");
+    let port = server::bound_port().expect("listener must report its bound port");
+
+    let req = "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 10485760\r\n\r\n{}";
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+        .unwrap();
+    use std::io::{Read, Write};
+    stream.write_all(req.as_bytes()).unwrap();
+    let mut buf = Vec::new();
+    let _ = stream.read_to_end(&mut buf);
+    let text = String::from_utf8_lossy(&buf).to_string();
+    server::stop();
+    assert!(text.starts_with("HTTP/1.1 400"), "{}", text);
+    assert!(text.contains("body too large"), "{}", text);
+}
+
+#[test]
+fn options_preflight_mirrors_origin_allowlist() {
+    let _g = SERVER_TESTS.lock().unwrap_or_else(|p| p.into_inner());
+    server::start("127.0.0.1", 0).expect("test server must start");
+    let port = server::bound_port().expect("listener must report its bound port");
+
+    let send = |origin: Option<&str>| -> String {
+        use std::io::{Read, Write};
+        let mut req =
+            String::from("OPTIONS /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n");
+        if let Some(o) = origin {
+            req.push_str(&format!("Origin: {}\r\n", o));
+        }
+        req.push_str("\r\n");
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        stream.write_all(req.as_bytes()).unwrap();
+        let mut buf = Vec::new();
+        let _ = stream.read_to_end(&mut buf);
+        String::from_utf8_lossy(&buf).to_string()
+    };
+
+    // 白名单来源：204 + 精确回显（不是 *）。
+    let resp = send(Some("http://localhost:3000"));
+    assert!(resp.starts_with("HTTP/1.1 204"), "{}", resp);
+    assert!(
+        resp.contains("Access-Control-Allow-Origin: http://localhost:3000"),
+        "{}",
+        resp
+    );
+    assert!(!resp.contains("Access-Control-Allow-Origin: *"), "{}", resp);
+    // 非白名单（含 null）：403，且不带 CORS 头。
+    for bad in [Some("null"), Some("https://evil.example.com")] {
+        let resp = send(bad);
+        assert!(resp.starts_with("HTTP/1.1 403"), "{:?}: {}", bad, resp);
+        assert!(!resp.contains("Access-Control-Allow-Origin"), "{}", resp);
+    }
+    // 普通 POST 响应不再带 ACAO:*（旧实现把 body readable 交给任意页面）。
+    let (head, body) = http_post(port, r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#, &[]);
+    assert!(head.starts_with("HTTP/1.1 200"), "{}", head);
+    assert!(body.contains("result"), "{}", body);
+    assert!(!head.contains("Access-Control-Allow-Origin"), "{}", head);
+
+    server::stop();
+}
+
+#[test]
+fn null_origin_post_is_rejected_over_real_tcp() {
+    // 修复的攻击路径端到端验证：sandbox iframe 造出的 Origin: null 必须 403。
+    let _g = SERVER_TESTS.lock().unwrap_or_else(|p| p.into_inner());
+    server::start("127.0.0.1", 0).expect("test server must start");
+    let port = server::bound_port().expect("listener must report its bound port");
+    let (head, _) = http_post(
+        port,
+        r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#,
+        &[("Origin", "null")],
+    );
+    server::stop();
+    assert!(head.starts_with("HTTP/1.1 403"), "{}", head);
 }
 
 // ====================================================================
@@ -1816,6 +1993,12 @@ fn end_to_end_over_real_tcp() {
 /// 用这把锁把所有起真服务的测试串行化。
 static SERVER_TESTS: Mutex<()> = Mutex::new(());
 
+/// 统计测试串行锁。stats_* 的 before/after 相对增量断言写的是**全局原子量**
+/// （TOOL_STATS / dispatch 埋点），cargo test 默认多线程并行，两个测试的
+/// record_call 交错落在快照之间即假失败 —— 与 src/plugin/stats.rs 单测的
+/// TEST_GLOBALS_LOCK 是同一个问题，集成侧也要锁。
+static STATS_TESTS: Mutex<()> = Mutex::new(());
+
 /// 回归：stop → start → stop 之后端口必须真的关掉。
 ///
 /// SERVER 曾是 `OnceLock<ServerHandle>`：第二次 start() 的句柄被
@@ -1923,7 +2106,7 @@ fn stats_tools_call_unknown_tool_lands_in_fallback_err() {
         &modern_head(),
     );
     assert_eq!(status, 200);
-    assert_eq!(resp["error"]["code"], protocol::METHOD_NOT_FOUND);
+    assert_eq!(resp["error"]["code"], protocol::INVALID_PARAMS);
 
     let idx = stats::tool_index("no_such_tool");
     assert_eq!(idx, stats::UNKNOWN_TOOL_IDX, "未知工具必须落兜底槽");
@@ -1939,6 +2122,8 @@ fn stats_tools_call_unknown_tool_lands_in_fallback_err() {
 fn stats_tools_call_is_error_counts_as_err_not_ok() {
     use everything_mcp::stats;
 
+    // 增量断言写全局原子量 —— 必须独占（见 STATS_TESTS 文档）。
+    let _g = STATS_TESTS.lock().unwrap_or_else(|p| p.into_inner());
     stats::set_flush_enabled(false);
 
     let idx = stats::tool_index("read_file");

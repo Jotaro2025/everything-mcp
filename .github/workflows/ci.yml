@@ -32,6 +32,9 @@ jobs:
             ~/.cargo/git
             target
           key: ci-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
+          # Cargo.lock 一变 key 就失效 —— restore-keys 从最近一次缓存续，
+          # 只重编变化的部分，而不是全冷启动。
+          restore-keys: ci-${{ matrix.target }}-
 
       # [lints] 里 clippy.all = deny，这里显式 -- -D warnings 双保险。
       # 只查默认 target（host 是 x64，x86 的 clippy 结果相同），省一半时间。
@@ -54,3 +57,15 @@ jobs:
           $dll = Get-ChildItem "target/${{ matrix.target }}/release/*.dll" | Select-Object -First 1
           if (-not $dll) { throw "no DLL produced for ${{ matrix.target }}" }
           "artifact: $($dll.Name) ($([math]::Round($dll.Length/1KB)) KB)"
+          # 导出表校验：Everything 只认 everything_plugin_proc 这一个入口。
+          # 重命名/漏导出要在这里暴露，而不是装进 Everything 后
+          # GetProcAddress 失败才追查。
+          $dumpbin = Get-ChildItem "C:\Program Files\Microsoft Visual Studio" -Recurse -Filter dumpbin.exe -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -match ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64' ? 'ARM64' : 'Hostx64') } |
+            Select-Object -First 1
+          if (-not $dumpbin) { throw "dumpbin.exe not found" }
+          $exports = & $dumpbin.FullName /EXPORTS $dll.FullName | Out-String
+          if ($exports -notmatch 'everything_plugin_proc') {
+            throw "DLL must export everything_plugin_proc; dumpbin /EXPORTS output:`n$exports"
+          }
+          "export check: everything_plugin_proc found"
