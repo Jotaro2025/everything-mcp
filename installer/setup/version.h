@@ -2,8 +2,8 @@
 // setup.c uses PLUGINVERSION for the -setup-plugin-version argument,
 // setup.rc uses the four numeric parts for FILEVERSION / PRODUCTVERSION.
 #define PLUGINMAJOR		1
-#define PLUGINMINOR		3
+#define PLUGINMINOR		4
 #define PLUGINREVISION	1
 #define PLUGINBUILD		0
 
-#define PLUGINVERSION	"1.3.1.0"
+#define PLUGINVERSION	"1.4.1.0"

@@ -284,6 +284,16 @@ fn search_description_warns_against_shell_glob_and_documents_truncation() {
     assert!(desc.contains('!'), "desc should document the '!' exclusion prefix");
     assert!(desc.contains("total"), "desc should document the total/count pair");
     assert!(desc.contains("content:"), "desc should mention content search");
+    // content: 的覆盖范围与替代工具必须写清楚：它的白名单不放代码格式，
+    // 而代码搜索该走 grep（自己读文件、有行号、无索引前提）。
+    assert!(
+        desc.contains("content_indexing_include_only_files"),
+        "desc should name the coverage setting: {desc}"
+    );
+    assert!(
+        desc.contains("grep"),
+        "desc should point code searches at grep: {desc}"
+    );
     // 新增能力也要在描述里点明：时间戳、翻页、排序。
     assert!(desc.contains("modified"), "desc should mention timestamps");
     assert!(desc.contains("offset"), "desc should document paging");
@@ -578,6 +588,15 @@ fn grep_description_documents_the_contract() {
     // 二进制 / 超大 / 黑名单都要写明是「跳过」而不是报错。
     assert!(desc.contains("skipped"), "desc: {desc}");
     assert!(desc.contains("denylisted"), "desc should name the denylist");
+    // 文档格式读不了这件事必须点破，并给出替代路径（否则只会得到无声的 0）。
+    assert!(
+        desc.contains("binary_skipped"),
+        "desc should expose the binary-skip counter: {desc}"
+    );
+    assert!(
+        desc.contains(".pdf") && desc.contains("content:"),
+        "desc should name document formats and point at content:: {desc}"
+    );
 
     // pattern 是正则、filter 是 Everything 语法 —— 这处最容易混，必须点破。
     let props = &tool["inputSchema"]["properties"];

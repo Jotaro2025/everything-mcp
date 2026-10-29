@@ -428,7 +428,7 @@ pub(crate) fn clip_line(line: &str) -> (String, bool) {
     }
 }
 
-/// 供 grep 用：读文件并解码成文本，任何不可用的情况都返回 `None`（跳过该文件）。
+/// 供 grep 用：读文件并解码成文本，不可用时返回 [`SkipReason`] 让调用方跳过。
 ///
 /// 返回值是 `(解码后的文本, 从磁盘读入的原始字节数)` —— grep 的 64 MiB
 /// 扫描预算按**原始字节**计：UTF-16 文件解码后长度约为原字节的一半，
@@ -436,33 +436,55 @@ pub(crate) fn clip_line(line: &str) -> (String, bool) {
 ///
 /// 与 [`read_file`] 的关键区别是**不报错**：grep 扫的是一批文件，二进制、
 /// 超大、读不了、命中黑名单的都应该只是跳过 —— 一个坏文件不该让整次搜索失败。
+/// 但要带上**原因**：`Binary` 单独计数回报给用户，否则按文档格式过滤时
+/// 只会看到一个毫无线索的 0 结果。
 ///
 /// 二进制判定与 `read_file` 同一套（扩展名硬表 + 内容嗅探），黑名单也一样 ——
 /// 而且黑名单在这里更要紧：grep 绝不能把 `.env` / 私钥的正文带出来。
-pub fn read_text_for_matching(path: &str) -> Option<(String, u64)> {
+/// grep 跳过一个候选文件的原因。调用方据此区分「读不了」与「不是文件」，
+/// 好把「因二进制被跳过」单独计数回报给用户 —— 否则 `ext:pdf` 这类查询
+/// 只会得到一个没有任何线索的 0 结果。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SkipReason {
+    /// 不存在、不是普通文件，或 stat 失败。
+    NotAFile,
+    /// 超过 [`MAX_FILE_BYTES`]（stat 或实际读取复核）。
+    TooLarge,
+    /// 命中敏感路径黑名单（含打开后句柄复核）。
+    Denied,
+    /// 二进制：扩展名硬表或内容嗅探命中。
+    Binary,
+    /// 打开或读取失败。
+    Unreadable,
+}
+
+pub fn read_text_for_matching(path: &str) -> Result<(String, u64), SkipReason> {
     if sensitive::is_sensitive_path(path) {
-        return None;
+        return Err(SkipReason::Denied);
     }
-    let meta = std::fs::metadata(path).ok()?;
-    if !meta.is_file() || meta.len() > MAX_FILE_BYTES {
-        return None;
+    let meta = std::fs::metadata(path).map_err(|_| SkipReason::NotAFile)?;
+    if !meta.is_file() {
+        return Err(SkipReason::NotAFile);
     }
-    let raw = std::fs::read(path).ok()?;
+    if meta.len() > MAX_FILE_BYTES {
+        return Err(SkipReason::TooLarge);
+    }
+    let raw = std::fs::read(path).map_err(|_| SkipReason::Unreadable)?;
     // stat 与 read 之间文件可能增长 —— 用实际字节数复核（TOCTOU）。
     if raw.len() as u64 > MAX_FILE_BYTES {
-        return None;
+        return Err(SkipReason::TooLarge);
     }
     // 与 read_file 同样的句柄级复核：grep 的候选路径来自 Everything 索引，
-    // 但索引与现实之间同样隔着符号链接/短名重定向。失败即跳过（None）。
+    // 但索引与现实之间同样隔着符号链接/短名重定向。失败即跳过。
     if !handle_passes_denylist(path) {
-        return None;
+        return Err(SkipReason::Denied);
     }
     if binary_reason(&raw, path).is_some() {
-        return None;
+        return Err(SkipReason::Binary);
     }
     let raw_len = raw.len() as u64;
     let (text, _) = decode_bytes(&raw);
-    Some((text, raw_len))
+    Ok((text, raw_len))
 }
 
 /// 对已读入内存的文件做「打开后复核」：`std::fs::read` 拿到字节后没有句柄
@@ -912,9 +934,12 @@ mod tests {
         let txt = std::env::temp_dir().join("everything_mcp_ascii_probe.txt");
         std::fs::write(&txt, b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\n%%EOF\n").unwrap();
         assert!(read_file(&txt.to_string_lossy(), 1, 10).is_ok());
-        // grep 那条路同样跳过二进制
-        assert!(read_text_for_matching(&path.to_string_lossy()).is_none());
-        assert!(read_text_for_matching(&txt.to_string_lossy()).is_some());
+        // grep 那条路同样跳过二进制，并且要给出 Binary 这个原因
+        assert_eq!(
+            read_text_for_matching(&path.to_string_lossy()),
+            Err(SkipReason::Binary)
+        );
+        assert!(read_text_for_matching(&txt.to_string_lossy()).is_ok());
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(&txt);

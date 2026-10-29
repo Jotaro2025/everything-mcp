@@ -104,6 +104,12 @@ pub struct GrepOutcome {
     pub bytes_scanned: u64,
     /// 有命中的文件数。
     pub files_with_matches: usize,
+    /// 因二进制（扩展名硬表或内容嗅探）被跳过的候选文件数。
+    ///
+    /// 单独回报是必要的：按文档格式过滤（如 `filter: ext:pdf`）时 grep
+    /// 一个文件都读不了，不区分原因的话调用方只会看到 0 结果而无从判断
+    /// 是「没有匹配」还是「这个格式搜不了」。
+    pub binary_skipped: usize,
     /// 被裁短的行数。
     pub clipped_lines: usize,
     /// 还有命中没返回（`head_limit` 或字节预算拦下）。
@@ -241,6 +247,7 @@ fn scan_candidates(
     let mut hits: Vec<Hit> = Vec::new();
     let mut per_file: Vec<(String, usize)> = Vec::new();
     let mut files_scanned = 0usize;
+    let mut binary_skipped = 0usize;
     let mut bytes_scanned = 0u64;
     let mut clipped_lines = 0usize;
     let mut truncated = false;
@@ -266,8 +273,14 @@ fn scan_candidates(
             break;
         }
         // 二进制 / 超大 / 黑名单 / 读不了 —— 跳过这个文件，不中断整次搜索。
-        let Some((text, raw_len)) = read::read_text_for_matching(path) else {
-            continue;
+        // 二进制单独计数：这是「按文档格式过滤」时唯一能给出的线索。
+        let (text, raw_len) = match read::read_text_for_matching(path) {
+            Ok(v) => v,
+            Err(read::SkipReason::Binary) => {
+                binary_skipped += 1;
+                continue;
+            }
+            Err(_) => continue,
         };
         files_scanned += 1;
         // 按**原始字节**计账（不是解码后长度）：64 MiB 的预算语义是
@@ -314,6 +327,7 @@ fn scan_candidates(
         candidates_truncated,
         files_scanned,
         bytes_scanned,
+        binary_skipped,
         files_with_matches,
         clipped_lines,
         truncated,
@@ -735,6 +749,41 @@ mod tests {
         assert_eq!(o.files_scanned, 0, "三类候选全部应被跳过");
         assert_eq!(o.payload.len(), 0);
         assert!(!o.truncated, "跳过不算截断");
+        // 只有 NUL 字节那个是「二进制」；.env 与 .git/objects 走黑名单，
+        // 不该混进 binary_skipped —— 否则用户按格式过滤时读数会失真。
+        assert_eq!(o.binary_skipped, 1, "只统计因二进制被跳过的候选");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn scan_candidates_counts_document_extensions_as_binary_skips() {
+        // 按文档格式过滤时 grep 一个文件都读不了，binary_skipped 是调用方
+        // 唯一能拿到的线索（真实场景：filter:"ext:pdf"）。
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("everything_mcp_grep_doc_{unique}"));
+        std::fs::create_dir_all(&root).unwrap();
+        // 纯 ASCII 的 .pdf：内容嗅探看不出二进制，靠扩展名硬表拦。
+        std::fs::write(root.join("a.pdf"), "%PDF-1.4 TODO").unwrap();
+        std::fs::write(root.join("b.docx"), "TODO").unwrap();
+        std::fs::write(root.join("c.txt"), "TODO here\n").unwrap();
+
+        let p = |rel: &str| root.join(rel).to_string_lossy().into_owned();
+        let entries = vec![(p("a.pdf"), false), (p("b.docx"), false), (p("c.txt"), false)];
+        let o = scan_candidates(
+            &build_re("TODO", false),
+            3,
+            false,
+            &entries,
+            OutputMode::Content,
+            200,
+        );
+        assert_eq!(o.binary_skipped, 2, "pdf/docx 都算二进制跳过");
+        assert_eq!(o.files_scanned, 1, "只有 .txt 真正被读");
+        assert_eq!(o.payload.len(), 1);
         let _ = std::fs::remove_dir_all(&root);
     }
 }

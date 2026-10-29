@@ -503,7 +503,11 @@ fn tool_server_diagnostics(_args: &Value) -> Result<ToolOutput, (i32, String)> {
             // 读不到（ini 缺失/键缺失）时为 null —— 设置页会按未勾选显示。
             "enabled": crate::options::content_indexing_enabled(),
             "setting": "content_indexing_enabled",
-            "note": "Everything core setting (Advanced page in newer builds). Only folders with 'Index file content' enabled are covered.",
+            // content: 的覆盖范围由这个白名单决定；不在名单里的格式（代码、
+            // .md/.json 等）content: 一律返回 0，要用 grep。
+            "formats": crate::options::content_indexing_formats(),
+            "formats_setting": "content_indexing_include_only_files",
+            "note": "Everything core setting (Advanced page in newer builds). Only folders with 'Index file content' enabled are covered; 'formats' limits which extensions content: can find — use grep for anything outside it.",
         },
         "index_changes_prerequisite": {
             "journal_log_directory": journal_dir_str,
@@ -966,6 +970,7 @@ fn tool_grep(args: &Value) -> Result<ToolOutput, (i32, String)> {
                 "candidates_truncated": o.candidates_truncated,
                 "files_scanned": o.files_scanned,
                 "bytes_scanned": o.bytes_scanned,
+                "binary_skipped": o.binary_skipped,
                 "files_with_matches": o.files_with_matches,
                 "clipped_lines": o.clipped_lines,
                 "count": o.payload.len(),

@@ -13,7 +13,7 @@ dependencies = [
 
 [[package]]
 name = "everything_mcp"
-version = "1.4.0"
+version = "1.4.1"
 dependencies = [
  "regex",
  "serde",
