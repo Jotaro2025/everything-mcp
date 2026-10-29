@@ -551,7 +551,11 @@ fn submit_query(
         // 也无法证明已生效），缓冲区绝不能在这里 free —— 泄漏它。
         // 见 LeakedBuf 的文档。查询对象本身由全局槽位复用，不动。
         leaked.leak_forever();
-        return Err(format!("search timeout after {} ms", timeout_ms));
+        return Err(format!(
+            "search timeout after {} ms — narrow the scope (ext:, exclude, subfolder) or raise timeout_ms \
+             (content:/utf8content: over a large tree need far more than the 10 s default)",
+            timeout_ms
+        ));
     }
 
     // 查询已完成 —— 句柄、保活守卫、主机锁一并交还给调用方，

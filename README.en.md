@@ -398,10 +398,28 @@ dropped. The equivalent pattern spelling is `*.cs !\obj\ !\.git\`.
 ##### Content search and making it fast
 
 `content:` is Everything's file-content search function. The plugin already
-passes the `allow_read_access` permission bit it needs, so it works
-**without building a content index first** — with no index, Everything opens
-candidate files on demand and the results are still correct, just slow. The
-slowness comes from the size of the candidate set, so speed it up in this
+passes the `allow_read_access` permission bit it needs. Three spellings behave
+very differently, so keep them apart:
+
+- **`content:`** reads the content **index**, so it only covers the extensions
+  in `content_indexing_include_only_files` (default
+  `*.doc;*.docx;*.pdf;*.txt;*.xls;*.xlsx`). It is also the only way into binary
+  documents such as PDF/DOCX — grep and read_file cannot read those.
+- **`utf8content:` / `ansicontent:`** open candidate files **on demand**, so
+  they work for any text file regardless of that extension list. The price is
+  speed, and they return paths only, with no line numbers.
+- **the `grep` tool** reads the files itself and gives line numbers and regex,
+  with no index at all — the default choice for code.
+
+Measured on the same `.rs` file and the same term:
+
+| spelling | result |
+| --- | --- |
+| `content:"probe_chinese_ui" ext:rs` | 0 hits (`.rs` is not in the index list) |
+| `utf8content:"probe_chinese_ui" ext:rs` | 1 hit (on-demand read works) |
+| `grep` + `filter: ext:rs` | 1 hit, with line numbers (0.3 s, see below) |
+
+The slowness comes from the size of the candidate set, so speed it up in this
 order.
 
 **1. Narrow the scope first (most effective, zero setup).** Limit the
@@ -414,27 +432,32 @@ modified files with `dm:lastweek`. Measured on one repository:
 | `content:"db_query_search2"` (repo root, including `target/`) | times out at the default 10s |
 | `ext:rs content:"db_query_search2"` | returns 9 files immediately |
 
-**2. Raise `timeout_ms`.** If it still times out after narrowing, increase it
+**2. Switch spelling.** Use `grep` or `utf8content:` for code and ordinary
+text; only documents (PDF/DOCX) genuinely require `content:`. `utf8content:` is
+an order of magnitude slower than `grep` (18.7 s vs 0.30 s over 15,567
+candidates in one measurement), so prefer grep when you can.
+
+**3. Raise `timeout_ms`.** If it still times out after narrowing, increase it
 (default 10000; it must be an integer in 1..300000 — 0 and out-of-range
 values are rejected rather than silently mangled, and the 300000 cap keeps
 one search from holding the shared query lock indefinitely).
 
-**3. Turn on content indexing (permanent, but only for the indexed
-folders).** In Everything, go to Tools → Options → Indexes → Folders, select
-the folder and tick "Index file content" (newer 1.5 builds moved these
-options to the Advanced page — search for `content` in the options dialog if
-you cannot find them). The ini keys are `content_indexing_enabled`,
-`content_indexing_include_only_files` and `content_indexing_max_size`. Two
-traps:
+**4. Turn on content indexing (only affects `content:`).** In Everything, go
+to Tools → Options → Indexes → Folders, select the folder and tick "Index file
+content" (newer 1.5 builds moved these options to the Advanced page — search
+for `content` in the options dialog if you cannot find them). The ini keys are
+`content_indexing_enabled`, `content_indexing_include_only_files` and
+`content_indexing_max_size`. Two things to know:
 
-- **Add your source extensions to `content_indexing_include_only_files`.**
-  Its default is only `*.doc;*.docx;*.pdf;*.txt;*.xls;*.xlsx` — no `.rs`,
-  `.cs`, `.py` or `.md`. Without them those files still go through on-demand
-  reading, so the index buys you nothing.
+- The default extension list has no `.rs`, `.cs`, `.py` or `.md`. **Whether to
+  add them depends on which spelling you use**: with them, plain `content:`
+  answers fast; without them those files still work via `utf8content:` or
+  `grep` — nothing is missing except `content:` itself.
 - Building the index makes Everything read every candidate file once, so
-  **the first build is markedly slower**; and an ini edit only takes effect
-  after **restarting Everything** (a running instance writes its in-memory
-  values back over the file on exit).
+  **the first build is markedly slower**. A hand-edited ini only takes effect
+  after a restart (a running instance writes its in-memory values back over the
+  file on exit); for immediate effect use `Everything.exe -add-config <file>`,
+  which is what the plugin's settings page does.
 
 Content-search spellings that work (all measured on 1.5.0.1422b):
 

@@ -20,6 +20,7 @@
 //!      连文件是否存在都不去碰；
 //!   3. 尺寸（8 MiB 文件上限）、二进制（NUL）、行窗口与字节预算。
 
+use std::io::Read;
 use std::path::Path;
 
 use windows_sys::Win32::Globalization::{MultiByteToWideChar, CP_ACP};
@@ -462,22 +463,29 @@ pub fn read_text_for_matching(path: &str) -> Result<(String, u64), SkipReason> {
     if sensitive::is_sensitive_path(path) {
         return Err(SkipReason::Denied);
     }
-    let meta = std::fs::metadata(path).map_err(|_| SkipReason::NotAFile)?;
+    // 一个文件只开一次句柄：metadata、黑名单复核、读正文都复用它。
+    // 旧实现开三次（metadata、fs::read、复核各一次），冷缓存下每次 open
+    // 都可能触发安全软件扫描 —— 实测这是 grep 在大目录上变慢的主因
+    // （1165 个小文件 5.3 MB：热缓存 0.30 s，首次访问 13.1 s）。
+    let mut file = std::fs::File::open(path).map_err(|_| SkipReason::NotAFile)?;
+    let meta = file.metadata().map_err(|_| SkipReason::NotAFile)?;
     if !meta.is_file() {
         return Err(SkipReason::NotAFile);
     }
     if meta.len() > MAX_FILE_BYTES {
         return Err(SkipReason::TooLarge);
     }
-    let raw = std::fs::read(path).map_err(|_| SkipReason::Unreadable)?;
+    // 句柄级复核放在读之前：既保留 fail-closed（拿不到最终路径就当命中），
+    // 又天然没有「复核完到读取之间被换成短名」的 TOCTOU 窗口。
+    if recheck_open_path(&file, path).is_err() {
+        return Err(SkipReason::Denied);
+    }
+    let mut raw = Vec::with_capacity(meta.len() as usize);
+    file.read_to_end(&mut raw)
+        .map_err(|_| SkipReason::Unreadable)?;
     // stat 与 read 之间文件可能增长 —— 用实际字节数复核（TOCTOU）。
     if raw.len() as u64 > MAX_FILE_BYTES {
         return Err(SkipReason::TooLarge);
-    }
-    // 与 read_file 同样的句柄级复核：grep 的候选路径来自 Everything 索引，
-    // 但索引与现实之间同样隔着符号链接/短名重定向。失败即跳过。
-    if !handle_passes_denylist(path) {
-        return Err(SkipReason::Denied);
     }
     if binary_reason(&raw, path).is_some() {
         return Err(SkipReason::Binary);
@@ -485,17 +493,6 @@ pub fn read_text_for_matching(path: &str) -> Result<(String, u64), SkipReason> {
     let raw_len = raw.len() as u64;
     let (text, _) = decode_bytes(&raw);
     Ok((text, raw_len))
-}
-
-/// 对已读入内存的文件做「打开后复核」：`std::fs::read` 拿到字节后没有句柄
-/// 可查 —— 为保持与 read_file 相同的语义，这里用 `File::open` +
-/// `GetFinalPathNameByHandleW` 再过一遍黑名单。open 失败按 fail-closed
-/// 返回 false（文件已读进内存但无法证明它不是敏感路径，丢弃）。
-fn handle_passes_denylist(path: &str) -> bool {
-    let Ok(file) = std::fs::File::open(path) else {
-        return false;
-    };
-    recheck_open_path(&file, path).is_ok()
 }
 
 /// 按行窗口取出的正文。

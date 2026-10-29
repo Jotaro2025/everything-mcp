@@ -1039,7 +1039,7 @@ fn write_content_indexing(enabled: bool) -> Result<(), String> {
 
 /// 写临时配置并调官方 `-add-config` 把开关合并进运行中的实例。
 ///
-/// 转发进程通常毫秒级退出；最多等 5 秒，绝不长时间卡 UI 线程。
+/// 转发进程通常毫秒级退出；等待上限见 [`ADD_CONFIG_WAIT_STEPS`]。
 fn run_add_config(exe: &std::path::Path, tmp: &std::path::Path, enabled: bool) -> Result<(), String> {
     std::fs::write(
         tmp,
@@ -1059,10 +1059,10 @@ fn run_add_config(exe: &std::path::Path, tmp: &std::path::Path, enabled: bool) -
         .spawn()
         .map_err(|e| format!("spawn -add-config: {}", e))?;
 
-    for _ in 0..500 {
+    for _ in 0..ADD_CONFIG_WAIT_STEPS {
         match child.try_wait() {
             Ok(Some(_)) => break,
-            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(10)),
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(ADD_CONFIG_POLL_MS)),
             Err(_) => break,
         }
     }
@@ -1075,6 +1075,14 @@ const APPLY_ATTEMPTS: u32 = 3;
 
 /// 两次尝试之间的退避。Everything 刚重启时初始化可能持续数秒。
 const APPLY_BACKOFF_MS: u64 = 250;
+
+/// 等待 `-add-config` 转发进程退出的轮询间隔与次数上限（100 × 10ms = 1s）。
+///
+/// 它正常是毫秒级退出，这个上限只防子进程卡死。**整个 apply 跑在
+/// Everything 的 UI 线程上**，所以单次等待必须短 —— 真正的冻结时长是
+/// [`APPLY_ATTEMPTS`] 次叠加，最坏 3 × (1s + 250ms) 约 3.8 秒。
+const ADD_CONFIG_POLL_MS: u64 = 10;
+const ADD_CONFIG_WAIT_STEPS: u32 = 100;
 
 /// 应用内容索引开关：先 `-add-config` 合并进运行中实例，再回读校验。
 ///

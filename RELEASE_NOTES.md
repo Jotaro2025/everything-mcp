@@ -19,6 +19,16 @@
 - 讲清正文检索的四层分工：`content:"..."` 查内容索引（只覆盖白名单里的格式，是进入 PDF/DOCX 的唯一入口）；`utf8content:"..."` / `ansicontent:"..."` 按需读取，任何文本文件都能搜但只返回路径、明显更慢；`grep` 给行号与正则、不依赖索引，是代码搜索首选；`read_file` 读不了文档，已指向 `content:`。
 - 设置页的格式行改为自动换行（原来用 `SS_LEFTNOWORDWRAP`，右边被裁掉），并预留两行高度。
 
+### 优化
+
+- **grep 每个候选文件从 3 次句柄打开降到 1 次。** 旧实现为同一个文件依次做 `metadata`、`fs::read` 和黑名单复核，三次都会 open；冷缓存下每次 open 都可能触发安全软件扫描，实测是 grep 在大目录上变慢的主因（1165 个小文件 5.3 MB：热缓存 0.30 s，首次访问 13.1 s）。现在 metadata、句柄级黑名单复核和正文读取共用一个句柄，而且复核移到读取之前，顺带消掉了「复核完到读取之间被换成短名」的 TOCTOU 窗口。
+- **`tools/list` 体积从 22.8 KB 压到 20.0 KB。** 八个工具的描述重新措辞，删掉重复叙述与参数级细节；同时加了一条回归测试，涨回 20 KiB 就会失败。
+- **内容索引开关的单次等待上限 5 s → 1 s。** 整个应用过程跑在 Everything 的 UI 线程上，最坏冻结从约 16 s 降到约 3.8 s。
+- **搜索超时的错误信息补上出路**：现在会提示「收窄范围或调大 timeout_ms」，并点明 `content:` / `utf8content:` 在大目录上远超 10 秒默认值。
+- **`server_diagnostics` 的每工具统计增加 `total_ms`。** `avg_ms` 是整数，历史累计越大反推单次耗时越糊；两个一起给才能算出最近几次的真实耗时。
+- **`installer/setup/version.h` 不再入库**（改由 `build-installers.ps1` 从 `Cargo.toml` 生成）。它以生成文件身份入库，1.4.0 发版时就漏更新、停在 1.3.1.0。
+- **README 修正 `content:` 的说明**：三者分工（`content:` 查索引、`utf8content:`/`ansicontent:` 按需读、`grep` 自带行号）写清了，删掉「必须把源码后缀加进索引白名单」的绝对说法，并把「改完 ini 必须重启」改成「可用 `-add-config` 立即生效」。
+
 ### 安装
 
 运行对应架构的 `everything-mcp-1.4.1-{x64,x86}-setup.exe`，它会找到 Everything.exe 并以 `-setup-plugin` 参数重新拉起主程序完成安装；卸载在 Everything 选项 → 插件 里一键完成。
@@ -43,6 +53,16 @@
 
 - Spell out the four-way split: `content:"..."` queries the content index (only the extensions in the include list; the only way into PDF/DOCX); `utf8content:"..."` / `ansicontent:"..."` read on demand, work on any text file but return paths only and are much slower; `grep` gives line numbers and regex without needing an index and is the default for code; `read_file` cannot read documents and now points at `content:`.
 - The formats line on the settings page now wraps (it used `SS_LEFTNOWORDWRAP` and was clipped on the right) and reserves two lines.
+
+### Performance and housekeeping
+
+- **grep now opens each candidate file once instead of three times.** The old path did `metadata`, `fs::read` and the denylist recheck separately, each opening the file; on a cold cache every open can trigger a security-software scan, which measured as the dominant cost on large directories (1,165 small files / 5.3 MB: 0.30 s warm, 13.1 s on first access). Metadata, the handle-level denylist recheck and the read now share one handle, and the recheck moved before the read, which also removes the TOCTOU window where the file could be swapped for a short name between check and read.
+- **`tools/list` shrank from 22.8 KB to 20.0 KB.** All eight descriptions were reworded to drop duplicated narrative and parameter-level detail; a regression test now fails if it grows past 20 KiB.
+- **The content-indexing switch waits 1 s per attempt instead of 5 s.** The whole apply runs on Everything's UI thread, so the worst-case freeze drops from about 16 s to about 3.8 s.
+- **The search-timeout error now says what to do**: narrow the scope or raise `timeout_ms`, noting that `content:` / `utf8content:` over a large tree need far more than the 10 s default.
+- **`server_diagnostics` per-tool stats gained `total_ms`.** `avg_ms` is an integer, so the larger the history the blurrier the per-call estimate; both together let you measure recent calls accurately.
+- **`installer/setup/version.h` is no longer tracked** (it is generated from `Cargo.toml` by `build-installers.ps1`). It was committed as a generated file and was missed in the 1.4.0 release, left at 1.3.1.0.
+- **README corrected on `content:`**: the three spellings are now distinguished (`content:` reads the index, `utf8content:`/`ansicontent:` read on demand, `grep` gives line numbers), the absolute "you must add your source extensions to the index list" advice is gone, and "an ini edit needs a restart" now mentions `-add-config` for immediate effect.
 
 ### Install
 

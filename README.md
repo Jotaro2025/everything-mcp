@@ -359,8 +359,24 @@ gitignore），常见做法：
 ##### 正文检索与提速
 
 `content:` 是 Everything 的正文检索函数。插件已把它需要的
-`allow_read_access` 权限位放开，**不需要先在 Everything 里建内容索引**就能
-用 —— 没建索引时 Everything 按需打开候选文件读内容，结果是对的，只是慢。
+`allow_read_access` 权限位放开。要分清三种写法，它们的覆盖面与代价完全不同：
+
+- **`content:`** 查的是**内容索引**，只覆盖 `content_indexing_include_only_files`
+  里的后缀（默认 `*.doc;*.docx;*.pdf;*.txt;*.xls;*.xlsx`）。它也是进入
+  PDF/DOCX 这类二进制文档的唯一入口 —— grep 和 read_file 都读不了。
+- **`utf8content:` / `ansicontent:`** **按需**打开候选文件读正文，任何文本
+  文件都能搜，不受上面那个后缀列表限制。代价是明显更慢，而且只返回路径、
+  没有行号。
+- **`grep` 工具**自己读文件，给行号和正则，完全不依赖索引 —— 搜代码的首选。
+
+三者的实测差别（同一个 `.rs` 文件、同一个词）：
+
+| 写法 | 结果 |
+| --- | --- |
+| `content:"probe_chinese_ui" ext:rs` | 0 条（`.rs` 不在索引后缀里） |
+| `utf8content:"probe_chinese_ui" ext:rs` | 1 条（按需读取生效） |
+| `grep` + `filter: ext:rs` | 1 条，带行号（0.3 s，见下） |
+
 慢的根源是候选集大小，所以提速按这个顺序做。
 
 **1. 先收窄范围（最有效，零配置）。** 用 `ext:` 限后缀、把 `folder` 指到
@@ -372,22 +388,26 @@ gitignore），常见做法：
 | `content:"db_query_search2"`（仓库根目录，含 `target/`） | 默认 10s 超时 |
 | `ext:rs content:"db_query_search2"` | 立刻返回 9 个文件 |
 
-**2. 调大 `timeout_ms`。** 收窄后仍超时就加大（默认 10000，必须是
+**2. 换写法。** 代码和普通文本用 `grep` 或 `utf8content:`；只有 PDF/DOCX
+这类文档才必须用 `content:`。`utf8content:` 比 `grep` 慢一个数量级
+（15,567 个候选实测 18.7 s 对 0.30 s），所以能用 grep 就别用它。
+
+**3. 调大 `timeout_ms`。** 收窄后仍超时就加大（默认 10000，必须是
 1..300000 的整数 —— 0 和越界值都会被拒；300000 的上限用于防止单次搜索
 长期占住共享查询锁）。
 
-**3. 开内容索引（一劳永逸，但只对建了索引的目录有效）。** 在 Everything 里
-走 工具 → 选项 → 索引 → 文件夹，选中目录并勾上「索引文件内容」（1.5 的较新
+**4. 开内容索引（只对 `content:` 有效）。** 在 Everything 里走
+工具 → 选项 → 索引 → 文件夹，选中目录并勾上「索引文件内容」（1.5 的较新
 构建把这些选项挪到了「高级」页，找不到就在选项对话框里搜 `content`）。
 对应的 ini 键是 `content_indexing_enabled`、`content_indexing_include_only_files`
-和 `content_indexing_max_size`。两个坑：
+和 `content_indexing_max_size`。注意两点：
 
-- **务必把源码后缀加进 `content_indexing_include_only_files`。** 它的默认值
-  只有 `*.doc;*.docx;*.pdf;*.txt;*.xls;*.xlsx`，不含 `.rs` / `.cs` / `.py` /
-  `.md` —— 不加的话这些文件仍走按需读取，索引白开。
-- 建索引时 Everything 要读一遍所有候选文件，**首次会明显变慢**；改完 ini
-  要**重启 Everything** 才生效（运行中的实例会在退出时用内存里的旧值把
-  ini 盖回去）。
+- 默认后缀列表不含 `.rs` / `.cs` / `.py` / `.md`。**要不要加取决于你用哪种
+  写法**：加进去之后纯 `content:` 也能秒回；不加的话这些文件仍可用
+  `utf8content:` 或 `grep`，功能不缺，只是 `content:` 搜不到它们。
+- 建索引时 Everything 要读一遍所有候选文件，**首次会明显变慢**。手改 ini
+  需要重启才生效（运行中的实例会在退出时用内存里的旧值盖回去）；想立即
+  生效可以走 `Everything.exe -add-config <文件>` —— 插件的设置页就是这么做的。
 
 正文检索的可用写法（均在 1.5.0.1422b 实测）：
 

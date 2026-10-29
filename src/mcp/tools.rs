@@ -474,7 +474,10 @@ fn tool_server_diagnostics(_args: &Value) -> Result<ToolOutput, (i32, String)> {
                 "calls": t.calls,
                 "ok": t.ok,
                 "err": t.err,
+                // avg_ms 是整数，累计越大反推单次耗时越糊（可达秒级误差）；
+                // total_ms 是精确值，两者一起给才能算出「最近这几次」的真实耗时。
                 "avg_ms": t.avg_ms(),
+                "total_ms": t.total_ms,
             })
         })
         .collect();

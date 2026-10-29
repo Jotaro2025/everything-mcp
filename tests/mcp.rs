@@ -616,6 +616,21 @@ fn grep_description_documents_the_contract() {
 }
 
 #[test]
+fn tools_list_payload_stays_within_a_context_budget() {
+    // 每次会话 agent 都要拉一遍 tools/list，这一串说明直接吃它的上下文预算。
+    // 2026-10 实测 22.8 KB，压缩后重新定基线；涨回去说明又往顶层描述里塞了
+    // 参数级细节 —— 那种东西更适合放进具体参数的 description 或错误信息里。
+    let list = protocol::make_tools_list(protocol::GlobalSearchMode::Deny);
+    let json = serde_json::to_string(&list).unwrap();
+    println!("tools/list payload: {} bytes", json.len());
+    assert!(
+        json.len() < 20 * 1024,
+        "tools/list payload grew to {} bytes (budget 20 KiB)",
+        json.len()
+    );
+}
+
+#[test]
 fn empty_results_can_carry_a_folder_warning() {
     // 空结果与「路径写错」原先无法区分：四个 folder 类工具现在都会在
     // 空结果时附一句 folder_warning，描述里必须写明这个字段，否则 LLM 看到

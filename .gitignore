@@ -22,6 +22,9 @@ FAILED
 # ===== 安装包构建产物（build-installers.ps1 的输出与中间文件）=====
 installer/build/
 installer/dist/
+# version.h 由 build-installers.ps1 从 Cargo.toml 生成（版本号单一来源），
+# 入库只会在发版时漂移（1.4.0 就漏更新过，停在 1.3.1.0）。
+installer/setup/version.h
 
 # ===== 操作系统 / 编辑器 =====
 Thumbs.db
