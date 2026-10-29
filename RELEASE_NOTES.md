@@ -2,6 +2,8 @@
 
 ## 中文
 
+1.4.1 是一次修复与打磨版本：修掉内容索引开关勾选后不生效的竞态，让 grep 在按文档格式过滤时不再给出无声的 0 结果，并把正文检索的三种写法（`content:` / `utf8content:` / `grep`）讲清楚。同时把 grep 的每文件句柄打开次数从 3 次降到 1 次、工具清单体积压掉 12%。无破坏性变更，现有设置与端口配置原样保留。
+
 ### 修复
 
 - **「启用内容索引」开关勾选后没生效。** 旧实现先把 ini 写成新值、再调官方 `-add-config` 合并进运行中实例；转发进程退出时会用它自己那份状态覆盖 ini，把刚写好的键改回去。实机复现：安装插件重启 Everything 后 23 秒内勾选，ini 先被写成 1、同一秒又被覆盖回 0，而插件只看到「命令发出去了」就报了成功。现在只发 `-add-config`（它自己会落盘），并按回读结果校验：不一致就补写 ini 兜底、退避重试，三次仍不生效则如实报错并保留 Apply 按钮供重试。
@@ -36,6 +38,8 @@
 ---
 
 ## English
+
+1.4.1 is a fix-and-polish release: it repairs the race that made the content-indexing switch silently fail, stops grep from returning an unexplained zero when filtering by document format, and documents the three content-search spellings (`content:` / `utf8content:` / `grep`) properly. It also cuts grep's per-file handle opens from three to one and trims the tool manifest by 12%. No breaking changes — existing settings and port configuration carry over.
 
 ### Fixes
 
