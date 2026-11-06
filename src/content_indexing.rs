@@ -244,20 +244,31 @@ mod tests {
     #[test]
     fn forwarder_input_survives_until_child_exit() {
         use std::os::windows::process::CommandExt;
+        if let Some(input) = std::env::var_os("EMCP_TEST_INPUT") {
+            std::thread::sleep(Duration::from_millis(1200));
+            assert!(std::path::Path::new(&input).is_file());
+            return;
+        }
         let file =
             std::env::temp_dir().join(format!("emcp-forwarder-test-{}.ini", std::process::id()));
-        let mut command = Command::new("powershell.exe");
-        command.args(["-NoProfile", "-NonInteractive", "-Command",
-            "Start-Sleep -Milliseconds 1200; if (-not (Test-Path -LiteralPath $env:EMCP_TEST_INPUT)) { exit 7 }"])
-            .env("EMCP_TEST_INPUT", &file).creation_flags(0x0800_0000);
-        assert!(run_with_input(
+        // Run this native test executable as the delayed reader. PowerShell's
+        // first startup on a fresh CI runner can exceed the forwarder timeout.
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "content_indexing::tests::forwarder_input_survives_until_child_exit",
+            ])
+            .env("EMCP_TEST_INPUT", &file)
+            .creation_flags(0x0800_0000);
+        let result = run_with_input(
             command,
             file.clone(),
             b"fixture",
             &AtomicBool::new(false),
-            Duration::from_secs(10)
-        )
-        .is_ok());
+            Duration::from_secs(30),
+        );
+        assert!(result.is_ok(), "{result:?}");
         assert!(!file.exists());
     }
 }
