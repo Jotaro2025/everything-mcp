@@ -20,6 +20,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 // windows-sys 0.59 中：
 //   - HANDLE 是 *mut c_void
@@ -126,10 +127,7 @@ impl EventSlot {
     /// 等待方用：先掏空槽位（锁内），再关闭句柄 —— 关闭必然发生在任何
     /// 可能拿着该句柄的 signal() 之后。
     fn take_and_close() {
-        let h = EVENT_SLOT
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .take();
+        let h = EVENT_SLOT.lock().unwrap_or_else(|p| p.into_inner()).take();
         if let Some(h) = h {
             unsafe { CloseHandle(h as Handle) };
         }
@@ -239,7 +237,6 @@ impl SearchOptions {
         }
     }
 }
-
 
 /// 拼 Everything 搜索字符串。纯函数，单独单测。
 ///
@@ -351,7 +348,7 @@ pub fn search_in_folder(
     options: SearchOptions,
 ) -> Result<SearchOutcome, String> {
     let q = submit_query(folder, pattern, options, timeout_ms)?;
-    read_results(q.query, offset, max_results)
+    read_results(q.query, offset, max_results, q.deadline)
 }
 
 /// 统计文件夹下匹配 `pattern` 的条目数，不读出任何名字。
@@ -365,7 +362,7 @@ pub fn count_in_folder(folder: &str, pattern: &str, timeout_ms: u32) -> Result<u
         SearchOptions::for_scope(SearchScope::Recursive),
         timeout_ms,
     )?;
-    count_results(q.query)
+    count_results(q.query, q.deadline)
 }
 
 /// 在整个 Everything 索引上按 pattern 搜索（不限文件夹）。
@@ -386,7 +383,7 @@ pub fn search_everywhere(
         ..options
     };
     let q = submit_query("", pattern, options, timeout_ms)?;
-    read_results(q.query, offset, max_results)
+    read_results(q.query, offset, max_results, q.deadline)
 }
 
 /// 一次已提交且已完成的查询。
@@ -400,6 +397,7 @@ pub fn search_everywhere(
 /// 字段声明顺序即 Drop 顺序：先释放缓冲区，最后才解锁。
 struct CompletedQuery {
     query: DbQueryHandle,
+    deadline: Instant,
     _keepalive: LeakedBuf,
     _host_lock: std::sync::MutexGuard<'static, ()>,
 }
@@ -417,6 +415,7 @@ fn submit_query(
     options: SearchOptions,
     timeout_ms: u32,
 ) -> Result<CompletedQuery, String> {
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms as u64);
     let host = Host::get();
 
     // 安全护栏：阻止搜索空目录或异常短路径导致的全部磁盘扫描。
@@ -429,7 +428,19 @@ fn submit_query(
     let search_string = build_search_string(folder, pattern, options.scope);
 
     // 2. 加锁、创建事件、设置槽位、提交查询、等待。
-    let guard = Host::lock_host();
+    let guard = loop {
+        if crate::mcp::server::shutting_down() || Instant::now() >= deadline {
+            return Err("search cancelled or timed out while queued".into());
+        }
+        match super::host::HOST_LOCK.try_lock() {
+            Ok(guard) => break guard,
+            Err(std::sync::TryLockError::Poisoned(p)) => break p.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                std::thread::sleep(Duration::from_millis(5))
+            }
+        }
+    };
+    let search = host.db_query_search.ok_or("db_query_search2 null")?;
 
     // 把 UTF-8 字符串末尾补 null，供主程序读取。
     let mut search_bytes = search_string.into_bytes();
@@ -453,7 +464,6 @@ fn submit_query(
     // 提交搜索。
     // 参数表严格按 etp_server.c 中 everything_plugin_db_query_search2 的调用形式：
     // 大量参数传 0/NULL，仅保留 force/allow_*/clear_* 这些必要开关。
-    let search = host.db_query_search.ok_or("db_query_search2 null")?;
     super::diag::verbose(&format!(
         "submit_query: search_bytes_len={} search={:?}",
         search_bytes.len(),
@@ -492,7 +502,7 @@ fn submit_query(
     // c->is_query 同样是在 event_proc 收到完成事件后才清零）。
     QUERY_SUBMITTED.store(true, Ordering::SeqCst);
     let raw_ctx = Box::into_raw(ctx) as *mut core::ffi::c_void;
-    let r = super::main_thread::invoke_c(run_search_on_main, raw_ctx);
+    let r = super::main_thread::invoke_until(run_search_on_main, raw_ctx, deadline);
     // 无论成败都回收 ctx —— run_search_on_main 不持有它超过调用期。
     let mut ctx = unsafe { Box::from_raw(raw_ctx as *mut SearchCtx) };
     let query = ctx.query;
@@ -509,35 +519,33 @@ fn submit_query(
     }
 
     // WaitForSingleObject 第一个参数是 HANDLE (isize)。
-    let mut waited = 0u32;
-    let step = 200u32;
     let mut signaled = false;
-    while waited < timeout_ms {
+    while !crate::mcp::server::shutting_down() {
+        let remain = deadline.saturating_duration_since(Instant::now());
+        if remain.is_zero() {
+            break;
+        }
+        let step = remain.as_millis().clamp(1, 200) as u32;
         let r = unsafe { WaitForSingleObject(event, step) };
         if r == WAIT_OBJECT_0 {
             signaled = true;
             break;
         }
-        if r == WAIT_TIMEOUT {
-            waited += step;
-            // 停机感知：PM_STOP 正在 join 本线程（通过 HTTP 连接线程），
-            // 不能傻等到 timeout_ms —— 客户端可传 49 天。立即按超时收场
-            // （走下面的放弃路径，缓冲区会被泄漏而不是释放）。
-            if crate::mcp::server::shutting_down() {
-                waited = timeout_ms;
-                break;
-            }
-            continue;
+        if r != WAIT_TIMEOUT {
+            break;
         }
-        // 其他错误返回（WAIT_FAILED 等）：立即跳出
-        break;
     }
 
     // 等待结束（无论是否等到）即撤守卫 —— 之后再来完成事件都与本次无关。
     QUERY_SUBMITTED.store(false, Ordering::SeqCst);
     super::diag::verbose(&format!(
         "submit_query: wait done signaled={} waited={}ms",
-        signaled, waited
+        signaled,
+        timeout_ms.saturating_sub(
+            deadline
+                .saturating_duration_since(Instant::now())
+                .as_millis() as u32
+        )
     ));
     EventSlot::take_and_close();
 
@@ -546,7 +554,7 @@ fn submit_query(
         // db_query_cancel 与 search2/结果读取一样有主线程亲和性（query
         // 对象归主线程所有），因此同样 marshal 过去，不能在本线程直接调。
         // 此刻仍持有 HOST_LOCK —— 主线程 wndproc 不取该锁，不会死锁。
-        cancel_query(query);
+        cancel_query(query, deadline);
         // 关键：后台查询可能仍在读 search_string（cancel 可能不存在、
         // 也无法证明已生效），缓冲区绝不能在这里 free —— 泄漏它。
         // 见 LeakedBuf 的文档。查询对象本身由全局槽位复用，不动。
@@ -558,6 +566,7 @@ fn submit_query(
     // 直到它读完结果（或计数）才释放。
     Ok(CompletedQuery {
         query,
+        deadline,
         _keepalive: leaked,
         _host_lock: guard,
     })
@@ -659,6 +668,8 @@ unsafe extern "system" fn run_search_on_main(ctx: *mut core::ffi::c_void) {
             "run_search_on_main: property_get_builtin_type({}) returned NULL",
             sort_type
         ));
+        c.error = Some("sort property unavailable".into());
+        return;
     }
     // db_query_search2 的 sort_ascending：1 = 升序，0 = 降序。
     let sort_ascending = if opts.descending { 0 } else { 1 };
@@ -785,7 +796,7 @@ unsafe extern "system" fn run_cancel_on_main(ctx: *mut core::ffi::c_void) {
 ///
 /// 主程序没有导出该函数时静默返回（查询本体最终也会超时收场）。
 /// marshal 失败也只记诊断 —— 取消是尽力而为，不该把原始错误盖掉。
-fn cancel_query(query: DbQueryHandle) {
+fn cancel_query(query: DbQueryHandle, deadline: Instant) {
     let host = Host::get();
     let Some(cancel) = host.db_query_cancel else {
         super::diag::write("cancel_query: db_query_cancel not available");
@@ -793,7 +804,11 @@ fn cancel_query(query: DbQueryHandle) {
     };
     let ctx = Box::new(CancelCtx { cancel, query });
     let raw = Box::into_raw(ctx) as *mut core::ffi::c_void;
-    let r = super::main_thread::invoke_c(run_cancel_on_main, raw);
+    let r = super::main_thread::invoke_until(
+        run_cancel_on_main,
+        raw,
+        deadline + Duration::from_millis(200),
+    );
     // invoke_c 返回即代表主线程已执行完（或确认未执行），ctx 可以回收。
     drop(unsafe { Box::from_raw(raw as *mut CancelCtx) });
     if let Err(e) = r {
@@ -809,6 +824,7 @@ fn read_results(
     query: DbQueryHandle,
     offset: usize,
     max_results: usize,
+    deadline: Instant,
 ) -> Result<SearchOutcome, String> {
     let ctx = Box::new(ReadCtx {
         query,
@@ -819,7 +835,7 @@ fn read_results(
         error: None,
     });
     let raw_ctx = Box::into_raw(ctx) as *mut core::ffi::c_void;
-    let r = super::main_thread::invoke_c(run_read_on_main, raw_ctx);
+    let r = super::main_thread::invoke_until(run_read_on_main, raw_ctx, deadline);
     // 取回 ctx（主线程已把结果与总数写进它的字段）。
     let mut ctx = unsafe { Box::from_raw(raw_ctx as *mut ReadCtx) };
     r.map_err(|e| format!("read_results invoke failed: {}", e))?;
@@ -834,14 +850,14 @@ fn read_results(
 }
 
 /// 只读查询命中总数（不碰任何条目的 name/path）。同样 marshal 到主线程。
-fn count_results(query: DbQueryHandle) -> Result<usize, String> {
+fn count_results(query: DbQueryHandle, deadline: Instant) -> Result<usize, String> {
     let ctx = Box::new(CountCtx {
         query,
         total: 0,
         error: None,
     });
     let raw_ctx = Box::into_raw(ctx) as *mut core::ffi::c_void;
-    let r = super::main_thread::invoke_c(run_count_on_main, raw_ctx);
+    let r = super::main_thread::invoke_until(run_count_on_main, raw_ctx, deadline);
     let mut ctx = unsafe { Box::from_raw(raw_ctx as *mut CountCtx) };
     r.map_err(|e| format!("count_results invoke failed: {}", e))?;
     match ctx.error.take() {
@@ -1074,7 +1090,7 @@ mod tests {
         assert_eq!(page_window(100, 0, 50), (0, 50));
         assert_eq!(page_window(100, 50, 50), (50, 50));
         assert_eq!(page_window(100, 90, 50), (90, 10)); // 最后一批不足一页
-        // max_results == 0 表示读到末尾。
+                                                        // max_results == 0 表示读到末尾。
         assert_eq!(page_window(100, 40, 0), (40, 60));
         assert_eq!(page_window(100, 0, 0), (0, 100));
         // offset 越界 → 空窗口，不 panic。

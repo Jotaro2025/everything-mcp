@@ -92,7 +92,8 @@ pub const PROTOCOL_VERSION_LEGACY: &str = "2024-11-05";
 pub const PROTOCOL_VERSION_MODERN: &str = "2026-07-28";
 /// 本服务端支持的协议版本。同时用于 discover 结果与 -32022 错误的
 /// `data.supported` 列表 —— 客户端从中选一个重试即可。
-pub const SUPPORTED_PROTOCOL_VERSIONS: [&str; 2] = [PROTOCOL_VERSION_LEGACY, PROTOCOL_VERSION_MODERN];
+pub const SUPPORTED_PROTOCOL_VERSIONS: [&str; 2] =
+    [PROTOCOL_VERSION_LEGACY, PROTOCOL_VERSION_MODERN];
 
 /// `_meta` 中承载协议版本的键（2026-07-28）。
 pub const META_PROTOCOL_VERSION_KEY: &str = "io.modelcontextprotocol/protocolVersion";
@@ -547,7 +548,7 @@ fn build_tools_list(mode: GlobalSearchMode) -> Value {
             },
             {
                 "name": "index_changes",
-                "description": "Query the Everything index journal: which files/folders were created, modified, deleted, renamed or moved, most recent first. This answers 'what changed recently' from Everything's change history — it does not describe the current index state (use search_in_folder for that). Requires 'journal_log' to be enabled in Everything (Tools > Options > Index > Journal > Log changes); when it is off the tool returns an error that says so. Results are capped by max_results and carry 'truncated' when more matching history exists further back. Each entry's 'action_text' holds Everything's original localized action label, so an unfamiliar locale still reads sensibly. NOTE: Everything appends journal rows to its log file with a delay — measured from about 8 s up to 70 s — so a change made moments ago may not be in the results yet. Re-query after a short wait, and never read an empty result as proof that nothing happened.",
+                "description": "Query the Everything index journal: which files/folders were created, modified, deleted, renamed or moved, most recent first. This answers 'what changed recently' from Everything's change history — it does not describe the current index state (use search_in_folder for that). Requires 'journal_log' to be enabled in Everything (Tools > Options > Index > Journal > Log changes); when it is off the tool returns an error that says so. Results are capped by max_results and carry 'truncated' and 'truncation_reason' when scanning stops early: max_results, byte_budget (64 MiB total), deadline (30 seconds), day_limit (92 files), file_window, output_budget, line_limit, cancelled or read_error. Each entry's 'action_text' holds Everything's original localized action label, so an unfamiliar locale still reads sensibly. NOTE: Everything appends journal rows to its log file with a delay — measured from about 8 s up to 70 s — so a change made moments ago may not be in the results yet. Re-query after a short wait, and never read an empty result as proof that nothing happened.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -610,7 +611,7 @@ fn build_tools_list(mode: GlobalSearchMode) -> Value {
             },
             {
                 "name": "grep",
-                "description": "Search file CONTENTS by regular expression and return the matching lines with their line numbers. This is the line-level companion to search_in_folder: that one uses Everything's index to answer WHICH files contain something (paths only), while grep reads the candidate files and reports the matching lines themselves. Candidates are still picked by the Everything index, so 'filter' decides how much actually gets read — an unfiltered grep over a large tree reads every file. Narrow 'filter' first with 'ext:' / '!' (same Everything operators as search_in_folder); 'pattern' stays a Rust regex. Three internal caps bound that work: 2000 candidate files, 64 MiB read, and a 128 KiB budget on the matched text that is returned; 'truncated' plus 'candidates' / 'files_scanned' / 'bytes_scanned' tell you which one bit. 'pattern' is a Rust regex matched against each line individually, so '^' and '$' anchor to line boundaries and a pattern containing a literal newline can never match. 'filter' takes the same Everything syntax as search_in_folder's pattern ('ext:rs;toml', 'dm:lastweek', '!\\\\target\\\\') and is applied before any file is read — use it. 'output_mode' picks the shape: 'content' (default) returns {path, line, text} hits, 'filesWithMatches' returns just the paths, 'count' returns per-file hit counts. 'head_limit' caps matches (content) or files (other modes); default 200, max 2000 — the 128 KiB budget is the real limiter. Matched lines longer than 16384 characters are cut and counted in 'clipped_lines'. Binary files (by extension or by content sniff), files above 8 MiB and denylisted paths (private keys, .env, credentials, .git/objects) are skipped silently — grep never returns content from them. Results are ordered by file modification time, newest first. Prefer this over search_in_folder + read_file when you need to know WHERE inside the files something is. When nothing matches, the response adds a 'folder_warning' if the folder does not exist, is unreachable, or is a file — so an empty result is distinguishable from a wrong path.",
+                "description": "Search file CONTENTS by regular expression and return the matching lines with their line numbers. This is the line-level companion to search_in_folder: that one uses Everything's index to answer WHICH files contain something (paths only), while grep reads the candidate files and reports the matching lines themselves. Candidates are still picked by the Everything index, so 'filter' decides how much actually gets read — an unfiltered grep over a large tree reads every file. Narrow 'filter' first with 'ext:' / '!' (same Everything operators as search_in_folder); 'pattern' stays a Rust regex. Internal caps bound that work: 2000 candidates, 64 MiB actual reads (including rejected binary samples), a 128 KiB matched-text budget, and timeout_ms for the whole query and scan; truncation_reason identifies the limit and files_skipped counts rejected files; 'truncated' plus 'candidates' / 'files_scanned' / 'bytes_scanned' tell you which one bit. 'pattern' is a Rust regex matched against each line individually, so '^' and '$' anchor to line boundaries and a pattern containing a literal newline can never match. 'filter' takes the same Everything syntax as search_in_folder's pattern ('ext:rs;toml', 'dm:lastweek', '!\\\\target\\\\') and is applied before any file is read — use it. 'output_mode' picks the shape: 'content' (default) returns {path, line, text} hits, 'filesWithMatches' returns just the paths, 'count' returns per-file hit counts. 'head_limit' caps matches (content) or files (other modes); default 200, max 2000 — the 128 KiB budget is the real limiter. Matched lines longer than 16384 characters are cut and counted in 'clipped_lines'. Binary files (by extension or by content sniff), files above 8 MiB and denylisted paths (private keys, .env, credentials, .git/objects) are skipped silently — grep never returns content from them. Results are ordered by file modification time, newest first. Prefer this over search_in_folder + read_file when you need to know WHERE inside the files something is. When nothing matches, the response adds a 'folder_warning' if the folder does not exist, is unreachable, or is a file — so an empty result is distinguishable from a wrong path.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -651,7 +652,7 @@ fn build_tools_list(mode: GlobalSearchMode) -> Value {
                         },
                         "timeout_ms": {
                             "type": "integer",
-                            "description": "Maximum time in milliseconds to wait for the Everything candidate query (1..300000, default 10000). Reading the candidates afterwards is not covered by it.",
+                            "description": "Cooperative timeout for the candidate query and content scan together (1..300000 ms, default 10000). Checks run between I/O operations; an executing Windows/SMB call must return safely.",
                             "default": 10000,
                             "minimum": 1,
                             "maximum": 300000u64
@@ -716,7 +717,7 @@ pub fn error_response_with_data(
 ) -> JsonRpcMessage {
     JsonRpcMessage {
         jsonrpc: "2.0".into(),
-        id: id.clone(),
+        id: Some(id.clone().unwrap_or(Value::Null)),
         method: None,
         params: None,
         result: None,

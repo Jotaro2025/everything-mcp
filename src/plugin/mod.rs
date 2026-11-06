@@ -6,6 +6,7 @@
 // PM_* 消息常量列出全部值便于对照主程序文档，其中部分未使用。
 #![allow(dead_code)]
 
+pub(crate) mod budget;
 pub mod diag;
 pub mod ffi_types;
 pub mod grep;

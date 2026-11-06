@@ -2,7 +2,8 @@
 //!
 //! 覆盖不依赖 Everything 主程序环境的纯逻辑：JSON-RPC 分发、HTTP 头部解析与
 //! 响应构造、协议类型、工具参数校验。凡需要 db_query_search2 的路径（真正
-//! 执行搜索）都必须在 Everything 进程内手动验证，不在自动化范围内。
+//! 执行搜索）在 Everything 进程内通过 `python tests/live_host.py` 验证，
+//! 不属于这组无宿主测试的范围。
 
 use everything_mcp::mcp::protocol;
 use everything_mcp::mcp::server;
@@ -95,7 +96,10 @@ fn tools_list_contains_eight_tools_with_required_params() {
         10_000
     );
     // timeout_ms 的 schema 范围必须与运行时校验一致：timeout_arg 拒 0 与 > u32::MAX。
-    assert_eq!(search["inputSchema"]["properties"]["timeout_ms"]["minimum"], 1);
+    assert_eq!(
+        search["inputSchema"]["properties"]["timeout_ms"]["minimum"],
+        1
+    );
     assert_eq!(
         search["inputSchema"]["properties"]["timeout_ms"]["maximum"],
         tools::MAX_TIMEOUT_MS as u64
@@ -140,7 +144,10 @@ fn tools_list_contains_eight_tools_with_required_params() {
     assert_eq!(read_props["max_lines"]["maximum"], 4000);
 
     // grep：pattern + folder 必填，其余带默认值。
-    assert_eq!(tools[5]["inputSchema"]["required"], json!(["pattern", "folder"]));
+    assert_eq!(
+        tools[5]["inputSchema"]["required"],
+        json!(["pattern", "folder"])
+    );
     let grep_props = &tools[5]["inputSchema"]["properties"];
     assert_eq!(grep_props["output_mode"]["default"], "content");
     assert_eq!(
@@ -151,7 +158,10 @@ fn tools_list_contains_eight_tools_with_required_params() {
     assert_eq!(grep_props["case_insensitive"]["default"], false);
     assert_eq!(grep_props["timeout_ms"]["default"], 10_000);
     assert_eq!(grep_props["timeout_ms"]["minimum"], 1);
-    assert_eq!(grep_props["timeout_ms"]["maximum"], tools::MAX_TIMEOUT_MS as u64);
+    assert_eq!(
+        grep_props["timeout_ms"]["maximum"],
+        tools::MAX_TIMEOUT_MS as u64
+    );
 
     // search_everywhere：只要求 pattern；max_results 与另外两个搜索工具同一套硬窗口。
     assert_eq!(tools[6]["inputSchema"]["required"], json!(["pattern"]));
@@ -162,7 +172,10 @@ fn tools_list_contains_eight_tools_with_required_params() {
     assert_eq!(global_props["offset"]["default"], 0);
     assert_eq!(global_props["timeout_ms"]["default"], 10_000);
     assert_eq!(global_props["timeout_ms"]["minimum"], 1);
-    assert_eq!(global_props["timeout_ms"]["maximum"], tools::MAX_TIMEOUT_MS as u64);
+    assert_eq!(
+        global_props["timeout_ms"]["maximum"],
+        tools::MAX_TIMEOUT_MS as u64
+    );
     assert_eq!(global_props["sort"]["default"], "name");
     assert_eq!(
         global_props["sort"]["enum"],
@@ -171,10 +184,7 @@ fn tools_list_contains_eight_tools_with_required_params() {
 
     // server_diagnostics：零参数、只读 —— 无 required 无 properties，注解标只读幂等。
     assert!(tools[7]["inputSchema"].get("required").is_none());
-    assert_eq!(
-        tools[7]["inputSchema"]["properties"],
-        json!({})
-    );
+    assert_eq!(tools[7]["inputSchema"]["properties"], json!({}));
     assert_eq!(tools[7]["annotations"]["readOnlyHint"], true);
     assert_eq!(tools[7]["annotations"]["destructiveHint"], false);
     assert_eq!(tools[7]["annotations"]["idempotentHint"], true);
@@ -200,12 +210,10 @@ fn search_everywhere_annotations_and_policy_follow_the_global_mode() {
     // Allow：只读注解 + 直接放行的说明。
     assert_eq!(allow["annotations"]["readOnlyHint"], true);
     assert_eq!(allow["annotations"]["destructiveHint"], false);
-    assert!(
-        allow["description"]
-            .as_str()
-            .unwrap()
-            .contains("global search' = allow")
-    );
+    assert!(allow["description"]
+        .as_str()
+        .unwrap()
+        .contains("global search' = allow"));
 
     // Review：非只读 + 破坏性（驱动确认弹窗），描述点名 USER 必须确认、磁盘不改。
     assert_eq!(review["annotations"]["readOnlyHint"], false);
@@ -281,14 +289,26 @@ fn search_description_warns_against_shell_glob_and_documents_truncation() {
     // 描述里必须点明三件评测中被踩过的坑：不是 glob、排除语法、截断可见。
     let desc = search["description"].as_str().unwrap();
     assert!(desc.contains("**/*.rs"), "desc should reject shell glob");
-    assert!(desc.contains('!'), "desc should document the '!' exclusion prefix");
-    assert!(desc.contains("total"), "desc should document the total/count pair");
-    assert!(desc.contains("content:"), "desc should mention content search");
+    assert!(
+        desc.contains('!'),
+        "desc should document the '!' exclusion prefix"
+    );
+    assert!(
+        desc.contains("total"),
+        "desc should document the total/count pair"
+    );
+    assert!(
+        desc.contains("content:"),
+        "desc should mention content search"
+    );
     // 新增能力也要在描述里点明：时间戳、翻页、排序。
     assert!(desc.contains("modified"), "desc should mention timestamps");
     assert!(desc.contains("offset"), "desc should document paging");
     // 截断必须可见，并且要给出「翻页 vs 收窄」的取舍 —— 翻页会重跑查询。
-    assert!(desc.contains("truncated"), "desc should document the truncated flag");
+    assert!(
+        desc.contains("truncated"),
+        "desc should document the truncated flag"
+    );
     assert!(
         desc.contains("re-runs the search"),
         "desc should warn that paging re-runs the search"
@@ -342,8 +362,14 @@ fn search_scope_documents_the_index_premise() {
         .unwrap()
         .to_string();
     let docs = [
-        list["tools"][0]["description"].as_str().unwrap().to_string(),
-        list["tools"][1]["description"].as_str().unwrap().to_string(),
+        list["tools"][0]["description"]
+            .as_str()
+            .unwrap()
+            .to_string(),
+        list["tools"][1]["description"]
+            .as_str()
+            .unwrap()
+            .to_string(),
         instructions,
     ];
     for d in &docs {
@@ -351,7 +377,10 @@ fn search_scope_documents_the_index_premise() {
             d.contains("Search scope follows Everything's index"),
             "desc: {d}"
         );
-        assert!(d.contains("Tools > Options > Indexes > Folders"), "desc: {d}");
+        assert!(
+            d.contains("Tools > Options > Indexes > Folders"),
+            "desc: {d}"
+        );
         assert!(d.contains("0 results, not an error"), "desc: {d}");
     }
 }
@@ -368,14 +397,32 @@ fn read_file_description_documents_the_contract() {
     assert!(desc.contains("list_folder"), "desc: {desc}");
     assert!(desc.contains("8 MiB"), "desc should state the size limit");
     assert!(desc.contains("start_line"), "desc should document paging");
-    assert!(desc.contains("encoding"), "desc should document the encoding field");
-    assert!(desc.contains("NUL"), "desc should say binary files are rejected");
+    assert!(
+        desc.contains("encoding"),
+        "desc should document the encoding field"
+    );
+    assert!(
+        desc.contains("NUL"),
+        "desc should say binary files are rejected"
+    );
     // 加固后的三项：黑名单、超长行裁剪、可分支的错误码。
-    assert!(desc.contains("denylist"), "desc should document the denylist");
+    assert!(
+        desc.contains("denylist"),
+        "desc should document the denylist"
+    );
     assert!(desc.contains("id_rsa"), "desc should name the denied files");
-    assert!(desc.contains("clipped_lines"), "desc should document line clipping");
-    assert!(desc.contains("next_start_line"), "desc should hand back the next offset");
-    assert!(desc.contains("PATH_DENIED"), "desc should list the error codes");
+    assert!(
+        desc.contains("clipped_lines"),
+        "desc should document line clipping"
+    );
+    assert!(
+        desc.contains("next_start_line"),
+        "desc should hand back the next offset"
+    );
+    assert!(
+        desc.contains("PATH_DENIED"),
+        "desc should list the error codes"
+    );
     // 与 content: 检索的分工必须写清楚 —— 这是最容易混的一处。
     assert!(desc.contains("content:"), "desc: {desc}");
 
@@ -489,8 +536,7 @@ fn read_file_reads_a_real_file_and_windows_lines() {
         &json!({"path": path.to_string_lossy(), "start_line": 1, "max_lines": 4000}),
     )
     .unwrap();
-    let meta: Value =
-        serde_json::from_str(out.0["content"][0]["text"].as_str().unwrap()).unwrap();
+    let meta: Value = serde_json::from_str(out.0["content"][0]["text"].as_str().unwrap()).unwrap();
     assert_eq!(meta["lines_returned"], 4);
     assert_eq!(meta["truncated"], false);
     assert_eq!(meta["next_start_line"], Value::Null);
@@ -536,7 +582,10 @@ fn read_file_reports_folders_and_missing_files_as_tool_errors() {
     let err = out_error(&out);
     assert_eq!(err["code"], "PATH_IS_DIRECTORY");
     assert_eq!(err["suggested_tool"], "list_folder");
-    assert_eq!(err["suggested_args"]["folder"], dir.to_string_lossy().as_ref());
+    assert_eq!(
+        err["suggested_args"]["folder"],
+        dir.to_string_lossy().as_ref()
+    );
 
     let missing = dir.join("everything_mcp_definitely_missing_file.txt");
     let out = tools::dispatch("read_file", &json!({"path": missing.to_string_lossy()})).unwrap();
@@ -573,8 +622,14 @@ fn grep_description_documents_the_contract() {
     assert!(desc.contains("search_in_folder"), "desc: {desc}");
     assert!(desc.contains("line"), "desc should mention line numbers");
     assert!(desc.contains("head_limit"), "desc: {desc}");
-    assert!(desc.contains("truncated"), "desc should document truncation");
-    assert!(desc.contains("newest first"), "desc should state the ordering");
+    assert!(
+        desc.contains("truncated"),
+        "desc should document truncation"
+    );
+    assert!(
+        desc.contains("newest first"),
+        "desc should state the ordering"
+    );
     // 二进制 / 超大 / 黑名单都要写明是「跳过」而不是报错。
     assert!(desc.contains("skipped"), "desc: {desc}");
     assert!(desc.contains("denylisted"), "desc should name the denylist");
@@ -716,7 +771,10 @@ fn list_folder_description_documents_zero_folder_size() {
     // 超时也要可调，与另外三个搜索类工具对齐（原先写死 10 秒）。
     assert_eq!(schema["properties"]["timeout_ms"]["default"], 10000);
     assert_eq!(schema["properties"]["timeout_ms"]["minimum"], 1);
-    assert_eq!(schema["properties"]["timeout_ms"]["maximum"], tools::MAX_TIMEOUT_MS as u64);
+    assert_eq!(
+        schema["properties"]["timeout_ms"]["maximum"],
+        tools::MAX_TIMEOUT_MS as u64
+    );
     assert!(desc.contains("timeout_ms"), "desc: {desc}");
 }
 
@@ -730,12 +788,15 @@ fn result_window_is_validated_identically_across_the_three_search_tools() {
     // 注意合法窗口不能在这里断言「没被拒」：那会走到搜索层，而 Host::get()
     // 在测试进程里没有 PM_INIT，直接 panic（这是本仓库的既有约定）。
     let cases = [
-        ("search_in_folder", json!({"folder": "C:\\", "pattern": "*.rs"})),
+        (
+            "search_in_folder",
+            json!({"folder": "C:\\", "pattern": "*.rs"}),
+        ),
         ("list_folder", json!({"folder": "C:\\"})),
         ("search_everywhere", json!({"pattern": "ab"})),
     ];
     for (tool, base) in cases {
-        for bad in [0, 2001, 99999] {
+        for bad in [0u64, 2001, 99999, 4_294_967_297, u64::MAX] {
             let mut args = base.clone();
             args["max_results"] = json!(bad);
             let err = tools::dispatch(tool, &args).unwrap_err();
@@ -759,18 +820,16 @@ fn timeout_ms_is_validated_identically_across_the_four_search_tools() {
     //
     // 全部在触达 Everything host 之前返回，无主程序环境的 CI 也能跑。
     let cases = [
-        ("search_in_folder", json!({"folder": "C:\\", "pattern": "*.rs"})),
+        (
+            "search_in_folder",
+            json!({"folder": "C:\\", "pattern": "*.rs"}),
+        ),
         ("list_folder", json!({"folder": "C:\\"})),
         ("grep", json!({"folder": "C:\\", "pattern": "x"})),
         ("search_everywhere", json!({"pattern": "ab"})),
     ];
     for (tool, base) in cases {
-        for bad in [
-            0u64,
-            tools::MAX_TIMEOUT_MS as u64 + 1,
-            1u64 << 32,
-            u64::MAX,
-        ] {
+        for bad in [0u64, tools::MAX_TIMEOUT_MS as u64 + 1, 1u64 << 32, u64::MAX] {
             let mut args = base.clone();
             args["timeout_ms"] = json!(bad);
             let err = tools::dispatch(tool, &args).unwrap_err();
@@ -839,8 +898,8 @@ fn message_round_trips_through_json() {
 
 #[test]
 fn parse_header_extracts_method_path_and_length() {
-    let head =
-        server::parse_header("POST /mcp HTTP/1.1\r\nHost: x\r\ncontent-length: 42\r\n\r\n").unwrap();
+    let head = server::parse_header("POST /mcp HTTP/1.1\r\nHost: x\r\ncontent-length: 42\r\n\r\n")
+        .unwrap();
     assert_eq!(head.method, "POST");
     assert_eq!(head.path, "/mcp");
     assert_eq!(head.content_length, 42);
@@ -930,7 +989,10 @@ fn legacy_notifications_are_202_with_empty_body() {
 fn dispatch_unknown_method_is_method_not_found() {
     let resp = dispatch(r#"{"jsonrpc":"2.0","id":3,"method":"resources/list"}"#);
     assert_eq!(resp["error"]["code"], protocol::METHOD_NOT_FOUND);
-    assert!(resp["error"]["message"].as_str().unwrap().contains("resources/list"));
+    assert!(resp["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("resources/list"));
 }
 
 #[test]
@@ -971,14 +1033,20 @@ fn server_diagnostics_reports_server_state_without_arguments() {
     // 服务身份与版本号同源（Cargo.toml）。
     assert_eq!(v["server"]["name"], "everything-mcp");
     assert_eq!(v["server"]["version"], env!("CARGO_PKG_VERSION"));
-    assert_eq!(v["server"]["protocol_versions"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        v["server"]["protocol_versions"].as_array().unwrap().len(),
+        2
+    );
     // 测试进程从未启用服务：bound_port 应为 None（listening=false）。
     assert_eq!(v["server"]["listening"], json!(false));
     assert_eq!(v["server"]["enabled"], json!(false));
     // 默认档位是 Deny；journal 目录与诊断日志给出路径（存在与否随环境）。
     assert_eq!(v["global_search"]["mode"], "deny");
     assert!(v["index_changes_prerequisite"]["journal_log_directory"].is_string());
-    assert!(v["diagnostic_log"]["path"].as_str().unwrap().contains("plugin.log"));
+    assert!(v["diagnostic_log"]["path"]
+        .as_str()
+        .unwrap()
+        .contains("plugin.log"));
     // 每工具统计覆盖 8 个真实工具 + 1 个未知兜底行（与 total_calls 的求和
     // 范围一致 —— 少列一行总数就对不上）。
     let tools = v["stats"]["tools"].as_array().unwrap();
@@ -1099,7 +1167,9 @@ fn short_name_of(path: &std::path::Path) -> Option<String> {
         return None;
     }
     out.truncate(n as usize);
-    let s = std::ffi::OsString::from_wide(&out).to_string_lossy().into_owned();
+    let s = std::ffi::OsString::from_wide(&out)
+        .to_string_lossy()
+        .into_owned();
     // 只有当短名真的不同于长名（~ 存在）才算拿到短名。
     if s != path.to_string_lossy() {
         Some(s)
@@ -1202,7 +1272,10 @@ fn normalize_exclude_term_collapses_doubled_backslashes() {
     assert_eq!(validate::normalize_exclude_term(r"\\\obj\\\\"), r"\obj\");
     // UNC 排除项也折叠 —— Everything 对完整路径做子串匹配，
     // `\NAS\old\` 与 `\\NAS\old\` 命中同一批文件，所以「排除整个共享」照样生效。
-    assert_eq!(validate::normalize_exclude_term(r"\\NAS\old\"), r"\NAS\old\");
+    assert_eq!(
+        validate::normalize_exclude_term(r"\\NAS\old\"),
+        r"\NAS\old\"
+    );
     // 本来就正常的项一个字符都不动。
     for ok in [r"\obj\", "ext:tmp", "node_modules", r"dm:lastweek", ""] {
         assert_eq!(validate::normalize_exclude_term(ok), ok, "{ok} 不该被改动");
@@ -1523,6 +1596,91 @@ fn valid_json_with_invalid_envelope_is_invalid_request() {
     // 真·非法 JSON 仍是 -32700。
     let resp = dispatch("{not json");
     assert_eq!(resp["error"]["code"], protocol::PARSE_ERROR);
+    assert_eq!(resp.get("id"), Some(&Value::Null));
+    for body in [
+        r#"{"jsonrpc":"1.0","id":1,"method":"ping"}"#,
+        r#"{"jsonrpc":"2.0","id":{},"method":"ping"}"#,
+        r#"{"jsonrpc":"2.0","id":1,"method":"ping","params":42}"#,
+        r#"{"jsonrpc":"2.0","id":1,"result":{}}"#,
+        r#"{"jsonrpc":"2.0","method":"ping","error":{"code":1,"message":"x"}}"#,
+    ] {
+        let resp = dispatch(body);
+        assert_eq!(resp["error"]["code"], protocol::INVALID_REQUEST, "{body}");
+        assert_eq!(resp.get("id"), Some(&Value::Null));
+    }
+    let resp = dispatch(r#"{"jsonrpc":"2.0","id":null,"method":"ping"}"#);
+    assert_eq!(resp.get("id"), Some(&Value::Null));
+    assert!(resp.get("result").is_some());
+}
+
+#[test]
+fn http_framing_rejects_ambiguous_or_malformed_headers() {
+    for head in [
+        "POST /\r\n",
+        "POST / HTTP/1.1 extra\r\n",
+        "POST / HTTP/1.1\r\nContent-Length: 3\r\nContent-Length: 8",
+        "POST / HTTP/1.1\r\nContent-Length: -1",
+        "POST / HTTP/1.1\r\nContent-Length: +1",
+        "POST / HTTP/1.1\r\nContent-Length: invalid",
+        "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\nContent-Length: 3",
+        "POST / HTTP/1.1\r\nOrigin: https://evil.example\r\nOrigin: http://localhost",
+        "POST / HTTP/1.1\r\n Origin: http://localhost",
+    ] {
+        assert!(server::parse_header(head).is_none(), "{head}");
+    }
+}
+
+#[test]
+fn tcp_rejects_short_body_and_returns_cors_on_actual_responses() {
+    use std::io::{Read, Write};
+    let _g = SERVER_TESTS.lock().unwrap_or_else(|p| p.into_inner());
+    server::start("127.0.0.1", 0).unwrap();
+    let port = server::bound_port().unwrap();
+    for body in [r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#, "{bad"] {
+        let (head, _) = http_post(port, body, &[("Origin", "http://localhost:3000")]);
+        assert!(head.contains("Access-Control-Allow-Origin: http://localhost:3000"));
+        assert!(head.contains("Vary: Origin"));
+    }
+    let body = r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#;
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+        .unwrap();
+    write!(stream, "POST / HTTP/1.1\r\nHost: localhost\r\nOrigin: http://localhost:3000\r\nContent-Length: {}\r\n\r\n{}", body.len() + 10, body).unwrap();
+    stream.shutdown(std::net::Shutdown::Write).unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).unwrap();
+    server::stop();
+    assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+    assert!(response.contains("incomplete request body"));
+    assert!(response.contains("Access-Control-Allow-Origin: http://localhost:3000"));
+}
+
+#[test]
+fn stop_interrupts_idle_header_and_body_connections() {
+    use std::io::Write;
+    use std::time::{Duration, Instant};
+    let _g = SERVER_TESTS.lock().unwrap_or_else(|p| p.into_inner());
+    for partial in [
+        "POST / HTTP/1.1\r\nHost: localhost\r\n",
+        "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 100\r\n\r\n{",
+    ] {
+        server::start("127.0.0.1", 0).unwrap();
+        let port = server::bound_port().unwrap();
+        let mut idle = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        idle.write_all(partial.as_bytes()).unwrap();
+        // A second accepted request proves the listener progressed past idle.
+        let (head, _) = http_post(port, r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#, &[]);
+        assert!(head.starts_with("HTTP/1.1 200"));
+        let start = Instant::now();
+        server::stop();
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "stop took {:?}",
+            start.elapsed()
+        );
+        assert!(std::net::TcpStream::connect(("127.0.0.1", port)).is_err());
+    }
 }
 
 #[test]
@@ -1654,17 +1812,16 @@ fn normalize_folder_fixes_llm_path_quirks() {
 fn normalize_folder_rejects_bad_paths_with_examples() {
     use everything_mcp::mcp::validate;
     for bad in [
-        "",           // 空
-        "   ",        // 只有空白
-        "src\\mcp",   // 相对路径
-        "C:src",      // 盘符后无反斜杠
-        "C:src\\mcp", // 相对盘符路径
+        "",            // 空
+        "   ",         // 只有空白
+        "src\\mcp",    // 相对路径
+        "C:src",       // 盘符后无反斜杠
+        "C:src\\mcp",  // 相对盘符路径
         r"C:\Users\*", // 通配符不属于路径
-        r"\\server",  // UNC 只有一段
-        r#"D:\a"b"#,  // 内部引号会破坏搜索语法
+        r"\\server",   // UNC 只有一段
+        r#"D:\a"b"#,   // 内部引号会破坏搜索语法
     ] {
-        let err = validate::normalize_folder(bad)
-            .unwrap_err();
+        let err = validate::normalize_folder(bad).unwrap_err();
         assert!(err.contains("folder"), "错误消息要点名参数: {}", err);
     }
     // 绝对路径类错误的消息里带范例，LLM 拿到就能一次改对。
@@ -1719,8 +1876,7 @@ fn non_numeric_max_results_is_invalid_params() {
 
 #[test]
 fn wildcard_in_folder_is_rejected_with_guidance() {
-    let err =
-        tools::dispatch("search_in_folder", &json!({"folder": "C:\\Users\\*"})).unwrap_err();
+    let err = tools::dispatch("search_in_folder", &json!({"folder": "C:\\Users\\*"})).unwrap_err();
     assert_eq!(err.0, protocol::INVALID_PARAMS);
     assert!(err.1.contains("wildcards"), "{}", err.1);
 }
@@ -1764,9 +1920,11 @@ fn index_changes_rejects_bad_params_before_touching_the_log() {
     let err = tools::dispatch("index_changes", &json!({ "max_results": 0 })).unwrap_err();
     assert_eq!(err.0, protocol::INVALID_PARAMS);
     assert!(err.1.contains("at least 1"), "{}", err.1);
-    let err = tools::dispatch("index_changes", &json!({ "max_results": 99_999 })).unwrap_err();
-    assert_eq!(err.0, protocol::INVALID_PARAMS);
-    assert!(err.1.contains("2000"), "上限要写进消息 {}", err.1);
+    for bad in [99_999u64, 4_294_967_297, u64::MAX] {
+        let err = tools::dispatch("index_changes", &json!({ "max_results": bad })).unwrap_err();
+        assert_eq!(err.0, protocol::INVALID_PARAMS, "max_results={bad}");
+        assert!(err.1.contains("2000"), "上限要写进消息 {}", err.1);
+    }
 
     // since 晚于 until 是最容易漏的一种错：放过它只会得到 0 条且无从诊断。
     let err = tools::dispatch(
@@ -1990,7 +2148,10 @@ fn end_to_end_over_real_tcp() {
     assert!(head.starts_with("HTTP/1.1 200"), "{}", head);
     let resp: Value = serde_json::from_str(&body).unwrap();
     assert_eq!(resp["error"]["code"], protocol::INVALID_PARAMS);
-    assert!(resp["error"]["message"].as_str().unwrap().contains("folder"));
+    assert!(resp["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("folder"));
 
     server::stop();
 }
@@ -2090,7 +2251,10 @@ fn stats_record_call_accumulates_per_tool() {
     assert_eq!(after.tools[idx].ok, before.tools[idx].ok + 2);
     assert_eq!(after.tools[idx].err, before.tools[idx].err + 1);
     assert_eq!(after.tools[idx].total_ms, before.tools[idx].total_ms + 35);
-    assert_eq!(after.tools[idx].bytes_out, before.tools[idx].bytes_out + 350);
+    assert_eq!(
+        after.tools[idx].bytes_out,
+        before.tools[idx].bytes_out + 350
+    );
 }
 
 // ====================================================================

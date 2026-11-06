@@ -27,7 +27,7 @@ mod stats_page;
 
 /// 暴露统计模块给 tests/ 下的集成测试（验证三类结果分类）。
 /// 运行期仍走 plugin::stats 内部路径，这里只是再导出一份。
-pub use plugin::stats as stats;
+pub use plugin::stats;
 
 use core::ffi::c_void;
 use std::ffi::CStr;
@@ -257,9 +257,7 @@ unsafe fn everything_plugin_proc_impl(msg: u32, data: *mut c_void) -> *mut c_voi
         // 元信息查询：返回静态 UTF-8 字符串指针。
         // ============================================================
         plugin::PM_GET_NAME => static_cstr_bytes(PLUGIN_NAME).as_ptr() as *mut c_void,
-        plugin::PM_GET_DESCRIPTION => {
-            static_cstr_bytes(PLUGIN_DESCRIPTION).as_ptr() as *mut c_void
-        }
+        plugin::PM_GET_DESCRIPTION => static_cstr_bytes(PLUGIN_DESCRIPTION).as_ptr() as *mut c_void,
         plugin::PM_GET_AUTHOR => static_cstr_bytes(PLUGIN_AUTHOR).as_ptr() as *mut c_void,
         plugin::PM_GET_LINK => static_cstr_bytes(PLUGIN_LINK).as_ptr() as *mut c_void,
         plugin::PM_GET_VERSION => static_cstr_bytes(PLUGIN_VERSION).as_ptr() as *mut c_void,

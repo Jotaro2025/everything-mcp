@@ -606,7 +606,14 @@ pub fn size_page(data: *mut c_void) -> *mut c_void {
 
     // 内容索引开关 + 一行说明（紧跟全局搜索行下方）。
     y += DLG_CHECKBOX_HIGH + DLG_SEPARATOR;
-    set_rect(page_hwnd, ID_CONTENT_INDEXING, x, y, wide, DLG_CHECKBOX_HIGH);
+    set_rect(
+        page_hwnd,
+        ID_CONTENT_INDEXING,
+        x,
+        y,
+        wide,
+        DLG_CHECKBOX_HIGH,
+    );
     y += DLG_CHECKBOX_HIGH + 3;
     set_rect(page_hwnd, ID_CONTENT_NOTE, x, y, wide, DLG_STATIC_HIGH);
 
@@ -940,7 +947,11 @@ fn set_core_value(content: &str, key: &str, value: &str) -> String {
                 .eq_ignore_ascii_case("Everything");
             if is_everything && !inserted {
                 // 段头在文件末尾且没有换行时，先把行断开再插键。
-                let nl = if content.contains("\r\n") { "\r\n" } else { "\n" };
+                let nl = if content.contains("\r\n") {
+                    "\r\n"
+                } else {
+                    "\n"
+                };
                 if !line.ends_with('\n') {
                     final_out.push_str(nl);
                 }
@@ -1418,7 +1429,9 @@ mod tests {
     fn core_ini_inserts_after_section_header_when_missing() {
         let content = "[Everything]\r\nfoo=1\r\n[Other]\r\nbar=2\r\n";
         let out = set_core_value(content, "content_indexing_enabled", "1");
-        let pos_key = out.find("content_indexing_enabled=1").expect("key 应被插入");
+        let pos_key = out
+            .find("content_indexing_enabled=1")
+            .expect("key 应被插入");
         let pos_other = out.find("[Other]").unwrap();
         assert!(pos_key < pos_other, "必须插在 [Everything] 段内: {out}");
         assert!(out.contains("foo=1"));

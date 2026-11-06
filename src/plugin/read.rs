@@ -20,7 +20,11 @@
 //!      连文件是否存在都不去碰；
 //!   3. 尺寸（8 MiB 文件上限）、二进制（NUL）、行窗口与字节预算。
 
+use super::budget::ScanBudget;
+use std::io::Read;
+use std::os::windows::fs::OpenOptionsExt;
 use std::path::Path;
+use std::time::Duration;
 
 use windows_sys::Win32::Globalization::{MultiByteToWideChar, CP_ACP};
 
@@ -43,9 +47,8 @@ fn final_path_of(file: &std::fs::File) -> Option<String> {
     use windows_sys::Win32::Storage::FileSystem::{
         GetFinalPathNameByHandleW, FILE_NAME_NORMALIZED, VOLUME_NAME_DOS,
     };
-    // 先探 buffer 大小，再分配调用一次。循环两次足够（路径不会在这
-    // 窗口里变长到第二次还装不下）。
-    for cap in [260usize, 1024, 4096] {
+    // Grow through bounded buffers up to the Windows extended-path limit.
+    for cap in [260usize, 1024, 4096, 32768] {
         let mut buf = vec![0u16; cap];
         let n = unsafe {
             GetFinalPathNameByHandleW(
@@ -70,10 +73,7 @@ fn final_path_of(file: &std::fs::File) -> Option<String> {
 ///
 /// `display_path` 是错误信息里回显的原始入参。fail-closed：复核阶段
 /// 出任何意外（拿不到最终路径）一律按命中处理。
-fn recheck_open_path(
-    file: &std::fs::File,
-    display_path: &str,
-) -> Result<(), ReadError> {
+fn recheck_open_path(file: &std::fs::File, display_path: &str) -> Result<(), ReadError> {
     let final_path = final_path_of(file).ok_or_else(|| {
         ReadError::at(
             ERR_PATH_DENIED,
@@ -233,15 +233,12 @@ const BINARY_EXTENSIONS: &[&str] = &[
     // 文档 / 电子表格 / 演示
     "doc", "docx", "xls", "xlsx", "ppt", "pptx", "odt", "ods", "odp", "pdf", "rtf", "epub",
     // 压缩包 / 镜像
-    "zip", "7z", "rar", "gz", "tgz", "bz2", "xz", "zst", "tar", "cab", "iso", "jar", "war",
-    "apk", "nupkg", "whl", "egg", "pyz",
-    // 可执行 / 目标文件 / 库
+    "zip", "7z", "rar", "gz", "tgz", "bz2", "xz", "zst", "tar", "cab", "iso", "jar", "war", "apk",
+    "nupkg", "whl", "egg", "pyz", // 可执行 / 目标文件 / 库
     "exe", "dll", "so", "dylib", "lib", "a", "o", "obj", "bin", "class", "pyc", "pyo", "wasm",
-    "msi", "sys", "ocx", "com", "scr", "pdb",
-    // 图片 / 音视频 / 字体
-    "png", "jpg", "jpeg", "gif", "bmp", "ico", "webp", "tif", "tiff", "heic", "psd", "mp3",
-    "mp4", "avi", "mkv", "mov", "wav", "flac", "ogg", "webm", "wmv", "ttf", "otf", "woff",
-    "woff2", "eot",
+    "msi", "sys", "ocx", "com", "scr", "pdb", // 图片 / 音视频 / 字体
+    "png", "jpg", "jpeg", "gif", "bmp", "ico", "webp", "tif", "tiff", "heic", "psd", "mp3", "mp4",
+    "avi", "mkv", "mov", "wav", "flac", "ogg", "webm", "wmv", "ttf", "otf", "woff", "woff2", "eot",
     // 数据库
     "db", "sqlite", "sqlite3", "mdb", "pak",
 ];
@@ -257,7 +254,11 @@ const SNIFF_NON_PRINTABLE_PERCENT: usize = 30;
 /// `>= 0x80` 一律算可打印 —— 那是 UTF-8 多字节序列和 GBK 双字节的组成部分，
 /// 按字节判会把所有中文正文误判成二进制。
 fn is_non_printable(byte: u8) -> bool {
-    !(byte == b'\t' || byte == b'\n' || byte == b'\r' || (0x20..0x7F).contains(&byte) || byte >= 0x80)
+    !(byte == b'\t'
+        || byte == b'\n'
+        || byte == b'\r'
+        || (0x20..0x7F).contains(&byte)
+        || byte >= 0x80)
 }
 
 /// 内容嗅探：前 4 KiB 里有 NUL，或非可打印字节超过 30%。
@@ -428,52 +429,123 @@ pub(crate) fn clip_line(line: &str) -> (String, bool) {
     }
 }
 
-/// 供 grep 用：读文件并解码成文本，任何不可用的情况都返回 `None`（跳过该文件）。
-///
-/// 返回值是 `(解码后的文本, 从磁盘读入的原始字节数)` —— grep 的 64 MiB
-/// 扫描预算按**原始字节**计：UTF-16 文件解码后长度约为原字节的一半，
-/// 按文本长度计账会把实际 I/O 放行到预算的两倍（2026-10 审计补漏）。
-///
-/// 与 [`read_file`] 的关键区别是**不报错**：grep 扫的是一批文件，二进制、
-/// 超大、读不了、命中黑名单的都应该只是跳过 —— 一个坏文件不该让整次搜索失败。
-///
-/// 二进制判定与 `read_file` 同一套（扩展名硬表 + 内容嗅探），黑名单也一样 ——
-/// 而且黑名单在这里更要紧：grep 绝不能把 `.env` / 私钥的正文带出来。
-pub fn read_text_for_matching(path: &str) -> Option<(String, u64)> {
+/// Open, validate and read through ONE handle. No path is reopened after checking.
+fn read_raw(path: &str, budget: &mut ScanBudget) -> Result<Vec<u8>, ReadError> {
+    let fail = |code, message| ReadError::at(code, message, path);
     if sensitive::is_sensitive_path(path) {
-        return None;
+        return Err(fail(ERR_PATH_DENIED, sensitive::denied_message(path)));
     }
-    let meta = std::fs::metadata(path).ok()?;
-    if !meta.is_file() || meta.len() > MAX_FILE_BYTES {
-        return None;
+    if !budget.check() {
+        return Err(fail(ERR_READ_FAILED, "read cancelled or timed out".into()));
     }
-    let raw = std::fs::read(path).ok()?;
-    // stat 与 read 之间文件可能增长 —— 用实际字节数复核（TOCTOU）。
-    if raw.len() as u64 > MAX_FILE_BYTES {
-        return None;
-    }
-    // 与 read_file 同样的句柄级复核：grep 的候选路径来自 Everything 索引，
-    // 但索引与现实之间同样隔着符号链接/短名重定向。失败即跳过（None）。
-    if !handle_passes_denylist(path) {
-        return None;
-    }
-    if binary_reason(&raw, path).is_some() {
-        return None;
-    }
-    let raw_len = raw.len() as u64;
-    let (text, _) = decode_bytes(&raw);
-    Some((text, raw_len))
+    // BACKUP_SEMANTICS lets us open directories to report their type using the
+    // same handle. It does not bypass ACLs or enable backup privileges.
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
+        .map_err(|e| {
+            let code = if e.kind() == std::io::ErrorKind::NotFound {
+                ERR_NOT_FOUND
+            } else {
+                ERR_READ_FAILED
+            };
+            fail(code, format!("cannot read {path:?}: {e}"))
+        })?;
+    read_opened(&mut file, path, budget)
 }
 
-/// 对已读入内存的文件做「打开后复核」：`std::fs::read` 拿到字节后没有句柄
-/// 可查 —— 为保持与 read_file 相同的语义，这里用 `File::open` +
-/// `GetFinalPathNameByHandleW` 再过一遍黑名单。open 失败按 fail-closed
-/// 返回 false（文件已读进内存但无法证明它不是敏感路径，丢弃）。
-fn handle_passes_denylist(path: &str) -> bool {
-    let Ok(file) = std::fs::File::open(path) else {
-        return false;
-    };
-    recheck_open_path(&file, path).is_ok()
+fn read_opened(
+    file: &mut std::fs::File,
+    path: &str,
+    budget: &mut ScanBudget,
+) -> Result<Vec<u8>, ReadError> {
+    let fail = |code, message| ReadError::at(code, message, path);
+    recheck_open_path(file, path)?;
+    let meta = file
+        .metadata()
+        .map_err(|e| fail(ERR_READ_FAILED, e.to_string()))?;
+    if meta.is_dir() {
+        return Err(fail(
+            ERR_PATH_IS_DIRECTORY,
+            format!("{path:?} is a folder; use list_folder to list its contents"),
+        ));
+    }
+    if !meta.is_file() {
+        return Err(fail(ERR_READ_FAILED, "path is not a regular file".into()));
+    }
+    if meta.len() > MAX_FILE_BYTES {
+        return Err(fail(
+            ERR_TOO_LARGE,
+            format!("{path:?} exceeds read_file's {MAX_FILE_BYTES} byte limit"),
+        ));
+    }
+    if let Some(reason) = binary_reason(&[], path) {
+        return Err(fail(ERR_BINARY_CONTENT, binary_message(path, reason)));
+    }
+    let raw = read_limited(file, path, budget)?;
+    Ok(raw)
+}
+
+/// At most MAX_FILE_BYTES + 1 bytes are allocated/read, even if a file grows.
+/// The first 4 KiB is sampled before reading the rest; failed reads remain charged.
+fn read_limited(
+    reader: &mut impl Read,
+    path: &str,
+    budget: &mut ScanBudget,
+) -> Result<Vec<u8>, ReadError> {
+    let mut raw = Vec::new();
+    let mut chunk = [0u8; 64 * 1024];
+    let mut sniffed = false;
+    loop {
+        let cap = if !sniffed {
+            SNIFF_BYTES - raw.len()
+        } else {
+            ((MAX_FILE_BYTES + 1) as usize - raw.len()).min(chunk.len())
+        };
+        let n = budget.read(reader, &mut chunk[..cap]).map_err(|e| {
+            ReadError::at(ERR_READ_FAILED, format!("cannot read {path:?}: {e}"), path)
+        })?;
+        if raw.len() + n > raw.capacity() {
+            let capacity = (raw.capacity().max(SNIFF_BYTES) * 2)
+                .max(raw.len() + n)
+                .min((MAX_FILE_BYTES + 1) as usize);
+            raw.reserve_exact(capacity - raw.len());
+        }
+        raw.extend_from_slice(&chunk[..n]);
+        if !sniffed && (raw.len() >= SNIFF_BYTES || n == 0) {
+            if let Some(reason) = binary_reason(&raw, path) {
+                return Err(ReadError::at(
+                    ERR_BINARY_CONTENT,
+                    binary_message(path, reason),
+                    path,
+                ));
+            }
+            sniffed = true;
+        }
+        if raw.len() as u64 > MAX_FILE_BYTES {
+            return Err(ReadError::at(
+                ERR_TOO_LARGE,
+                format!("{path:?} grew past read_file's {MAX_FILE_BYTES} byte limit"),
+                path,
+            ));
+        }
+        if n == 0 {
+            return Ok(raw);
+        }
+    }
+}
+
+/// grep shares its request budget with every file, including rejected files.
+pub(crate) fn read_text_budgeted(path: &str, budget: &mut ScanBudget) -> Result<String, ReadError> {
+    read_raw(path, budget).map(|raw| decode_bytes(&raw).0)
+}
+
+#[cfg(test)]
+fn read_text_for_matching(path: &str) -> Option<(String, u64)> {
+    let mut budget = ScanBudget::new(MAX_FILE_BYTES + 1, Duration::from_secs(30));
+    let text = read_text_budgeted(path, &mut budget).ok()?;
+    Some((text, budget.bytes))
 }
 
 /// 按行窗口取出的正文。
@@ -498,41 +570,39 @@ struct Window {
 /// `max_lines` 必须 ≥ 1 —— 调用方（[`read_file`] / MCP 层）负责校验，
 /// 这里不做「0 = 不限」这种第二含义。
 fn build_window(text: &str, start_line: usize, max_lines: usize) -> Window {
-    let lines: Vec<&str> = text.lines().collect();
-    let total = lines.len();
-    // start_line 超出末尾时给出空窗口而不是报错。
-    let start = start_line.saturating_sub(1).min(total);
-
+    let start = start_line.saturating_sub(1);
     let mut out = String::new();
-    let mut count = 0usize;
-    let mut clipped = 0usize;
-    let mut idx = start;
-    while idx < total {
-        if count >= max_lines {
-            break;
+    let mut count = 0;
+    let mut clipped = 0;
+    let mut total = 0;
+    let mut truncated = false;
+    for (idx, line) in text.lines().enumerate() {
+        total += 1;
+        if idx < start {
+            continue;
         }
-        let (piece, was_clipped) = clip_line(lines[idx]);
-        // 首行不加分隔符，其余行前面各有一个换行。
+        if truncated || count >= max_lines {
+            truncated = true;
+            continue;
+        }
+        let (piece, was_clipped) = clip_line(line);
         let extra = piece.len() + usize::from(count > 0);
         if out.len() + extra > MAX_WINDOW_BYTES {
-            break;
+            truncated = true;
+            continue;
         }
         if count > 0 {
             out.push('\n');
         }
         out.push_str(&piece);
-        if was_clipped {
-            clipped += 1;
-        }
+        clipped += usize::from(was_clipped);
         count += 1;
-        idx += 1;
     }
-
     Window {
         text: out,
         total_lines: total,
         lines_returned: count,
-        truncated: idx < total,
+        truncated,
         clipped_lines: clipped,
     }
 }
@@ -557,94 +627,20 @@ pub fn read_file(
         ));
     }
 
-    // 黑名单先于 stat：拒绝一个路径不该先去碰它，也不该靠「文件不存在」
-    // 与否泄漏它是否存在。
-    if sensitive::is_sensitive_path(&path) {
-        return Err(ReadError::at(
-            ERR_PATH_DENIED,
-            sensitive::denied_message(&path),
-            &path,
+    if start_line == 0 {
+        return Err(ReadError::new(
+            ERR_INVALID_ARGUMENT,
+            "start_line must be at least 1".into(),
         ));
     }
-
-    let meta = std::fs::metadata(&path).map_err(|e| {
-        let code = if e.kind() == std::io::ErrorKind::NotFound {
-            ERR_NOT_FOUND
-        } else {
-            ERR_READ_FAILED
-        };
-        ReadError::at(code, format!("cannot read {:?}: {}", path, e), &path)
-    })?;
-    if meta.is_dir() {
-        return Err(ReadError::at(
-            ERR_PATH_IS_DIRECTORY,
-            format!(
-                "{:?} is a folder; use list_folder to list its contents",
-                path
-            ),
-            &path,
-        ));
-    }
-    if meta.len() > MAX_FILE_BYTES {
-        return Err(ReadError::at(
-            ERR_TOO_LARGE,
-            format!(
-                "{:?} is {} bytes, over read_file's {} byte limit; \
-                 use search_in_folder to narrow down to a smaller file, or read it outside this tool",
-                path,
-                meta.len(),
-                MAX_FILE_BYTES
-            ),
-            &path,
-        ));
-    }
-
-    let raw = std::fs::read(&path).map_err(|e| {
-        ReadError::at(
-            ERR_READ_FAILED,
-            format!("cannot read {:?}: {}", path, e),
-            &path,
-        )
-    })?;
-    // stat 与 read 之间文件可能增长（活跃日志）—— 用实际字节数复核上限，
-    // 不信任 stat 快照（TOCTOU）。
-    if raw.len() as u64 > MAX_FILE_BYTES {
-        return Err(ReadError::at(
-            ERR_TOO_LARGE,
-            format!(
-                "{:?} grew past read_file's {} byte limit while it was being read",
-                path, MAX_FILE_BYTES
-            ),
-            &path,
-        ));
-    }
-    // 句柄级黑名单复核：上面那层是对入参字符串的判定；符号链接、subst 盘、
-    // 8.3 短名这类重定向在这里才现出真实身份。fail-closed —— 拿不到真实
-    // 路径也拒。
-    {
-        let file = std::fs::File::open(&path).map_err(|e| {
-            ReadError::at(
-                ERR_READ_FAILED,
-                format!("cannot read {:?}: {}", path, e),
-                &path,
-            )
-        })?;
-        recheck_open_path(&file, &path)?;
-    }
-    // 二进制在解码之前就判掉（按原始字节嗅探，比解码后再找 NUL 更准）。
-    if let Some(reason) = binary_reason(&raw, &path) {
-        return Err(ReadError::at(
-            ERR_BINARY_CONTENT,
-            binary_message(&path, reason),
-            &path,
-        ));
-    }
+    let mut budget = ScanBudget::new(MAX_FILE_BYTES + 1, Duration::from_secs(30));
+    let raw = read_raw(&path, &mut budget)?;
     let (text, encoding) = decode_bytes(&raw);
 
     let window = build_window(&text, start_line, max_lines);
     Ok(FileContent {
         path,
-        size: meta.len(),
+        size: raw.len() as u64,
         total_lines: window.total_lines,
         start_line,
         lines_returned: window.lines_returned,
@@ -663,13 +659,87 @@ mod tests {
     use super::*;
 
     #[test]
+    fn checked_handle_is_the_handle_read_even_if_path_is_replaced() {
+        let root = std::env::temp_dir().join(format!("emcp_same_handle_{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("input.txt");
+        std::fs::write(&path, "original").unwrap();
+        let mut original = std::fs::File::open(&path).unwrap();
+        std::fs::rename(&path, root.join("moved.txt")).unwrap();
+        std::fs::write(&path, "replacement").unwrap();
+        let mut budget = ScanBudget::new(MAX_FILE_BYTES + 1, Duration::from_secs(5));
+        let raw = read_opened(&mut original, &path.to_string_lossy(), &mut budget).unwrap();
+        assert_eq!(raw, b"original");
+        drop(original);
+
+        // An innocuous display path must not authorize a sensitive handle.
+        let key = root.join("id_rsa");
+        std::fs::write(&key, "synthetic test marker").unwrap();
+        let mut sensitive = std::fs::File::open(&key).unwrap();
+        let mut budget = ScanBudget::new(MAX_FILE_BYTES + 1, Duration::from_secs(5));
+        assert_eq!(
+            read_opened(&mut sensitive, &path.to_string_lossy(), &mut budget)
+                .unwrap_err()
+                .code,
+            ERR_PATH_DENIED
+        );
+        assert_eq!(budget.bytes, 0);
+        drop(sensitive);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn bounded_read_stops_growth_and_charges_rejected_binary_bytes() {
+        let mut endless = std::io::repeat(b'a');
+        let mut budget = ScanBudget::new(MAX_FILE_BYTES + 100, Duration::from_secs(5));
+        assert_eq!(
+            read_limited(&mut endless, "growing.txt", &mut budget)
+                .unwrap_err()
+                .code,
+            ERR_TOO_LARGE
+        );
+        assert_eq!(budget.bytes, MAX_FILE_BYTES + 1);
+
+        let mut binary = std::io::repeat(0);
+        let mut budget = ScanBudget::new(MAX_FILE_BYTES, Duration::from_secs(5));
+        assert_eq!(
+            read_limited(&mut binary, "unknown.dat", &mut budget)
+                .unwrap_err()
+                .code,
+            ERR_BINARY_CONTENT
+        );
+        assert_eq!(budget.bytes, SNIFF_BYTES as u64);
+
+        let mut budget = ScanBudget::new(100, Duration::from_secs(5));
+        assert!(read_limited(&mut endless, "text.txt", &mut budget).is_err());
+        assert_eq!(budget.bytes, 100);
+        assert_eq!(budget.stop_reason, Some("byte_budget"));
+    }
+
+    #[test]
+    fn window_handles_millions_of_empty_lines_with_small_output() {
+        let text = "\n".repeat(MAX_FILE_BYTES as usize);
+        let window = build_window(&text, 2, 3);
+        assert_eq!(window.total_lines, MAX_FILE_BYTES as usize);
+        assert_eq!(window.lines_returned, 3);
+        assert_eq!(window.text, "\n\n");
+        assert!(window.truncated);
+    }
+
+    #[test]
     fn validate_path_rejects_relative_and_patterns() {
         assert!(validate_path("").unwrap_err().contains("empty"));
         assert!(validate_path("   ").unwrap_err().contains("empty"));
-        assert!(validate_path("src\\lib.rs").unwrap_err().contains("absolute"));
-        assert!(validate_path("D:\\a\\*.rs").unwrap_err().contains("pattern"));
+        assert!(validate_path("src\\lib.rs")
+            .unwrap_err()
+            .contains("absolute"));
+        assert!(validate_path("D:\\a\\*.rs")
+            .unwrap_err()
+            .contains("pattern"));
         assert!(validate_path("D:\\a\\b?c").unwrap_err().contains("pattern"));
-        assert!(validate_path("D:\\a\\b\tc").unwrap_err().contains("control"));
+        assert!(validate_path("D:\\a\\b\tc")
+            .unwrap_err()
+            .contains("control"));
         assert_eq!(validate_path("  D:\\a\\b.rs  ").unwrap(), "D:\\a\\b.rs");
     }
 
@@ -679,24 +749,36 @@ mod tests {
         // 全部
         let w = build_window(text, 1, 100);
         assert_eq!(w.text, "a\nb\nc\nd\ne");
-        assert_eq!((w.total_lines, w.lines_returned, w.truncated), (5, 5, false));
+        assert_eq!(
+            (w.total_lines, w.lines_returned, w.truncated),
+            (5, 5, false)
+        );
         // 中间一段
         let w = build_window(text, 2, 2);
         assert_eq!(w.text, "b\nc");
         assert_eq!((w.total_lines, w.lines_returned, w.truncated), (5, 2, true));
         // 尾部
         let w = build_window(text, 5, 10);
-        assert_eq!((w.text.as_str(), w.lines_returned, w.truncated), ("e", 1, false));
+        assert_eq!(
+            (w.text.as_str(), w.lines_returned, w.truncated),
+            ("e", 1, false)
+        );
         // 起点超出末尾 —— 空窗口而不是报错
         let w = build_window(text, 99, 10);
-        assert_eq!((w.text.as_str(), w.total_lines, w.lines_returned), ("", 5, 0));
+        assert_eq!(
+            (w.text.as_str(), w.total_lines, w.lines_returned),
+            ("", 5, 0)
+        );
         assert!(!w.truncated);
     }
 
     #[test]
     fn build_window_tolerates_crlf_and_missing_trailing_newline() {
         let w = build_window("a\r\nb\r\n", 1, 100);
-        assert_eq!((w.text.as_str(), w.total_lines, w.lines_returned), ("a\nb", 2, 2));
+        assert_eq!(
+            (w.text.as_str(), w.total_lines, w.lines_returned),
+            ("a\nb", 2, 2)
+        );
     }
 
     #[test]
@@ -738,7 +820,11 @@ mod tests {
         assert_eq!(clip_line("hello"), ("hello".to_string(), false));
         assert_eq!(clip_line(""), (String::new(), false));
         let exact = "z".repeat(MAX_LINE_CHARS);
-        assert_eq!(clip_line(&exact), (exact.clone(), false), "正好到上限不算裁");
+        assert_eq!(
+            clip_line(&exact),
+            (exact.clone(), false),
+            "正好到上限不算裁"
+        );
     }
 
     #[test]
@@ -780,7 +866,10 @@ mod tests {
     #[test]
     fn decode_bytes_prefers_utf8_then_ansi() {
         // 合法 UTF-8 原样返回
-        assert_eq!(decode_bytes("中文".as_bytes()), ("中文".to_string(), "utf-8"));
+        assert_eq!(
+            decode_bytes("中文".as_bytes()),
+            ("中文".to_string(), "utf-8")
+        );
         assert_eq!(
             decode_bytes(b"plain ascii"),
             ("plain ascii".to_string(), "utf-8")
@@ -819,12 +908,17 @@ mod tests {
         // 关键用例：内容全是可打印 ASCII，嗅探看不出问题，只能靠扩展名拦。
         let ascii_pdf = b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\n%%EOF\n";
         assert!(!looks_binary(ascii_pdf), "这份 PDF 的字节确实不像二进制");
-        assert_eq!(binary_reason(ascii_pdf, r"D:\a\report.pdf"), Some("extension"));
+        assert_eq!(
+            binary_reason(ascii_pdf, r"D:\a\report.pdf"),
+            Some("extension")
+        );
         // 大小写与多级后缀都要认
         assert_eq!(binary_reason(b"x", r"D:\a\IMG.PNG"), Some("extension"));
         assert_eq!(binary_reason(b"x", r"D:\a\book.docx"), Some("extension"));
         assert_eq!(binary_reason(b"x", r"D:\a\pkg.tar.gz"), Some("extension"));
-        for name in ["a.zip", "a.exe", "a.dll", "a.xlsx", "a.mp4", "a.ttf", "a.sqlite"] {
+        for name in [
+            "a.zip", "a.exe", "a.dll", "a.xlsx", "a.mp4", "a.ttf", "a.sqlite",
+        ] {
             assert_eq!(binary_reason(b"x", name), Some("extension"), "{name}");
         }
     }
@@ -833,10 +927,28 @@ mod tests {
     fn binary_reason_keeps_text_formats_readable() {
         // 这些是文本，一个都不该被扩展名表拦住
         for name in [
-            "a.json", "a.xml", "a.svg", "a.log", "a.csv", "a.tsv", "a.ipynb", "a.dat", "a.yml",
-            "a.toml", "a.rs", "a.py", "a.md", "a.sql", "a.ini", "a.env.example",
+            "a.json",
+            "a.xml",
+            "a.svg",
+            "a.log",
+            "a.csv",
+            "a.tsv",
+            "a.ipynb",
+            "a.dat",
+            "a.yml",
+            "a.toml",
+            "a.rs",
+            "a.py",
+            "a.md",
+            "a.sql",
+            "a.ini",
+            "a.env.example",
         ] {
-            assert_eq!(binary_reason(b"hello\nworld\n", name), None, "{name} 应可读");
+            assert_eq!(
+                binary_reason(b"hello\nworld\n", name),
+                None,
+                "{name} 应可读"
+            );
         }
     }
 
@@ -858,7 +970,10 @@ mod tests {
     #[test]
     fn binary_reason_keeps_multibyte_text_readable() {
         // 中文 UTF-8：每个汉字 3 个 >= 0x80 的字节，按字节判必须算可打印
-        assert_eq!(binary_reason("中文正文，含全角标点。".as_bytes(), "a.txt"), None);
+        assert_eq!(
+            binary_reason("中文正文，含全角标点。".as_bytes(), "a.txt"),
+            None
+        );
         // GBK 双字节
         assert_eq!(binary_reason(&[0xD6, 0xD0, 0xCE, 0xC4], "a.txt"), None);
         // 大段中文 + 少量 ASCII 混排
@@ -904,13 +1019,21 @@ mod tests {
     fn read_file_rejects_ascii_only_pdf_by_extension() {
         // 端到端：这份文件在改动前会被当正文返回（实测过）
         let path = std::env::temp_dir().join("everything_mcp_ascii_probe.pdf");
-        std::fs::write(&path, b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\n%%EOF\n").unwrap();
+        std::fs::write(
+            &path,
+            b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\n%%EOF\n",
+        )
+        .unwrap();
         let err = read_file(&path.to_string_lossy(), 1, 10).unwrap_err();
         assert_eq!(err.code, ERR_BINARY_CONTENT);
         assert!(err.message.contains(".pdf"), "{}", err.message);
         // 同一份内容换个文本后缀就能读 —— 证明拦的是扩展名不是内容
         let txt = std::env::temp_dir().join("everything_mcp_ascii_probe.txt");
-        std::fs::write(&txt, b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\n%%EOF\n").unwrap();
+        std::fs::write(
+            &txt,
+            b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\n%%EOF\n",
+        )
+        .unwrap();
         assert!(read_file(&txt.to_string_lossy(), 1, 10).is_ok());
         // grep 那条路同样跳过二进制
         assert!(read_text_for_matching(&path.to_string_lossy()).is_none());
@@ -925,7 +1048,10 @@ mod tests {
         // 黑名单在 stat 之前生效：不存在的敏感路径也报 PATH_DENIED 而不是 NOT_FOUND
         let err = read_file(r"C:\definitely\missing\.ssh\id_rsa", 1, 10).unwrap_err();
         assert_eq!(err.code, ERR_PATH_DENIED);
-        assert_eq!(err.path.as_deref(), Some(r"C:\definitely\missing\.ssh\id_rsa"));
+        assert_eq!(
+            err.path.as_deref(),
+            Some(r"C:\definitely\missing\.ssh\id_rsa")
+        );
 
         let err = read_file(r"D:\proj\.env", 1, 10).unwrap_err();
         assert_eq!(err.code, ERR_PATH_DENIED);

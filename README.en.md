@@ -517,14 +517,17 @@ modified, deleted, renamed or moved, **most recent first**. It answers
   window inclusively and accept `2026-09-23`, `2026-09-23 11:18`,
   `2026-09-23 11:18:31` (space or `T` between date and time); a bare
   number is read as unix seconds.
-- The response carries `count`, `truncated` (true when more matching
-  history exists beyond `max_results`), `days_searched` (how many daily
+- The response carries `count`, `truncated` (scanning stopped early and history
+  may be incomplete), `truncation_reason`, `days_searched` (how many daily
   logs were read), `skipped_lines` (lines that failed to parse, usually a
   half-written last line) and `log_directory` (the directory actually
   read). The log is scanned backwards in chunks, so "the last N changes"
   reads only a small piece of the file tail rather than the whole log.
 - History depth follows Everything's own retention: one log file per day,
-  and this tool reads back at most 92 days, up to 64 MiB per file.
+  and this tool reads back at most 92 days, up to 64 MiB per file and per request,
+  with a 30-second cooperative deadline. `truncated` marks incomplete scans;
+  `truncation_reason` reports `max_results`, `byte_budget`, `deadline`, `day_limit`,
+  `file_window`, `output_budget`, `line_limit`, `cancelled` or `read_error`.
 
 #### 5. `read_file`
 
@@ -559,8 +562,9 @@ one — a search itself returns only paths and metadata, never content.
   injection that tries to exfiltrate `~/.ssh/id_rsa`. It applies to content
   reads only — search results do not hide these files, because the file name
   is not the secret; the content is.
-- **8 MiB per file**, refused above that (`TOO_LARGE`) — a large file is
-  never read into memory. The response is additionally capped at a **128 KiB
+- **8 MiB per file**, refused above that (`TOO_LARGE`). Path validation,
+  metadata and reading share one open handle. A growing file is read up to
+  8 MiB + 1 byte to detect overflow; line windows do not allocate a full line index. The response is additionally capped at a **128 KiB
   byte budget**, accumulated **whole lines at a time**, so the budget never
   cuts a line in half.
 - **Overlong lines are cut**: a line longer than 16384 characters is
@@ -638,7 +642,10 @@ that one uses Everything's index to answer *which files* contain something
   the damage: at most 2000 candidate files, 64 MiB read, and a **128 KiB
   budget on the matched text returned** (the same constant `read_file` uses).
   When one bites, `truncated` is `true`, and `candidates` / `files_scanned` /
-  `bytes_scanned` tell you which. Note that the 128 KiB counts the matched
+  `bytes_scanned` report actual reads, including rejected binary samples.
+  `files_skipped` counts files that could not be read as text. `truncation_reason`
+  reports `candidate_limit`, `head_limit`, `output_budget`, `byte_budget`, `deadline`
+  or `cancelled`. `timeout_ms` covers both the candidate query and content scan. Note that the 128 KiB counts the matched
   text only; the JSON envelope (paths, line numbers, escaping) sits on top, so
   the actual response is somewhat larger.
 - **`output_mode`** picks the shape:
@@ -884,6 +891,17 @@ Behavior boundaries collected from the per-tool docs — worth a read before wir
 - **Text only**. `read_file` refuses binary content (by extension and content
   sniffing) and clips lines longer than 16 KiB; `grep` likewise skips binary
   files and files above 8 MiB.
+
+Shutdown closes in-flight HTTP sockets and cooperatively cancels queued host
+work and file scans. Search `timeout_ms` includes lock queueing, submission,
+query completion and result dispatch; cancellation submission has up to 200 ms
+additional grace. An executing host FFI call or Windows/SMB filesystem operation
+must still return safely; deadlines cannot forcibly interrupt these system calls.
+
+Allowlisted browser origins receive an exact `Access-Control-Allow-Origin` and
+`Vary: Origin` on preflight and actual success/error responses. Conflicting HTTP
+lengths, malformed request lines, chunked requests and incomplete bodies are
+rejected; JSON-RPC request envelopes are validated before dispatch.
 
 ### Debugging
 

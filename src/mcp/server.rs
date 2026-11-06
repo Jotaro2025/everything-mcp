@@ -23,11 +23,13 @@
 //! 保存监听线程句柄，PM_STOP 时调用 `stop()` 标记关闭、join 线程。
 
 use std::io::{Read, Write};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::os::windows::io::AsRawSocket;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
+use windows_sys::Win32::Networking::WinSock::{WSAPoll, POLLRDNORM, WSAPOLLFD};
 
 use serde_json::Value;
 
@@ -46,9 +48,7 @@ static SERVER: Mutex<Option<ServerHandle>> = Mutex::new(None);
 /// 在途连接计数：并发上限与 PM_STOP 排空共用。
 static INFLIGHT: AtomicUsize = AtomicUsize::new(0);
 
-/// 全局停机标志：服务在运行（或正在关闭）时为 false。搜索等待循环每
-/// 200ms 步进查一次 —— 置位后立刻放弃等待并按超时处理，stop() 的 join
-/// 才能在秒级收敛（而不是等满客户端的 timeout_ms，上限可到 49 天）。
+/// 全局停机标志：停止时拒绝新的宿主任务；排队和查询等待均检查此标志。
 static STOPPING: AtomicBool = AtomicBool::new(false);
 
 /// 搜索等待循环查询的停机信号。服务未运行（测试直接走 dispatch 的场景、
@@ -61,8 +61,35 @@ pub fn shutting_down() -> bool {
 /// 在途连接线程的句柄注册表。连接线程绝不能活过 FreeLibrary —— 否则它
 /// 从系统调用返回后执行的是已卸载的 DLL 代码，Everything.exe 直接崩
 /// （与 stats.rs 刷盘线程的 join 保障是同一条不变量）。stop() join 完
-/// 监听线程后必须把这里也 join 干净；工作线程退出时自行把自己摘掉。
+/// 监听线程后必须把这里也 join 干净；已完成句柄由监听线程 join 后回收。
 static CONN_THREADS: Mutex<Vec<JoinHandle<()>>> = Mutex::new(Vec::new());
+static CONNECTIONS: Mutex<Vec<(usize, TcpStream)>> = Mutex::new(Vec::new());
+static NEXT_CONNECTION: AtomicUsize = AtomicUsize::new(1);
+
+thread_local! {
+    // Direct dispatch/tests have no HTTP lifecycle; cancellation belongs to a request.
+    static REQUEST_SHUTDOWN: std::cell::RefCell<Option<std::sync::Arc<AtomicBool>>> = const { std::cell::RefCell::new(None) };
+}
+
+pub(crate) fn request_cancelled() -> bool {
+    REQUEST_SHUTDOWN.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .is_some_and(|s| s.load(Ordering::Acquire))
+    })
+}
+
+struct ConnectionGuard(usize);
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        CONNECTIONS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retain(|(id, _)| *id != self.0);
+        INFLIGHT.fetch_sub(1, Ordering::SeqCst);
+    }
+}
 
 struct ServerHandle {
     shutdown: std::sync::Arc<AtomicBool>,
@@ -95,6 +122,9 @@ pub fn start(bind: &str, port: u16) -> Result<(), String> {
 
     let addr = format!("{}:{}", bind, port);
     let listener = TcpListener::bind(&addr).map_err(|e| format!("bind {} failed: {}", addr, e))?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|e| format!("nonblocking listener: {e}"))?;
     // Windows 上 TCPListener::bind 默认已开启 SO_EXCLUSIVEADDRUSE/SO_REUSEADDR，
     // 服务退出后立即重启不会因为 TIME_WAIT 失败。
 
@@ -143,12 +173,9 @@ pub fn bound_port() -> Option<u16> {
 
 /// 关闭服务（PM_STOP / PM_KILL 时调用）。
 ///
-/// 停机三步，顺序不能变：
-///   1. 置 shutdown + 唤醒 accept —— 监听线程不再接新连接；
-///   2. join 全部连接线程 —— 每条连接线程的所有等待循环（读超时、搜索
-///      等待）都是 200ms 步进 + 每步查 shutdown，最长一个步进内收敛，
-///      所以这里不再需要旧实现的 15 秒「排空猜大小」：join 本身就是有界
-///      的，且在途请求会在下一个步进点带着错误响应退出。
+/// 顺序：通知停止 → join 监听线程 → shutdown 在途 socket → join 工作线程。
+/// socket 读写可被主动中断；文件 I/O 在系统调用之间协作取消，Windows/网络
+/// 驱动中的阻塞调用及已执行的宿主 FFI 仍必须等待安全返回。
 ///
 /// join 必须在 PM_STOP 返回前完成：之后宿主会销毁窗口、释放 db 并
 /// FreeLibrary —— 任何活过这一步的连接线程都在执行已卸载的代码。
@@ -163,33 +190,22 @@ pub fn stop() {
     if let Some(s) = taken {
         s.shutdown.store(true, Ordering::SeqCst);
 
-        // 打断阻塞 accept：向本机端口自连接唤醒。连不上（理论上不会发生）
-        // 就放弃 join —— 监听线程会在下一个真实连接到来时自行退出，不值得
-        // 为停机挂死 PM_STOP。
-        let mut woken = false;
-        for _ in 0..10 {
-            if TcpStream::connect_timeout(&s.wakeup, Duration::from_millis(100)).is_ok() {
-                woken = true;
-                break;
-            }
-        }
-        if woken {
-            let joined = match s.thread.lock() {
-                Ok(mut guard) => guard.take(),
-                Err(p) => p.into_inner().take(),
-            };
-            if let Some(t) = joined {
-                let _ = t.join();
-            }
-        } else {
-            crate::plugin::host::Host::debug(
-                "everything_mcp: stop() self-connect failed; listener exits on next connection",
-            );
+        // Wake the readiness wait promptly. Even if this fails, WSAPoll has a
+        // finite timeout: the listener must ALWAYS be joined before DLL unload.
+        let _ = TcpStream::connect_timeout(&s.wakeup, Duration::from_millis(100));
+        let joined = s.thread.lock().unwrap_or_else(|p| p.into_inner()).take();
+        if let Some(t) = joined {
+            let _ = t.join();
         }
     }
 
-    // join 连接线程。同样把句柄整体取走再 join，不持 CONN_THREADS 锁等待
-    // （连接线程退出时会回来拿这把锁把自己摘掉，持锁 join 会死锁）。
+    // No further registrations after joining the listener. Shutdown interrupts
+    // both blocked reads and writes on the worker's cloned socket handle.
+    for (_, stream) in CONNECTIONS.lock().unwrap_or_else(|p| p.into_inner()).iter() {
+        let _ = stream.shutdown(Shutdown::Both);
+    }
+
+    // Take ownership of every remaining worker and wait for all thread cleanup.
     let handles = {
         let mut reg = CONN_THREADS.lock().unwrap_or_else(|p| p.into_inner());
         core::mem::take(&mut *reg)
@@ -197,70 +213,87 @@ pub fn stop() {
     for t in handles {
         let _ = t.join();
     }
-    // 连接线程只在自己退出时摘句柄，join 后注册表必然已空 —— 这里无需
-    // 再清一次。若未来有线程忘记摘，下一轮 stop 的 take 仍能兜住。
 }
 
 fn run_listener(listener: TcpListener, shutdown: std::sync::Arc<AtomicBool>) {
-    // 阻塞 accept：旧实现的非阻塞 + 50ms 轮询给每个请求平均白加 ~25ms
-    // 延迟（响应是 Connection: close，每个 MCP 请求都是新连接）。停机
-    // 由 stop() 向本机端口自连接唤醒。
+    // Wait for readiness rather than sleeping between accepts. A finite poll
+    // also guarantees shutdown if the self-connect wakeup fails.
     while !shutdown.load(Ordering::SeqCst) {
+        let mut fd = WSAPOLLFD {
+            fd: listener.as_raw_socket() as _,
+            events: POLLRDNORM,
+            revents: 0,
+        };
+        let ready = unsafe { WSAPoll(&mut fd, 1, 200) };
+        if ready == 0 {
+            continue;
+        }
+        if ready < 0 {
+            crate::plugin::host::Host::debug("everything_mcp: listener poll failed");
+            break;
+        }
         match listener.accept() {
             Ok((mut stream, _peer)) => {
                 // 唤醒连接或停机后才到达的连接：直接退出循环，套接字丢弃。
                 if shutdown.load(Ordering::SeqCst) {
                     break;
                 }
+                if stream.set_nonblocking(false).is_err() {
+                    continue;
+                }
                 // 并发上限：满了 503 拒掉，不再开线程。
                 if INFLIGHT.load(Ordering::Relaxed) >= MAX_CONNECTIONS {
+                    let _ = stream.set_write_timeout(Some(Duration::from_millis(200)));
                     let _ = stream.write_all(
                         b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
                     );
                     continue;
                 }
                 stats::record_connection();
+                let Ok(control) = stream.try_clone() else {
+                    continue;
+                };
+                let id = NEXT_CONNECTION.fetch_add(1, Ordering::Relaxed);
+                CONNECTIONS
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push((id, control));
                 INFLIGHT.fetch_add(1, Ordering::SeqCst);
                 let s_clone = shutdown.clone();
                 let spawned = thread::Builder::new()
                     .name("everything-mcp-conn".into())
                     .spawn(move || {
+                        let _guard = ConnectionGuard(id);
+                        REQUEST_SHUTDOWN.with(|slot| *slot.borrow_mut() = Some(s_clone.clone()));
                         let _ = handle_connection(stream, s_clone);
-                        INFLIGHT.fetch_sub(1, Ordering::SeqCst);
-                        // 句柄摘除必须在连接线程自己的退出路径上：stop()
-                        // 不持 CONN_THREADS 锁 join（会死锁），它拿到的
-                        // 快照里若含本线程句柄，join() 返回即可。
-                        unregister_self();
                     });
                 match spawned {
                     Ok(handle) => {
                         let mut reg = CONN_THREADS.lock().unwrap_or_else(|p| p.into_inner());
-                        reg.retain(|t| !t.is_finished());
+                        let mut i = 0;
+                        while i < reg.len() {
+                            if reg[i].is_finished() {
+                                // is_finished may precede the last thread cleanup;
+                                // join even completed threads before discarding handles.
+                                let _ = reg.swap_remove(i).join();
+                            } else {
+                                i += 1;
+                            }
+                        }
                         reg.push(handle);
                     }
                     Err(_) => {
-                        // 没起线程就得自己把计数还回去。
-                        INFLIGHT.fetch_sub(1, Ordering::SeqCst);
+                        drop(ConnectionGuard(id));
                     }
                 }
             }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(e) => {
                 crate::plugin::host::Host::debug(&format!("accept err: {}", e));
                 thread::sleep(Duration::from_millis(100));
             }
         }
     }
-}
-
-/// 连接线程退出前清理注册表。
-///
-/// std 拿不到「当前线程自己的 JoinHandle」，无法精确摘除自身；改走
-/// 「清掉所有已结束条目」的语义 —— 本线程此刻已到退出路径，is_finished
-/// 为 false 的竞争窗口只有几条指令，下一次任何连接线程注册或 stop()
-/// 时都会被兜住。注册表不会无限积累：push 前也做同样的清理。
-fn unregister_self() {
-    let mut reg = CONN_THREADS.lock().unwrap_or_else(|p| p.into_inner());
-    reg.retain(|t| !t.is_finished());
 }
 
 /// 处理单条 HTTP 连接：读请求 → 分发 → 写响应。
@@ -305,7 +338,7 @@ fn handle_connection(
         return Ok(());
     }
     if req_head.method != "POST" || (req_head.path != "/" && req_head.path != "/mcp") {
-        let _ = stream.write_all(not_allowed().as_bytes());
+        let _ = stream.write_all(with_cors(not_allowed(), req_head.origin.as_deref()).as_bytes());
         return Ok(());
     }
     if let Some(body) = origin_error(req_head.origin.as_deref()) {
@@ -317,7 +350,8 @@ fn handle_connection(
         Ok(r) => r,
         Err(e) => {
             let body = format!("HTTP body error: {}", e);
-            let _ = stream.write_all(bad_request(&body).as_bytes());
+            let _ = stream
+                .write_all(with_cors(bad_request(&body), req_head.origin.as_deref()).as_bytes());
             return Ok(());
         }
     };
@@ -328,7 +362,7 @@ fn handle_connection(
     // 到 Everything 主线程；调用方无需关心。
     let (status, body) = dispatch_rpc_http(&req.body, &req_head);
 
-    let resp = http_response(status, &body);
+    let resp = with_cors(http_response(status, &body), req_head.origin.as_deref());
     let _ = stream.write_all(resp.as_bytes());
     let _ = stream.flush();
     Ok(())
@@ -380,15 +414,29 @@ fn read_bounded(
     chunk: &mut [u8],
     deadline: Instant,
 ) -> std::io::Result<usize> {
-    let remain = deadline.saturating_duration_since(Instant::now());
-    if remain.is_zero() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
-            "connection deadline exceeded",
-        ));
+    loop {
+        let remain = deadline.saturating_duration_since(Instant::now());
+        if remain.is_zero() || request_cancelled() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "connection cancelled or deadline exceeded",
+            ));
+        }
+        stream.set_read_timeout(Some(remain.min(Duration::from_millis(200))))?;
+        match stream.read(chunk) {
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::Interrupted
+                ) =>
+            {
+                continue
+            }
+            result => return result,
+        }
     }
-    let _ = stream.set_read_timeout(Some(remain.min(Duration::from_secs(30))));
-    stream.read(chunk)
 }
 
 /// 读取并解析一个 HTTP 请求头（不含 body）。
@@ -407,6 +455,12 @@ fn read_http_head(
     let mut search_from = 0usize;
     let head_end = loop {
         if let Some(pos) = find_head_end(&buf, search_from) {
+            if pos > 65536 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "header too large",
+                ));
+            }
             break pos;
         }
         // 下一轮从「可能被新数据补全的最早位置」开始找，避免整段重扫。
@@ -427,8 +481,9 @@ fn read_http_head(
         buf.extend_from_slice(&chunk[..n]);
     };
 
-    let header_str = String::from_utf8_lossy(&buf[..head_end]);
-    let head = parse_header(&header_str)
+    let header_str = std::str::from_utf8(&buf[..head_end])
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let head = parse_header(header_str)
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "no request line"))?;
     // Content-Length 在头部阶段就拦：声明超过上限的请求直接拒绝，绝不
     // 进入读 body 循环 —— 否则读校验顺序颠倒，资源先被消耗、Origin/方法
@@ -459,10 +514,13 @@ fn read_http_body(
     // Content-Length 已在 read_http_head 里验证过 <= MAX_BODY_BYTES。
     let mut body_bytes = leftover;
     while body_bytes.len() < head.content_length {
-        let n = read_bounded(stream, &mut chunk, deadline)?;
+        let take = chunk.len().min(head.content_length - body_bytes.len());
+        let n = read_bounded(stream, &mut chunk[..take], deadline)?;
         if n == 0 {
-            // 与旧行为一致：对端中途关闭时按已收到的内容继续。
-            break;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "incomplete request body",
+            ));
         }
         body_bytes.extend_from_slice(&chunk[..n]);
     }
@@ -470,48 +528,81 @@ fn read_http_body(
     // 保持「一次连接只处理一条请求」的既有语义。
     body_bytes.truncate(head.content_length);
 
-    let body = String::from_utf8_lossy(&body_bytes).into_owned();
+    let body = String::from_utf8(body_bytes)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     Ok(HttpRequest { body })
 }
 
 /// 解析已读完的 HTTP 头部文本，取出请求行与关注的头部字段。
 ///
 /// `header` 是到（含）`\r\n\r\n` 为止的全部字节；首行必须是
-/// `METHOD SP PATH SP VERSION`，否则返回 None。Content-Length 缺失或非法时
-/// 按 0 处理（无 body 的请求）。头部字段名不区分大小写。
+/// `METHOD SP PATH SP VERSION`，否则返回 None。Content-Length
+/// 缺失按 0 处理；非法值、冲突长度、Transfer-Encoding 均拒绝。头名不区分大小写。
 pub fn parse_header(header: &str) -> Option<RequestHead> {
     let mut lines = header.split("\r\n");
     let request_line = lines.next()?;
-    let mut parts = request_line.split_whitespace();
-    let method = parts.next()?.to_string();
-    let path = parts.next()?.to_string();
-
+    let mut parts = request_line.split(' ');
+    let method = parts.next()?;
+    let path = parts.next()?;
+    let version = parts.next()?;
+    if parts.next().is_some()
+        || !matches!(version, "HTTP/1.0" | "HTTP/1.1")
+        || method.is_empty()
+        || !method.bytes().all(|b| b.is_ascii_uppercase())
+        || !path.starts_with('/')
+        || path
+            .bytes()
+            .any(|b| b.is_ascii_whitespace() || b.is_ascii_control())
+    {
+        return None;
+    }
     let mut head = RequestHead {
-        method,
-        path,
+        method: method.into(),
+        path: path.into(),
         ..RequestHead::default()
     };
+    let mut length = None;
     for line in lines {
         if line.is_empty() {
             break;
         }
-        // split_once 取第一个冒号 —— 值里再出现冒号（如 Origin 的端口）不受影响。
-        let (name, value) = match line.split_once(':') {
-            Some((n, v)) => (n.trim(), v.trim()),
-            None => continue,
-        };
-        match name.to_ascii_lowercase().as_str() {
-            "content-length" => {
-                if let Ok(n) = value.parse::<usize>() {
-                    head.content_length = n;
-                }
-            }
-            "mcp-protocol-version" => head.protocol_version = Some(value.to_string()),
-            "origin" => head.origin = Some(value.to_string()),
-            "mcp-method" => head.mcp_method = Some(value.to_string()),
-            "mcp-name" => head.mcp_name = Some(value.to_string()),
-            _ => {}
+        let (name, value) = line.split_once(':')?;
+        if name.is_empty()
+            || !name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
+        {
+            return None;
         }
+        let value = value.trim_matches([' ', '\t']);
+        if value.chars().any(|c| c.is_control() && c != '\t') {
+            return None;
+        }
+        let slot = match name.to_ascii_lowercase().as_str() {
+            "content-length" => {
+                if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+                    return None;
+                }
+                let n = value.parse::<usize>().ok()?;
+                if length.is_some_and(|previous| previous != n) {
+                    return None;
+                }
+                length = Some(n);
+                head.content_length = n;
+                continue;
+            }
+            // Chunked requests are unsupported; never interpret them as CL bodies.
+            "transfer-encoding" => return None,
+            "mcp-protocol-version" => &mut head.protocol_version,
+            "origin" => &mut head.origin,
+            "mcp-method" => &mut head.mcp_method,
+            "mcp-name" => &mut head.mcp_name,
+            _ => continue,
+        };
+        if slot.is_some() {
+            return None;
+        }
+        *slot = Some(value.to_string());
     }
     Some(head)
 }
@@ -543,38 +634,51 @@ pub fn dispatch_rpc(body: &str) -> String {
 /// 两种时代接受通知时均返回 202 空体，不生成 JSON-RPC 响应。
 pub fn dispatch_rpc_http(body: &str, head: &RequestHead) -> (u16, String) {
     stats::record_request();
-    // 可能有批量和单条两种；MCP 客户端实际只发单条，这里也只处理单条。
-    let parsed: protocol::JsonRpcMessage = match serde_json::from_str(body) {
-        Ok(m) => m,
+    let error_status = if head.protocol_version.is_some() {
+        400
+    } else {
+        200
+    };
+    let envelope: Value = match serde_json::from_str(body) {
+        Ok(value) => value,
         Err(_) => {
-            // JSON 本身不合法 → -32700（parse error）。JSON 合法但不是
-            // JSON-RPC 对象（jsonrpc 字段缺失/类型错，serde 才会失败）→
-            // -32600（invalid request）—— JSON-RPC 2.0 里 -32700 只留给
-            // 非 JSON 文本，混用会让按错误码分流的客户端拿到错误的恢复信号。
-            let (code, msg, status) = if serde_json::from_str::<Value>(body).is_ok() {
-                (
-                    protocol::INVALID_REQUEST,
-                    "invalid request: not a JSON-RPC 2.0 message",
-                    400,
-                )
-            } else {
-                (protocol::PARSE_ERROR, "parse error", 400)
-            };
-            let resp = protocol::error_response(&None, code, msg);
-            // modern 语义：请求没进 JSON-RPC 层，按 400 拒绝；legacy 保持 200。
-            let status = if head.protocol_version.is_some() {
-                status
-            } else {
-                200
-            };
-            return (status, encode(&resp));
+            return (
+                error_status,
+                encode(&protocol::error_response(
+                    &None,
+                    protocol::PARSE_ERROR,
+                    "parse error",
+                )),
+            )
         }
     };
-
-    let id = parsed.id.clone();
-    let method = parsed.method.as_deref().unwrap_or("");
-    let params = parsed.params.as_ref().unwrap_or(&Value::Null);
-    let is_notification = parsed.id.is_none();
+    let valid_id = envelope
+        .get("id")
+        .is_none_or(|id| id.is_null() || id.is_string() || id.is_number());
+    let valid = envelope.is_object()
+        && envelope.get("jsonrpc").and_then(Value::as_str) == Some("2.0")
+        && envelope.get("method").is_some_and(Value::is_string)
+        && envelope
+            .get("params")
+            .is_none_or(|p| p.is_object() || p.is_array())
+        && envelope.get("result").is_none()
+        && envelope.get("error").is_none()
+        && valid_id;
+    if !valid {
+        return (
+            error_status,
+            encode(&protocol::error_response(
+                &None,
+                protocol::INVALID_REQUEST,
+                "invalid JSON-RPC 2.0 request",
+            )),
+        );
+    }
+    // Preserve explicit null IDs: only an ABSENT id denotes a notification.
+    let id = envelope.get("id").cloned();
+    let method = envelope["method"].as_str().unwrap_or("");
+    let params = envelope.get("params").unwrap_or(&Value::Null);
+    let is_notification = id.is_none();
 
     // ---- 版本协商 ----
     let meta_version = protocol::requested_version_from_meta(params);
@@ -664,6 +768,16 @@ pub fn dispatch_rpc_http(body: &str, head: &RequestHead) -> (u16, String) {
         "tools/call" => {
             let name = params.get("name").and_then(Value::as_str).unwrap_or("");
             let args = params.get("arguments").unwrap_or(&Value::Null);
+            if name.is_empty() || (!args.is_null() && !args.is_object()) {
+                return (
+                    200,
+                    encode(&protocol::error_response(
+                        &id,
+                        protocol::INVALID_PARAMS,
+                        "tools/call requires name and an arguments object",
+                    )),
+                );
+            }
             let idx = stats::tool_index(name);
             let t0 = std::time::Instant::now();
             let resp = match tools::dispatch(name, args) {
@@ -736,7 +850,32 @@ fn origin_allowed(origin: &str) -> bool {
         Some(r) => r,
         None => return false,
     };
-    // 取 authority（去掉路径），再去掉 userinfo。
+    // Origins contain only a scheme and authority; reject paths/userinfo and
+    // malformed ports instead of normalizing a non-origin URL into the allowlist.
+    if rest.contains(['/', '@', '?', '#']) || rest.chars().any(char::is_whitespace) {
+        return false;
+    }
+    let port = if let Some(tail) = rest.strip_prefix("[::1]") {
+        tail
+    } else {
+        rest.split_once(':').map_or("", |(_, p)| p)
+    };
+    if rest.starts_with("[::1]") {
+        if !port.is_empty()
+            && !port.strip_prefix(':').is_some_and(|p| {
+                !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) && p.parse::<u16>().is_ok()
+            })
+        {
+            return false;
+        }
+    } else if rest.contains(':')
+        && (port.is_empty()
+            || !port.bytes().all(|b| b.is_ascii_digit())
+            || port.parse::<u16>().is_err())
+    {
+        return false;
+    }
+    // The authority is now validated.
     let authority = rest.split('/').next().unwrap_or("");
     let host_port = authority.rsplit('@').next().unwrap_or(authority);
     // IPv6 字面量带方括号：[::1]:8080。
@@ -815,13 +954,7 @@ fn base64_decode(s: &str) -> Option<Vec<u8>> {
 
 /// 构造任意状态码的 HTTP 响应。
 ///
-/// CORS（2026-10 审计收紧）：不再无条件 `Access-Control-Allow-Origin: *`。
-/// `*` 会把响应 readable 交给任意远程页面 —— 与 Origin 白名单组合起来
-/// 恰好是「校验放行了 localhost 的请求、却把 body 送给所有页面」的裂缝
-/// （sandbox iframe 造出 Origin: null 的老路径已堵，这里再收一层）。
-/// 现在只对 http_response 之外的专用预检出口做精确回显；普通响应不带
-/// 任何 CORS 头 —— 非浏览器客户端（curl / MCP 客户端）不受影响，浏览器
-/// 内的 fetch 只在预检通过的白名单页面里能读到响应。
+/// Actual responses use with_cors only after an allowlisted Origin is parsed.
 pub fn http_response(status: u16, body: &str) -> String {
     let reason = match status {
         200 => "OK",
@@ -842,12 +975,28 @@ pub fn http_response(status: u16, body: &str) -> String {
     s
 }
 
+fn with_cors(mut response: String, origin: Option<&str>) -> String {
+    if let Some(origin) = origin.filter(|o| origin_allowed(o)) {
+        if let Some(end) = response.find("\r\n\r\n") {
+            response.insert_str(
+                end + 2,
+                &format!(
+                    "Access-Control-Allow-Origin: {}\r\nVary: Origin\r\n",
+                    origin.trim()
+                ),
+            );
+        }
+    }
+    response
+}
+
 /// OPTIONS 预检的 204 应答。`origin` 已通过白名单校验（调用方负责），
 /// CORS 头精确回显它 —— 任何页面（无论多远）都拿不到可读响应。
 fn preflight_response(origin: &str) -> String {
     let mut s = String::with_capacity(320);
     s.push_str("HTTP/1.1 204 No Content\r\n");
     s.push_str(&format!("Access-Control-Allow-Origin: {}\r\n", origin));
+    s.push_str("Vary: Origin\r\n");
     s.push_str("Access-Control-Allow-Methods: POST, OPTIONS\r\n");
     s.push_str(
         "Access-Control-Allow-Headers: Content-Type, Accept, MCP-Protocol-Version, Mcp-Method, Mcp-Name\r\n",
@@ -869,7 +1018,7 @@ pub fn forbidden(body: &str) -> String {
 }
 
 pub fn bad_request(reason: &str) -> String {
-    let body = format!("{{\"error\":\"{}\"}}", reason.replace('"', "\\\""));
+    let body = serde_json::json!({"error": reason}).to_string();
     format!(
         "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         body.len(),

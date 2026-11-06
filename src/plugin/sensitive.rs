@@ -10,7 +10,7 @@
 //! 文件」—— 后者没有边界（`.npmrc`、`.pypirc`、`~/.aws/credentials`、
 //! `.docker/config.json` 都是），收进来只会误伤正常读取。
 //!
-//! 只作用于**读正文**（`read_file` 与 `grep`，经 `read::read_text_for_matching`）：
+//! 只作用于**读正文**（`read_file` 与 `grep`，经 `read::read_text_budgeted`）：
 //! 搜索结果不隐藏这些文件 —— 文件名不是秘密，正文才是；把索引结果悄悄过滤掉
 //! 反而会让用户「搜了却没有」，破坏本工具作为索引镜像的可信度。
 
@@ -151,14 +151,12 @@ pub fn is_sensitive_path(path: &str) -> bool {
     // `.git` 的 8.3 短名（`GIT~1` / `.GIT~1`）也一并识别 —— 短名解析回的就是
     // 同一个目录。
     let parts: Vec<&str> = normalized.split('\\').collect();
-    parts
-        .windows(2)
-        .any(|w| {
-            let git = w[0].eq_ignore_ascii_case(".git")
-                || w[0].eq_ignore_ascii_case("git~1")
-                || w[0].eq_ignore_ascii_case(".git~1");
-            git && w[1].eq_ignore_ascii_case("objects")
-        })
+    parts.windows(2).any(|w| {
+        let git = w[0].eq_ignore_ascii_case(".git")
+            || w[0].eq_ignore_ascii_case("git~1")
+            || w[0].eq_ignore_ascii_case(".git~1");
+        git && w[1].eq_ignore_ascii_case("objects")
+    })
 }
 
 /// 命中黑名单时的统一错误文案。
@@ -275,7 +273,13 @@ mod tests {
 
     #[test]
     fn denies_short_8_3_names() {
-        for name in ["CREDEN~1.JSO", "CREDEN~1", "ID_ED2~1", "ID_RSA~1", "id_rsa~"] {
+        for name in [
+            "CREDEN~1.JSO",
+            "CREDEN~1",
+            "ID_ED2~1",
+            "ID_RSA~1",
+            "id_rsa~",
+        ] {
             assert!(is_sensitive_file_name(name), "{name:?} 应被拒绝");
         }
         assert!(is_sensitive_path(r"C:\Users\me\.ssh\ID_ED2~1"));
@@ -325,7 +329,13 @@ mod tests {
     #[test]
     fn keeps_innocent_short_names_readable() {
         // 无点无 ~ 的普通短名（8.3 化后也可能存在的普通文件）不误伤。
-        for name in ["main.rs", "notes.txt", "monkey.txt", "keystore.md", "id_rsa.pub"] {
+        for name in [
+            "main.rs",
+            "notes.txt",
+            "monkey.txt",
+            "keystore.md",
+            "id_rsa.pub",
+        ] {
             assert!(!is_sensitive_file_name(name), "{name:?} 不该被拦");
         }
     }

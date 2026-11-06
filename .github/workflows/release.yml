@@ -49,7 +49,7 @@ jobs:
           "tag $env:GITHUB_REF_NAME matches version $cargoVersion"
 
       - name: Test
-        run: cargo test
+        run: cargo test --locked
 
       # 产物：installer\dist\everything-mcp-<版本>-{x64,x86}-setup.exe
       - name: Build installers

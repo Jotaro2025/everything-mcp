@@ -26,7 +26,11 @@ fn require_folder(args: &Value) -> Result<String, (i32, String)> {
 /// 取 pattern 参数：可缺省（空 = 列出全部），但不能含控制字符。
 /// shell  globstar 前缀（`**/`、`**\`、`./`）在这里翻译成 Everything 语义。
 fn pattern_arg(args: &Value) -> Result<String, (i32, String)> {
-    let raw = args.get("pattern").and_then(Value::as_str).unwrap_or("");
+    let raw = match args.get("pattern") {
+        None | Some(Value::Null) => "",
+        Some(Value::String(s)) => s,
+        Some(_) => return Err((INVALID_PARAMS, "'pattern' must be a string".into())),
+    };
     let p = validate::validate_pattern(raw).map_err(|e| (INVALID_PARAMS, e))?;
     Ok(validate::translate_globstar(&p))
 }
@@ -187,12 +191,7 @@ fn u64_arg(args: &Value, key: &str, default: u64) -> Result<u64, (i32, String)> 
 /// 与 `u64_arg(...)? as usize` 的区别：发布的是 x86/x64 双架构，x86 的
 /// `usize` 是 32 位 —— 传 2^32 会被 `as usize` 静默截断成 0（调用方以为
 /// 在翻第 N 页，实际拿到第 0 页）。这里先按 u64 完成范围校验再收窄。
-fn usize_arg(
-    args: &Value,
-    key: &str,
-    default: u64,
-    max: u64,
-) -> Result<usize, (i32, String)> {
+fn usize_arg(args: &Value, key: &str, default: u64, max: u64) -> Result<usize, (i32, String)> {
     let v = u64_arg(args, key, default)?;
     if v > max {
         return Err((
@@ -542,9 +541,9 @@ fn tool_search_in_folder(args: &Value) -> Result<ToolOutput, (i32, String)> {
     // offset 无上界（超大值按空页处理，见 page_window 的钳制）；max_results
     // 走带范围的显式校验。x86 下 usize 是 32 位，必须先校验再收窄。
     let offset = usize_arg(args, "offset", 0, usize::MAX as u64)?;
-    let max_results = u64_arg(args, "max_results", 50)? as usize;
+    let max_results = u64_arg(args, "max_results", 50)?;
     // 窗口上限与另外两个搜索工具一致；0 是写错而不是「不限」。
-    if max_results == 0 || max_results > RESULT_WINDOW_MAX {
+    if max_results == 0 || max_results > RESULT_WINDOW_MAX as u64 {
         return Err((
             INVALID_PARAMS,
             format!(
@@ -554,6 +553,7 @@ fn tool_search_in_folder(args: &Value) -> Result<ToolOutput, (i32, String)> {
             ),
         ));
     }
+    let max_results = max_results as usize;
     let timeout_ms = timeout_arg(args, 10_000)?;
     let sort = sort_arg(args)?;
     let descending = bool_arg(args, "descending", false)?;
@@ -565,8 +565,14 @@ fn tool_search_in_folder(args: &Value) -> Result<ToolOutput, (i32, String)> {
         descending,
     };
 
-    match plugin::search::search_in_folder(&folder, &query, offset, max_results, timeout_ms, options)
-    {
+    match plugin::search::search_in_folder(
+        &folder,
+        &query,
+        offset,
+        max_results,
+        timeout_ms,
+        options,
+    ) {
         Ok(outcome) => {
             let entries: Vec<Value> = outcome
                 .results
@@ -620,8 +626,8 @@ fn tool_list_folder(args: &Value) -> Result<ToolOutput, (i32, String)> {
     let offset = usize_arg(args, "offset", 0, usize::MAX as u64)?;
     // 窗口必须能翻页：大目录的直接子项可以上千（实测 C:\Windows\System32
     // 有 4889 个），旧实现写死 500 条且没有 offset，第 501 项之后拿不到。
-    let max_results = u64_arg(args, "max_results", LIST_DEFAULT_MAX_RESULTS as u64)? as usize;
-    if max_results == 0 || max_results > RESULT_WINDOW_MAX {
+    let max_results = u64_arg(args, "max_results", LIST_DEFAULT_MAX_RESULTS as u64)?;
+    if max_results == 0 || max_results > RESULT_WINDOW_MAX as u64 {
         return Err((
             INVALID_PARAMS,
             format!(
@@ -634,6 +640,7 @@ fn tool_list_folder(args: &Value) -> Result<ToolOutput, (i32, String)> {
     // 无排除项时 query 为空串，等价于列出该目录全部直接子项，不递归。
     // 超时同样可调：一个挂着离线共享的目录要等多久，调用方说了算
     // （原先写死 10 秒，与另外三个搜索类工具不对称）。
+    let max_results = max_results as usize;
     let timeout_ms = timeout_arg(args, 10_000)?;
     match plugin::search::search_in_folder(
         &folder,
@@ -673,8 +680,7 @@ fn tool_list_folder(args: &Value) -> Result<ToolOutput, (i32, String)> {
                     payload["folder_warning"] = json!(w);
                 }
             }
-            let text =
-                serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".into());
+            let text = serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".into());
             Ok((content_text(&text), false))
         }
         Err(e) => Ok((content_text(&format!("list error: {}", e)), true)),
@@ -722,7 +728,7 @@ fn tool_index_changes(args: &Value) -> Result<ToolOutput, (i32, String)> {
     let name = optional_text_arg(args, "name")?;
     let since = timestamp_arg(args, "since")?;
     let until = timestamp_arg(args, "until")?;
-    let max_results = u64_arg(args, "max_results", INDEX_CHANGES_DEFAULT)? as usize;
+    let max_results = u64_arg(args, "max_results", INDEX_CHANGES_DEFAULT)?;
 
     if max_results == 0 {
         return Err((
@@ -733,7 +739,7 @@ fn tool_index_changes(args: &Value) -> Result<ToolOutput, (i32, String)> {
             ),
         ));
     }
-    if max_results as u64 > INDEX_CHANGES_LIMIT {
+    if max_results > INDEX_CHANGES_LIMIT {
         return Err((
             INVALID_PARAMS,
             format!(
@@ -743,6 +749,7 @@ fn tool_index_changes(args: &Value) -> Result<ToolOutput, (i32, String)> {
             ),
         ));
     }
+    let max_results = max_results as usize;
     // since 晚于 until 是最容易犯的错：放过它只会得到 0 条且无从诊断。
     if let (Some(s), Some(u)) = (&since, &until) {
         if s > u {
@@ -789,6 +796,7 @@ fn tool_index_changes(args: &Value) -> Result<ToolOutput, (i32, String)> {
                 "until": filter.until,
                 "count": outcome.count,
                 "truncated": outcome.truncated,
+                "truncation_reason": outcome.truncation_reason,
                 "days_searched": outcome.days_searched,
                 "skipped_lines": outcome.skipped_lines,
                 "log_directory": outcome.log_directory,
@@ -806,15 +814,15 @@ fn tool_index_changes(args: &Value) -> Result<ToolOutput, (i32, String)> {
 fn tool_read_file(args: &Value) -> Result<ToolOutput, (i32, String)> {
     // 纯入参问题（缺参数 / 相对路径 / 通配符）在触达磁盘之前就报
     // INVALID_PARAMS —— 与 folder 参数的处理一致，CI 上无主程序也能跑。
-    let path = match args.get("path").and_then(Value::as_str) {
-        Some(p) => plugin::read::validate_path(p).map_err(|e| (INVALID_PARAMS, e))?,
-        None => {
-            return Err((
+    let path =
+        match args.get("path").and_then(Value::as_str) {
+            Some(p) => plugin::read::validate_path(p).map_err(|e| (INVALID_PARAMS, e))?,
+            None => return Err((
                 INVALID_PARAMS,
-                "'path' is required and must be a string: the absolute path of the file to read".into(),
-            ))
-        }
-    };
+                "'path' is required and must be a string: the absolute path of the file to read"
+                    .into(),
+            )),
+        };
     let start_line = usize_arg(args, "start_line", 1, usize::MAX as u64)?;
     let max_lines = usize_arg(
         args,
@@ -894,7 +902,8 @@ fn tool_grep(args: &Value) -> Result<ToolOutput, (i32, String)> {
         None => {
             return Err((
                 INVALID_PARAMS,
-                "'pattern' is required and must be a string: a regular expression matched per line".into(),
+                "'pattern' is required and must be a string: a regular expression matched per line"
+                    .into(),
             ))
         }
     };
@@ -925,13 +934,12 @@ fn tool_grep(args: &Value) -> Result<ToolOutput, (i32, String)> {
         }
     };
 
-    let head_limit =
-        usize_arg(
-            args,
-            "head_limit",
-            plugin::grep::DEFAULT_HEAD_LIMIT as u64,
-            plugin::grep::MAX_HEAD_LIMIT as u64,
-        )?;
+    let head_limit = usize_arg(
+        args,
+        "head_limit",
+        plugin::grep::DEFAULT_HEAD_LIMIT as u64,
+        plugin::grep::MAX_HEAD_LIMIT as u64,
+    )?;
     if head_limit == 0 || head_limit > plugin::grep::MAX_HEAD_LIMIT {
         return Err((
             INVALID_PARAMS,
@@ -970,6 +978,8 @@ fn tool_grep(args: &Value) -> Result<ToolOutput, (i32, String)> {
                 "clipped_lines": o.clipped_lines,
                 "count": o.payload.len(),
                 "truncated": o.truncated,
+                "truncation_reason": o.truncation_reason,
+                "files_skipped": o.files_skipped,
             });
             // 载荷键随模式变：matches / files / counts。
             match &o.payload {
@@ -1013,8 +1023,7 @@ fn tool_search_everywhere(args: &Value) -> Result<ToolOutput, (i32, String)> {
     // 顺序刻意如此：入参校验先行（纯入参问题，无主程序环境的 CI 也能跑），
     // 再过 mcp_global_search 模式闸门，最后才触达搜索层。
     let pattern = pattern_arg(args)?;
-    let pattern =
-        validate::validate_global_pattern(&pattern).map_err(|e| (INVALID_PARAMS, e))?;
+    let pattern = validate::validate_global_pattern(&pattern).map_err(|e| (INVALID_PARAMS, e))?;
     let excludes = exclude_arg(args)?;
     // exclude 项会拼进同一条查询，content: 闸门必须两边都查 ——
     // 只查 pattern 的话 `exclude: ["content:…"]` 就绕过去了。
@@ -1061,8 +1070,13 @@ fn tool_search_everywhere(args: &Value) -> Result<ToolOutput, (i32, String)> {
         descending,
     };
 
-    match plugin::search::search_everywhere(&query, offset, max_results as usize, timeout_ms, options)
-    {
+    match plugin::search::search_everywhere(
+        &query,
+        offset,
+        max_results as usize,
+        timeout_ms,
+        options,
+    ) {
         Ok(outcome) => {
             let entries: Vec<Value> = outcome
                 .results
@@ -1243,7 +1257,10 @@ mod tests {
         assert_eq!(timeout_arg(&json!({}), 10_000).unwrap(), 10_000);
         assert_eq!(timeout_arg(&json!({ "timeout_ms": null }), 7).unwrap(), 7);
         // 正常值原样通过；服务端上限本身可用。
-        assert_eq!(timeout_arg(&json!({ "timeout_ms": 30_000 }), 1).unwrap(), 30_000);
+        assert_eq!(
+            timeout_arg(&json!({ "timeout_ms": 30_000 }), 1).unwrap(),
+            30_000
+        );
         assert_eq!(
             timeout_arg(&json!({ "timeout_ms": MAX_TIMEOUT_MS }), 1).unwrap(),
             MAX_TIMEOUT_MS

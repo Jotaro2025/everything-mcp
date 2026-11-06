@@ -38,17 +38,21 @@ jobs:
 
       # [lints] 里 clippy.all = deny，这里显式 -- -D warnings 双保险。
       # 只查默认 target（host 是 x64，x86 的 clippy 结果相同），省一半时间。
+      - name: Format
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        run: cargo fmt --all -- --check
+
       - name: Clippy
         if: matrix.target == 'x86_64-pc-windows-msvc'
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
 
       - name: Build (release)
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --locked --release --target ${{ matrix.target }}
 
-      # 绝大多数测试不需要 Everything 宿主：search 走宿主 FFI（单测里已桩化），
+      # 绝大多数测试不需要 Everything 宿主：search 的真实 FFI 需宿主验收，
       # read_file / grep 用临时文件，HTTP / 分发 / 协议走 tests/mcp.rs 的本地套接字。
       - name: Test
-        run: cargo test --target ${{ matrix.target }}
+        run: cargo test --locked --target ${{ matrix.target }}
 
       # cdylib 产物存在性检查：插件 DLL 是唯一交付物，编译成功但没出 DLL 也算失败。
       - name: Verify DLL artifact
@@ -69,3 +73,14 @@ jobs:
             throw "DLL must export everything_plugin_proc; dumpbin /EXPORTS output:`n$exports"
           }
           "export check: everything_plugin_proc found"
+
+          $dependencies = & $dumpbin.FullName /DEPENDENTS $dll.FullName | Out-String
+          $allowed = '^(kernel32|user32|ws2_32|advapi32|ntdll|userenv|bcrypt|bcryptprimitives|gdi32|comctl32|ole32|shell32|secur32|crypt32|rpcrt4|shlwapi|version|winmm|dbghelp|api-ms-win-[a-z0-9-]+|ext-ms-win-[a-z0-9-]+)\.dll$'
+          $imports = [regex]::Matches($dependencies, '(?im)^\s+([a-z0-9_.-]+\.dll)\s*$')
+          if ($imports.Count -eq 0) { throw "could not read DLL import table" }
+          foreach ($import in $imports) {
+            if ($import.Groups[1].Value -notmatch $allowed) {
+              throw "unexpected runtime DLL dependency: $($import.Groups[1].Value)"
+            }
+          }
+          "dependency check: system DLLs only"

@@ -16,8 +16,10 @@
 
 use regex::{Regex, RegexBuilder};
 
+use super::budget::ScanBudget;
 use super::read;
 use super::search::{search_in_folder, SearchOptions, SearchScope, SortKey};
+use std::time::{Duration, Instant};
 
 /// 默认最多返回多少条命中（content 模式）或多少个文件（其余模式）。
 pub const DEFAULT_HEAD_LIMIT: usize = 200;
@@ -52,7 +54,12 @@ impl OutputMode {
 
     /// 解析输出模式，顺带收几个 LLM 常写的同义字。
     pub fn parse(s: &str) -> Option<Self> {
-        match s.trim().to_ascii_lowercase().replace(['_', '-'], "").as_str() {
+        match s
+            .trim()
+            .to_ascii_lowercase()
+            .replace(['_', '-'], "")
+            .as_str()
+        {
             "" | "content" | "lines" | "matches" => Some(OutputMode::Content),
             "fileswithmatches" | "files" | "filenames" => Some(OutputMode::FilesWithMatches),
             "count" | "counts" => Some(OutputMode::Count),
@@ -108,6 +115,8 @@ pub struct GrepOutcome {
     pub clipped_lines: usize,
     /// 还有命中没返回（`head_limit` 或字节预算拦下）。
     pub truncated: bool,
+    pub truncation_reason: Option<&'static str>,
+    pub files_skipped: usize,
     pub payload: GrepPayload,
 }
 
@@ -116,6 +125,7 @@ pub struct GrepOutcome {
 /// content 模式下把命中追加进 `out`，并从 `budget`（剩余字节）里扣账 ——
 /// 预算在**逐条命中**上扣，所以单个文件也炸不了窗口。返回
 /// (本文件命中数, 裁短行数, 是否停下)。
+#[cfg(test)]
 fn scan_text(
     re: &Regex,
     path: &str,
@@ -125,13 +135,34 @@ fn scan_text(
     out: &mut Vec<Hit>,
     budget: &mut usize,
 ) -> (usize, usize, bool) {
+    let mut scan = ScanBudget::new(MAX_TOTAL_BYTES, Duration::from_secs(30));
+    scan_text_budgeted(re, path, text, mode, head_limit, out, budget, &mut scan)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scan_text_budgeted(
+    re: &Regex,
+    path: &str,
+    text: &str,
+    mode: OutputMode,
+    head_limit: usize,
+    out: &mut Vec<Hit>,
+    budget: &mut usize,
+    scan: &mut ScanBudget,
+) -> (usize, usize, bool) {
     let mut file_hits = 0usize;
     let mut clipped = 0usize;
     for (idx, line) in text.lines().enumerate() {
+        if idx % 256 == 0 && !scan.check() {
+            return (file_hits, clipped, true);
+        }
         if !re.is_match(line) {
             continue;
         }
         file_hits += 1;
+        if mode == OutputMode::FilesWithMatches {
+            return (1, 0, false);
+        }
         if mode != OutputMode::Content {
             continue;
         }
@@ -184,6 +215,7 @@ pub fn grep(
     case_insensitive: bool,
     timeout_ms: u32,
 ) -> Result<GrepOutcome, String> {
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms as u64);
     if pattern.trim().is_empty() {
         return Err("'pattern' must not be empty".into());
     }
@@ -199,14 +231,7 @@ pub fn grep(
         descending: true,
         ..SearchOptions::for_scope(SearchScope::Recursive)
     };
-    let outcome = search_in_folder(
-        folder,
-        filter,
-        0,
-        MAX_CANDIDATE_FILES,
-        timeout_ms,
-        options,
-    )?;
+    let outcome = search_in_folder(folder, filter, 0, MAX_CANDIDATE_FILES, timeout_ms, options)?;
     let candidates = outcome.total;
     let candidates_truncated = outcome.total > outcome.results.len();
     let entries: Vec<(String, bool)> = outcome
@@ -214,13 +239,14 @@ pub fn grep(
         .iter()
         .map(|r| (r.path.clone(), r.is_folder))
         .collect();
-    Ok(scan_candidates(
+    Ok(scan_candidates_budgeted(
         &re,
         candidates,
         candidates_truncated,
         &entries,
         mode,
         head_limit,
+        &mut ScanBudget::until(MAX_TOTAL_BYTES, deadline),
     ))
 }
 
@@ -230,6 +256,7 @@ pub fn grep(
 /// 测试路径用临时文件夹具直接喂。`entries` 是 `(完整路径, 是否文件夹)`
 /// 对，顺序即处理顺序 —— 结果里「最近改动的文件先出」这一性质也由
 /// 调用方保证。
+#[cfg(test)]
 fn scan_candidates(
     re: &Regex,
     candidates: usize,
@@ -238,12 +265,33 @@ fn scan_candidates(
     mode: OutputMode,
     head_limit: usize,
 ) -> GrepOutcome {
+    scan_candidates_budgeted(
+        re,
+        candidates,
+        candidates_truncated,
+        entries,
+        mode,
+        head_limit,
+        &mut ScanBudget::new(MAX_TOTAL_BYTES, Duration::from_secs(30)),
+    )
+}
+
+fn scan_candidates_budgeted(
+    re: &Regex,
+    candidates: usize,
+    candidates_truncated: bool,
+    entries: &[(String, bool)],
+    mode: OutputMode,
+    head_limit: usize,
+    scan: &mut ScanBudget,
+) -> GrepOutcome {
     let mut hits: Vec<Hit> = Vec::new();
     let mut per_file: Vec<(String, usize)> = Vec::new();
     let mut files_scanned = 0usize;
-    let mut bytes_scanned = 0u64;
+    let mut files_skipped = 0usize;
     let mut clipped_lines = 0usize;
     let mut truncated = false;
+    let mut truncation_reason = None;
     // 输出预算：与 read_file 同一个常量（128 KiB）。head_limit 是粗筛，
     // 它才是真正防「一次 grep 把上下文炸掉」的闸门。
     let mut budget = read::MAX_WINDOW_BYTES;
@@ -259,28 +307,41 @@ fn scan_candidates(
         };
         if listed >= head_limit {
             truncated = true;
+            truncation_reason = Some("head_limit");
             break;
         }
-        if bytes_scanned >= MAX_TOTAL_BYTES || budget == 0 {
+        if !scan.check() || budget == 0 {
+            truncation_reason = scan.stop_reason.or(Some("output_budget"));
             truncated = true;
             break;
         }
         // 二进制 / 超大 / 黑名单 / 读不了 —— 跳过这个文件，不中断整次搜索。
-        let Some((text, raw_len)) = read::read_text_for_matching(path) else {
-            continue;
+        let text = match read::read_text_budgeted(path, scan) {
+            Ok(text) => text,
+            Err(_) => {
+                files_skipped += 1;
+                continue;
+            }
         };
         files_scanned += 1;
-        // 按**原始字节**计账（不是解码后长度）：64 MiB 的预算语义是
-        // 「从磁盘读了多少」，UTF-16 文件的解码文本只有原字节一半。
-        bytes_scanned += raw_len;
+        // The shared budget charges every OS read, including binary sniffing.
 
-        let (file_hits, clipped, stopped) =
-            scan_text(re, path, &text, mode, head_limit, &mut hits, &mut budget);
+        let (file_hits, clipped, stopped) = scan_text_budgeted(
+            re,
+            path,
+            &text,
+            mode,
+            head_limit,
+            &mut hits,
+            &mut budget,
+            scan,
+        );
         clipped_lines += clipped;
         if file_hits > 0 {
             // 非 content 模式的载荷是路径，也要计账。
             if mode != OutputMode::Content {
                 if path.len() + 8 > budget {
+                    truncation_reason = Some("output_budget");
                     truncated = true;
                     break;
                 }
@@ -289,15 +350,35 @@ fn scan_candidates(
             per_file.push((path.clone(), file_hits));
         }
         if stopped {
+            truncation_reason = scan.stop_reason.or(Some(if hits.len() >= head_limit {
+                "head_limit"
+            } else {
+                "output_budget"
+            }));
             truncated = true;
             break 'files;
         }
         if mode != OutputMode::Content && per_file.len() >= head_limit {
+            truncation_reason = Some("head_limit");
             truncated = true;
             break;
         }
     }
 
+    truncated |= candidates_truncated || scan.stop_reason.is_some();
+    if scan.stop_reason.is_some() {
+        truncation_reason = scan.stop_reason;
+    } else if truncated && truncation_reason.is_none() {
+        truncation_reason = Some(
+            if hits.len() >= head_limit || per_file.len() >= head_limit {
+                "head_limit"
+            } else if candidates_truncated {
+                "candidate_limit"
+            } else {
+                "output_budget"
+            },
+        );
+    }
     let files_with_matches = per_file.len();
     let payload = match mode {
         OutputMode::Content => GrepPayload::Content(hits),
@@ -313,7 +394,9 @@ fn scan_candidates(
         candidates,
         candidates_truncated,
         files_scanned,
-        bytes_scanned,
+        bytes_scanned: scan.bytes,
+        files_skipped,
+        truncation_reason,
         files_with_matches,
         clipped_lines,
         truncated,
@@ -324,6 +407,30 @@ fn scan_candidates(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejected_binary_files_consume_shared_io_budget() {
+        let (root, _) = fixture();
+        let path = root.join("unknown.dat");
+        std::fs::write(&path, vec![0; 8192]).unwrap();
+        let entries = vec![(path.to_string_lossy().into_owned(), false); 4];
+        let mut scan = ScanBudget::new(6000, Duration::from_secs(5));
+        let out = scan_candidates_budgeted(
+            &re("TODO"),
+            4,
+            false,
+            &entries,
+            OutputMode::Content,
+            200,
+            &mut scan,
+        );
+        assert_eq!(out.bytes_scanned, 6000);
+        assert_eq!(out.files_scanned, 0);
+        assert!(out.files_skipped >= 2);
+        assert!(out.truncated);
+        assert_eq!(out.truncation_reason, Some("byte_budget"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     fn re(p: &str) -> Regex {
         RegexBuilder::new(p).build().unwrap()
@@ -351,7 +458,10 @@ mod tests {
             OutputMode::parse("files_with_matches"),
             Some(OutputMode::FilesWithMatches)
         );
-        assert_eq!(OutputMode::parse("files"), Some(OutputMode::FilesWithMatches));
+        assert_eq!(
+            OutputMode::parse("files"),
+            Some(OutputMode::FilesWithMatches)
+        );
         assert_eq!(OutputMode::parse("count"), Some(OutputMode::Count));
         assert_eq!(OutputMode::parse("summary"), None);
     }
@@ -395,7 +505,10 @@ mod tests {
 
     #[test]
     fn scan_text_stops_at_head_limit() {
-        let text = (1..=10).map(|i| format!("hit {i}")).collect::<Vec<_>>().join("\n");
+        let text = (1..=10)
+            .map(|i| format!("hit {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let mut out = Vec::new();
         let mut b = budget();
         let (hits, _, stopped) = scan_text(
@@ -505,7 +618,11 @@ mod tests {
     fn output_budget_is_shared_with_read_file() {
         // 两个工具用同一个常量：改一处两边一起变，避免只调了一个。
         assert_eq!(read::MAX_WINDOW_BYTES, 128 * 1024);
-        assert_eq!(read::MAX_LINE_CHARS * 4, 64 * 1024, "裁过的行必须放得进预算");
+        assert_eq!(
+            read::MAX_LINE_CHARS * 4,
+            64 * 1024,
+            "裁过的行必须放得进预算"
+        );
         const { assert!(read::MAX_LINE_CHARS * 4 < read::MAX_WINDOW_BYTES) };
     }
 

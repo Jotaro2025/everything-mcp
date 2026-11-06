@@ -700,16 +700,17 @@ mod tests {
         // 下次运行也不会复用 —— 起步时按前缀清一遍旧账。
         if let Ok(rd) = std::fs::read_dir(std::env::temp_dir()) {
             for e in rd.flatten() {
-                if e.file_name().to_string_lossy().starts_with("everything_mcp_stats_test_") {
+                if e.file_name()
+                    .to_string_lossy()
+                    .starts_with("everything_mcp_stats_test_")
+                {
                     let _ = std::fs::remove_dir_all(e.path());
                 }
             }
         }
 
-        let dir = std::env::temp_dir().join(format!(
-            "everything_mcp_stats_test_{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("everything_mcp_stats_test_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         set_test_stats_dir(Some(dir.clone()));
@@ -760,10 +761,8 @@ mod tests {
     fn flush_rotates_oversized_file_keeping_latest_values() {
         let _g = TEST_GLOBALS_LOCK.lock().unwrap();
 
-        let dir = std::env::temp_dir().join(format!(
-            "everything_mcp_stats_test_{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("everything_mcp_stats_test_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         set_test_stats_dir(Some(dir.clone()));

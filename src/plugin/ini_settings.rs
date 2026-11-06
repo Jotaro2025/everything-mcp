@@ -78,7 +78,7 @@ fn decode_ini(bytes: &[u8]) -> String {
     // 同样如此；中文 Windows 即 GBK）。
     #[cfg(windows)]
     {
-        use windows_sys::Win32::Globalization::{CP_ACP, MultiByteToWideChar};
+        use windows_sys::Win32::Globalization::{MultiByteToWideChar, CP_ACP};
         if !body.is_empty() && body.len() <= i32::MAX as usize {
             let units = unsafe {
                 MultiByteToWideChar(
@@ -143,7 +143,10 @@ fn parse_section(content: &str) -> Option<PersistedSettings> {
         let line = line.trim();
         if let Some(rest) = line.strip_prefix('[') {
             // strip_prefix 对 ASCII 前缀按字节切，不存在「索引切在字符中间」的问题。
-            in_section = rest.trim_end_matches(']').trim().eq_ignore_ascii_case(SECTION);
+            in_section = rest
+                .trim_end_matches(']')
+                .trim()
+                .eq_ignore_ascii_case(SECTION);
             continue;
         }
         if !in_section {

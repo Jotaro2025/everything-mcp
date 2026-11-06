@@ -457,13 +457,15 @@ gitignore），常见做法：
   匹配新名字）。`since` / `until` 给出时间窗（含端点），接受
   `2026-09-23`、`2026-09-23 11:18`、`2026-09-23 11:18:31`（日期与时间之间
   空格或 `T` 都行），裸数字按 Unix 秒处理。
-- 响应带 `count`、`truncated`（还有更多匹配的历史时说明被 `max_results`
-  截断了）、`days_searched`（回溯了几天的日志）、`skipped_lines`
+- 响应带 `count`、`truncated`（查询提前停止，历史可能不完整）、
+  `truncation_reason`（停止原因）、`days_searched`（回溯了几天的日志）、`skipped_lines`
   （解析失败的行数，通常就是正在写入的半行）和 `log_directory`（实际读的
   日志目录）。日志按天倒序分块读，「取最近 N 条」只读文件尾部一小段，
   不会把整份日志穿完。
 - 深度受 Everything 侧的日志保留策略限制：日志按天一个文件，本工具最多
-  回溯 92 天、单文件最多 64 MiB。
+  回溯 92 天、单文件和整个请求均最多读取 64 MiB；请求设 30 秒协作式截止时间。
+  `truncation_reason` 可为 `max_results`、`byte_budget`、`deadline`、`day_limit`、
+  `file_window`、`output_budget`、`line_limit`、`cancelled` 或 `read_error`。
 
 #### 5. `read_file`
 
@@ -492,7 +494,8 @@ gitignore），常见做法：
   **这份名单不可配置** —— 它是这个面向 LLM 的读文件工具里唯一能挡住
   「提示注入 → 读走 `~/.ssh/id_rsa`」的机制。名单只作用于读正文，
   搜索结果不隐藏这些文件：文件名不是秘密，正文才是。
-- **单文件上限 8 MiB**，超过直接报错（`TOO_LARGE`）—— 不会把大文件读进内存。
+- **单文件上限 8 MiB**，超过报错（`TOO_LARGE`）。路径复核、元数据和读取使用同一句柄；
+  即使文件边读边增长，最多读取 8 MiB + 1 字节用于判定超限。行窗口不建立全文件行索引。
   返回内容另有 **128 KiB 字节预算**兜底，**按整行累加**：预算拦下时只会少返回
   整行，不会从一行中间切开。
 - **超长行会被裁短**：超过 16384 字符的行裁到上限，裁了几行由 `clipped_lines`
@@ -554,7 +557,10 @@ gitignore），常见做法：
   不限范围的 `content:` 检索是同一个坑。三道内部闸门兜底：候选文件上限
   2000 个、读取总量上限 64 MiB、**返回的命中正文累计 128 KiB**（与 `read_file`
   同一个常量）；触顶时 `truncated` 为 `true`，而 `candidates` / `files_scanned` /
-  `bytes_scanned` 会告诉你卡在哪一道上。注意这 128 KiB 算的是**正文**，JSON
+  `bytes_scanned` 会告诉你实际扫描量（包含最终跳过的二进制样本）。
+  `truncation_reason` 给出 `candidate_limit`、`head_limit`、`output_budget`、
+  `byte_budget`、`deadline` 或 `cancelled`；`files_skipped` 统计未能完成文本读取的文件。
+  `timeout_ms` 覆盖候选查询和内容扫描，默认 10000 毫秒。注意这 128 KiB 算的是**正文**，JSON
   信封（路径、行号、转义）还会再叠一层，所以实际响应会略大于它。
 - **`output_mode`** 决定返回形状：
   - `content`（默认）：`matches` 数组，每项 `{ path, line, text }`；
@@ -744,6 +750,15 @@ Everything 主程序之前，因此非法入参绝不会变成一次真实搜索
   **无鉴权**——见上文「绑定与凭据边界」。远程公开暴露不在设计目标内。
 - **只处理文本**。`read_file` 拒绝二进制内容（按扩展名与内容双重嗅探），
   行长超 16 KiB 截断；`grep` 同样跳过二进制文件与超过 8 MiB 的文件。
+
+停机时会主动关闭在途 HTTP 连接，主线程队列和文件扫描协作取消。搜索的
+`timeout_ms` 包含共享查询锁排队、主线程提交、查询等待和结果读取；超时后的
+取消提交最多再等 200 毫秒。已进入宿主 FFI 或 Windows 文件系统/SMB 驱动的
+阻塞调用仍须安全返回，因此这些时限不保证强制中断底层系统调用。
+
+浏览器从白名单本机来源访问时，预检及实际成功/错误响应均精确回显
+`Access-Control-Allow-Origin`，并带 `Vary: Origin`。HTTP 拒绝冲突长度、
+非法请求行、分块请求和不完整正文；JSON-RPC 严格校验请求信封。
 
 ### 调试
 

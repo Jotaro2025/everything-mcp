@@ -38,10 +38,12 @@
 //! 动作列是本地化字符串（随 Everything 的界面语言变化），因此按多语言关键词
 //! 归类成稳定的枚举值；归不上的记为 `other` 并保留原始串，LLM 仍能读懂。
 
+use super::budget::ScanBudget;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use std::time::Duration;
 
 /// 单条索引变更。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -127,6 +129,7 @@ pub struct Outcome {
     pub bytes_scanned: u64,
     /// true = 已取满 `max_results` 提前收尾，日志里可能还有更早的匹配项。
     pub truncated: bool,
+    pub truncation_reason: Option<&'static str>,
     /// 解析失败的行数（正在写入的半行、格式不认的行）。
     pub skipped_lines: u64,
     /// 实际使用的日志目录。
@@ -143,6 +146,9 @@ const CHUNK: usize = 256 * 1024;
 /// 单个日志文件最多读入的字节数。配上倒序扫描，即使过滤器什么都匹配不上
 /// 也不会把一个巨大的日志文件读穿。
 const MAX_BYTES_PER_FILE: u64 = 64 * 1024 * 1024;
+const MAX_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_LINE_BYTES: usize = 1024 * 1024;
+const MAX_OUTPUT_BYTES: usize = 512 * 1024;
 
 /// 动作关键词表。**顺序即优先级**：必须先判重命名再判修改 ——
 /// 日语「名前の変更」、韩语「이름 변경」都含有表示「修改」的「変更/변경」。
@@ -593,7 +599,18 @@ fn day_from_filename(name: &str) -> Option<String> {
 ///
 /// 不触达任何 Everything 宿主接口，纯文件读取 —— 可在任意线程调用。
 pub fn query(filter: &Filter) -> Result<Outcome, String> {
-    let dir = log_directory();
+    query_directory(
+        filter,
+        log_directory(),
+        &mut ScanBudget::new(MAX_TOTAL_BYTES, Duration::from_secs(30)),
+    )
+}
+
+fn query_directory(
+    filter: &Filter,
+    dir: PathBuf,
+    budget: &mut ScanBudget,
+) -> Result<Outcome, String> {
     if !dir.is_dir() {
         return Err(format!(
             "index journal log directory not found: {}\n\
@@ -627,15 +644,15 @@ pub fn query(filter: &Filter) -> Result<Outcome, String> {
                 && until_day.as_deref().is_none_or(|u| day.as_str() <= u)
         })
         // day_files 已是新的在前，倒序扫描要的就是这个顺序。
-        .take(MAX_DAYS)
+        .take(MAX_DAYS + 1)
         .collect();
 
     let wanted = filter.max_results.max(1);
     let mut changes: Vec<Change> = Vec::new();
-    let mut bytes_scanned: u64 = 0;
+    let mut output_bytes = 0usize;
     let mut skipped_lines: u64 = 0;
     let mut days_searched = 0usize;
-    let mut stopped_early = false;
+    let mut reason = (selected.len() > MAX_DAYS).then_some("day_limit");
 
     let path_prefix = filter
         .path
@@ -643,121 +660,83 @@ pub fn query(filter: &Filter) -> Result<Outcome, String> {
         .map(|p| normalize_prefix(p).trim_end_matches('\\').to_lowercase());
     let name_sub = filter.name.as_deref().map(|n| n.to_lowercase());
 
-    // 单行处理：解析 + 过滤 + 收编。返回 false 表示已取满，调用方立即停手。
-    // 把它做成闭包而不是内联三处，是为了让「取满即停」只有一个判断点。
-    let accept = |line: &str, changes: &mut Vec<Change>, skipped: &mut u64| -> bool {
-        if changes.len() >= wanted {
-            return false;
+    for (_, file_path) in selected.into_iter().take(MAX_DAYS) {
+        if !budget.check() {
+            reason = budget.stop_reason;
+            break;
         }
-        match parse_line(line) {
-            Some(c) => {
-                if matches_filter(&c, filter, path_prefix.as_deref(), name_sub.as_deref()) {
-                    changes.push(c);
-                }
-            }
-            None => {
-                if !line.trim().is_empty() {
-                    *skipped += 1;
-                }
-            }
-        }
-        true
-    };
-
-    'files: for (_, file_path) in selected {
-        let file_len = match fs::metadata(file_path) {
-            Ok(m) => m.len(),
-            Err(_) => continue,
-        };
-        // 预算按「最新优先」裁：超过上限的文件只扫**尾部**（最新）的
-        // MAX_BYTES_PER_FILE 字节。倒序扫描从文件尾往回走，窗口必须开在
-        // 尾部 —— 旧实现把 limit 当作「只读前 64 MiB」，繁忙磁盘上一天
-        // 就能超限，最新的变更反而永远看不到，恰好与工具的契约相反。
-        let (start_offset, limit) = if file_len > MAX_BYTES_PER_FILE {
-            (file_len - MAX_BYTES_PER_FILE, MAX_BYTES_PER_FILE)
-        } else {
-            (0, file_len)
-        };
         let mut handle = match fs::File::open(file_path) {
             Ok(h) => h,
-            Err(_) => continue,
+            Err(_) => {
+                reason = Some("read_error");
+                continue;
+            }
         };
+        let file_len = match handle.metadata() {
+            Ok(m) => m.len(),
+            Err(_) => {
+                reason = Some("read_error");
+                continue;
+            }
+        };
+        let start_offset = file_len.saturating_sub(MAX_BYTES_PER_FILE);
+        if start_offset > 0 {
+            reason = Some("file_window");
+        }
         days_searched += 1;
-
-        // 倒序分块读：从文件尾往前啃，取满 wanted 立刻收工，
-        // 「最近发生了什么」这类查询因此不必读整个日志。
-        let mut end = limit;
-        // carry 装上一块开头那一行的前半段，本块用块尾把它接完整。
-        let mut carry = String::new();
-        let mut at_tail = true;
-        while end > 0 {
-            let start = end.saturating_sub(CHUNK as u64);
-            let take = (end - start) as usize;
-            let mut buf = vec![0u8; take];
-            let abs_start = start_offset + start;
-            if handle.seek(SeekFrom::Start(abs_start)).is_err()
-                || handle.read_exact(&mut buf).is_err()
-            {
+        let mut result_limit = None;
+        let mut accept = |raw: &[u8]| {
+            if raw.is_empty() {
+                return true;
+            }
+            let parsed = std::str::from_utf8(raw).ok().and_then(parse_line);
+            if let Some(c) = parsed {
+                if matches_filter(&c, filter, path_prefix.as_deref(), name_sub.as_deref()) {
+                    if changes.len() >= wanted {
+                        result_limit = Some("max_results");
+                        return false;
+                    }
+                    let cost = 256
+                        + 6 * (c.path.len()
+                            + c.new_path.as_ref().map_or(0, String::len)
+                            + c.action_text.len());
+                    if output_bytes + cost > MAX_OUTPUT_BYTES {
+                        result_limit = Some("output_budget");
+                        return false;
+                    }
+                    output_bytes += cost;
+                    changes.push(c);
+                    if changes.len() >= wanted {
+                        result_limit = Some("max_results");
+                        return false;
+                    }
+                }
+            } else if raw.iter().any(|b| !b.is_ascii_whitespace()) {
+                skipped_lines += 1;
+            }
+            true
+        };
+        match scan_reverse(
+            &mut handle,
+            file_len,
+            start_offset,
+            CHUNK,
+            budget,
+            &mut accept,
+        ) {
+            Ok(Some(r)) => {
+                reason = Some(r);
                 break;
             }
-            bytes_scanned += take as u64;
-            // 块尾可能是被截断的多字节 UTF-8 序列（中文路径是 3 字节字符，
-            // 256 KiB 边界撞上的概率不低）—— 逐块 from_utf8_lossy 会把
-            // 两半各自替换成 U+FFFD，路径永久损坏。剥掉块尾不完整的序列，
-            // 按原始字节与 carry 拼好后一次性解码；不完整序列的字节属于
-            // 更早一块的行首，留给下一轮。
-            let valid_end = match std::str::from_utf8(&buf) {
-                Ok(_) => buf.len(),
-                Err(e) => e.valid_up_to(),
-            };
-            let mut raw_line = buf[..valid_end].to_vec();
-            raw_line.extend_from_slice(carry.as_bytes());
-            let remainder = buf[valid_end..].to_vec();
-            carry.clear();
-            let text = String::from_utf8_lossy(&raw_line).into_owned();
-
-            // split 出的第一段是更早一块的半行尾巴，最后一段则是通向
-            // 更早一块的半行开头 —— 只有中间各段是完整行。
-            let mut segments: Vec<&str> = text.split('\n').collect();
-            let tail = segments.pop().unwrap_or("");
-            // 整块一个换行符都没有（单行超过一个块）时，首段就是尾段：
-            // 它既是一条跨块行的前半段，也是另一条跨块行的后半段。
-            let no_newline = segments.is_empty();
-            let head = if no_newline { tail } else { segments.remove(0) };
-
-            if at_tail && !no_newline {
-                // 第一块到尾即文件尾：这段就是最后一行（文件未必以换行符收尾），
-                // 它是全文件最新的一条，必须最先处理。
-                if !tail.trim().is_empty() && !accept(tail, &mut changes, &mut skipped_lines) {
-                    stopped_early = true;
-                    break 'files;
-                }
-            } else if !at_tail {
-                // tail 是与上一块边界处那一行的前半段，接上 carry 才是完整一行；
-                // 它比本块其余行都新，所以也要先处理。
-                let joined = format!("{}{}", tail, carry);
-                if !accept(&joined, &mut changes, &mut skipped_lines) {
-                    stopped_early = true;
-                    break 'files;
-                }
+            Err(_) => {
+                reason = Some(budget.stop_reason.unwrap_or("read_error"));
+                break;
             }
-            at_tail = false;
-            for seg in segments.iter().rev() {
-                if !accept(seg, &mut changes, &mut skipped_lines) {
-                    stopped_early = true;
-                    break 'files;
-                }
-            }
-            // carry = 更早一块的行首片段：先接本块剥下的不完整序列字节，
-            // 再接 head（head 是本块开头那半行的文本）。
-            carry = format!("{}{}", String::from_utf8_lossy(&remainder), head);
-            end = start;
+            Ok(None) => {}
         }
-        // 走到这里 carry 是最老一块的开头片段 —— 它前面没有更多字节了，
-        // 因此就是文件的第一行，同样要过一遍过滤。
-        if !accept(&carry, &mut changes, &mut skipped_lines) {
-            stopped_early = true;
-            break 'files;
+        if let Some(r) = result_limit {
+            reason = Some(r);
+            break;
         }
     }
 
@@ -765,11 +744,66 @@ pub fn query(filter: &Filter) -> Result<Outcome, String> {
         count: changes.len(),
         changes,
         days_searched,
-        bytes_scanned,
-        truncated: stopped_early,
+        bytes_scanned: budget.bytes,
+        truncated: reason.is_some(),
+        truncation_reason: reason,
         skipped_lines,
         log_directory: dir,
     })
+}
+
+/// Reverse complete records as BYTES. Decode only after joining at LF boundaries.
+/// A cut-off prefix at start_offset is discarded rather than parsed as a record.
+fn scan_reverse(
+    reader: &mut (impl Read + Seek),
+    file_len: u64,
+    start_offset: u64,
+    chunk_size: usize,
+    budget: &mut ScanBudget,
+    accept: &mut impl FnMut(&[u8]) -> bool,
+) -> std::io::Result<Option<&'static str>> {
+    let mut end = file_len;
+    let mut carry = Vec::new();
+    while end > start_offset {
+        let start = end.saturating_sub(chunk_size as u64).max(start_offset);
+        let take = (end - start) as usize;
+        reader.seek(SeekFrom::Start(start))?;
+        let mut buf = vec![0; take];
+        let mut filled = 0;
+        while filled < take {
+            let n = budget.read(reader, &mut buf[filled..])?;
+            if n == 0 {
+                return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
+            }
+            filled += n;
+        }
+        buf.append(&mut carry);
+        let mut line_end = buf.len();
+        for idx in (0..buf.len()).rev() {
+            if buf[idx] == b'\n' {
+                if !budget.check() {
+                    return Ok(budget.stop_reason);
+                }
+                if line_end - idx - 1 > MAX_LINE_BYTES {
+                    return Ok(Some("line_limit"));
+                }
+                if !accept(&buf[idx + 1..line_end]) {
+                    return Ok(None);
+                }
+                line_end = idx;
+            }
+        }
+        if line_end > MAX_LINE_BYTES {
+            return Ok(Some("line_limit"));
+        }
+        buf.truncate(line_end);
+        carry = buf;
+        end = start;
+    }
+    if start_offset == 0 {
+        accept(&carry);
+    }
+    Ok(None)
 }
 
 /// 规范化路径前缀：统一 `\` 分隔、折叠连续反斜杠、去尾斜杠（盘符根除外）。
@@ -962,9 +996,7 @@ fn local_civil_from_unix(secs: u64) -> Option<String> {
     // Unix 纪元（1970）与 FILETIME 纪元（1601）相差 11644473600 秒。
     // checked_add：接近 u64::MAX 的输入回绕后会产出「合法」的 1970 年代
     // FILETIME，静默返回错误日期 —— 溢出就该报 None。
-    let hundreds = secs
-        .checked_add(11_644_473_600)?
-        .checked_mul(10_000_000)?;
+    let hundreds = secs.checked_add(11_644_473_600)?.checked_mul(10_000_000)?;
     let utc_ft = FILETIME {
         dwLowDateTime: (hundreds & 0xFFFF_FFFF) as u32,
         dwHighDateTime: (hundreds >> 32) as u32,
@@ -1037,6 +1069,118 @@ fn format_civil(y: u16, mo: u16, d: u16, h: u16, mi: u16, s: u16) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reverse_scan_preserves_utf8_and_record_order_across_boundaries() {
+        for newline in ["\n", "\r\n"] {
+            for trailing in [false, true] {
+                let lines: Vec<String> = (1..=6000).map(|id|
+                    format!("1\t{id}\t2026-11-06 12:00:00\t\"文件创建\"\t\"C:\\中文甲😀\\{id}.txt\"\t\"\""))
+                    .collect();
+                let mut text = lines.join(newline);
+                if trailing {
+                    text.push_str(newline);
+                }
+                for chunk in [127, CHUNK, CHUNK + 1] {
+                    let mut reader = std::io::Cursor::new(text.as_bytes());
+                    let mut budget = ScanBudget::new(text.len() as u64, Duration::from_secs(10));
+                    let mut rows = Vec::new();
+                    let reason = scan_reverse(
+                        &mut reader,
+                        text.len() as u64,
+                        0,
+                        chunk,
+                        &mut budget,
+                        &mut |raw| {
+                            if !raw.is_empty() {
+                                rows.push(parse_line(std::str::from_utf8(raw).unwrap()).unwrap());
+                            }
+                            true
+                        },
+                    )
+                    .unwrap();
+                    assert_eq!(reason, None);
+                    assert_eq!(rows.len(), 6000);
+                    assert_eq!(budget.bytes, text.len() as u64);
+                    for (i, row) in rows.iter().enumerate() {
+                        assert_eq!(row.change_id, 6000 - i as u64);
+                        assert!(row.path.contains("中文甲😀"));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn reverse_scan_discards_cut_prefix_and_enforces_total_budget() {
+        let text = b"partial-first\nsecond\nthird";
+        let mut reader = std::io::Cursor::new(text);
+        let mut budget = ScanBudget::new(100, Duration::from_secs(5));
+        let mut lines = Vec::new();
+        scan_reverse(
+            &mut reader,
+            text.len() as u64,
+            5,
+            3,
+            &mut budget,
+            &mut |raw| {
+                lines.push(raw.to_vec());
+                true
+            },
+        )
+        .unwrap();
+        assert_eq!(lines, vec![b"third".to_vec(), b"second".to_vec()]);
+
+        let mut budget = ScanBudget::new(5, Duration::from_secs(5));
+        assert!(scan_reverse(
+            &mut reader,
+            text.len() as u64,
+            0,
+            8,
+            &mut budget,
+            &mut |_| true
+        )
+        .is_err());
+        assert_eq!(budget.bytes, 5);
+        assert_eq!(budget.stop_reason, Some("byte_budget"));
+    }
+
+    #[test]
+    fn query_marks_incomplete_history_with_reason() {
+        let dir = std::env::temp_dir().join(format!("emcp_journal_budget_{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let text = (1..=20)
+            .map(|id| {
+                format!("1\t{id}\t2026-11-06 12:00:00\t\"Created\"\t\"C:\\a{id}.txt\"\t\"\"\n")
+            })
+            .collect::<String>();
+        fs::write(dir.join("index-journal-2026-11-06.txt"), &text).unwrap();
+        let filter = Filter {
+            max_results: 2,
+            ..Default::default()
+        };
+        let out = query_directory(
+            &filter,
+            dir.clone(),
+            &mut ScanBudget::new(10000, Duration::from_secs(5)),
+        )
+        .unwrap();
+        assert_eq!(
+            out.changes.iter().map(|c| c.change_id).collect::<Vec<_>>(),
+            vec![20, 19]
+        );
+        assert_eq!(out.truncation_reason, Some("max_results"));
+        let out = query_directory(
+            &filter,
+            dir.clone(),
+            &mut ScanBudget::new(50, Duration::from_secs(5)),
+        )
+        .unwrap();
+        assert_eq!(out.bytes_scanned, 50);
+        assert!(out.truncated);
+        assert_eq!(out.truncation_reason, Some("byte_budget"));
+        fs::remove_dir_all(dir).unwrap();
+    }
 
     // 实证样本：Everything 1.5.0.1422b，journal_log=1，中文界面。
     const SAMPLE_CREATED: &str = "134345291781008867\t352520\t2026-09-23 11:18:44\t\"文件创建\"\t\"D:\\source\\repos\\everything-mcp\\.sdk-cache\\zzjournal_probe\\ZZCREATE-7f3a1c.txt\"\t\"\"";

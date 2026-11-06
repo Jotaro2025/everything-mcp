@@ -180,7 +180,7 @@ function Build-Setup {
     if ($SkipBuild) {
         if (-not (Test-Path -LiteralPath $dllSrc)) { throw "-SkipBuild 但找不到 $dllSrc" }
     } else {
-        $cargoArgs = @('build', '--release')
+        $cargoArgs = @('build', '--locked', '--release')
         if ($Arch.Target) { $cargoArgs += @('--target', $Arch.Target) }
         & cargo @cargoArgs
         if ($LASTEXITCODE -ne 0) { throw "cargo build ($tag) 失败" }

@@ -36,6 +36,7 @@ version = "0.59"
 features = [
     "Win32_Foundation",
     "Win32_Globalization",
+    "Win32_Networking_WinSock",
     "Win32_Storage",
     "Win32_Storage_FileSystem",
     "Win32_System_Threading",

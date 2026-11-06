@@ -14,20 +14,21 @@
 //! 我们的实现：在 PM_START 时（运行在主线程）通过 host 的 os_register_class +
 //! os_create_window 创建一个隐藏窗口。工作线程把任务（一个 C 风格函数指针 +
 //! 上下文裸指针）存进 `PENDING_TASK`，再 PostMessageW 投递 WM_INVOKE；
-//! 主线程 wndproc 取出任务直接调用，完成后置位 done 标志，工作线程自旋等待。
+//! 主线程 wndproc 取出任务直接调用，完成后通过条件变量唤醒工作线程。
 //!
 //! **刻意不使用 Rust 闭包 / Box<dyn FnOnce>**：wndproc 是 host 消息泵回调的
 //! 栈帧，里面跑 Rust 闭包间接分发曾在实测中触发崩溃。改成纯 C 函数指针后
 //! 调用路径与 etp_server.c 完全一致。
 
 use core::ffi::c_void;
-use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicIsize, AtomicU32, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows_sys::Win32::System::Threading::{GetCurrentThreadId, Sleep};
-use windows_sys::Win32::UI::WindowsAndMessaging::{DestroyWindow, IsWindow, PostMessageW};
+use windows_sys::Win32::System::Threading::GetCurrentThreadId;
+use windows_sys::Win32::UI::WindowsAndMessaging::{DestroyWindow, PostMessageW};
 
 use super::host::{Host, HCURSOR, HICON, HINSTANCE, HMENU, HWND as HostHwnd};
 
@@ -58,11 +59,17 @@ const CLASS_NAME: &[u8] = b"EverythingMcpMain\0";
 /// 并在返回前把 done 标志置位（由 invoke_c 传入的 Arc 负责）。
 pub type TaskFn = unsafe extern "system" fn(*mut c_void);
 
+#[derive(Default)]
+struct Completion {
+    done: Mutex<bool>,
+    wake: Condvar,
+}
+
 /// 待主线程执行的任务。由工作线程填充，主线程 wndproc 取出执行。
 struct PendingTask {
     func: TaskFn,
     ctx: *mut c_void,
-    done: Arc<AtomicBool>,
+    done: Arc<Completion>,
 }
 
 // SAFETY：任务只在 invoke_c 的同步窗口内跨线程传递：
@@ -84,39 +91,15 @@ pub fn main_hwnd() -> Option<isize> {
     }
 }
 
-/// 尝试取回槽位里的任务。
-///
-/// 只有当能**证明**主线程不会（再）执行我们的任务时，才取回并清空槽位：
-///
-///  1. 槽位里仍然是我们这次提交的任务 —— 主线程还没取走它，取回即安全；
-///  2. 槽位已空、且 `hwnd` 指向的窗口已经销毁 —— 消息永远到不了主线程，
-///     任务不可能再被执行（销毁窗口发生在主线程，因此主线程不可能正卡在
-///     某个 wndproc 里执行我们的任务）。
-///
-/// 其余情况（槽位空但窗口仍在）表示主线程已经取走任务、正在执行，此时
-/// 返回 None：调用方必须继续等 `done`，绝不能就地释放 ctx。
-///
-/// 返回 Some(()) 表示调用方已重新独占该任务，可以安全释放自己的 ctx。
-fn try_reclaim(done: &Arc<AtomicBool>, hwnd: isize) -> Option<()> {
+/// Reclaim only a task still in the queue. An empty slot means the callback
+/// owns ctx until completion, even if the window disappears during execution.
+fn try_reclaim(done: &Arc<Completion>) -> Option<()> {
     let mut slot = PENDING_TASK.lock().unwrap_or_else(|p| p.into_inner());
-    match slot.as_ref() {
-        // 还在槽位里 —— 主线程尚未取走。
-        Some(t) if Arc::ptr_eq(&t.done, done) => {
-            *slot = None;
-            Some(())
-        }
-        // 槽位里是别的任务 —— 说明我们那次已经被取走在执行。
-        Some(_) => None,
-        // 槽位为空。只在我们自己的窗口已销毁时才能断定任务已被丢弃；
-        // 窗口还活着就意味着主线程刚 take() 完、正在跑。
-        None => {
-            let alive = unsafe { IsWindow(hwnd as HWND) } != 0;
-            if alive {
-                None
-            } else {
-                Some(())
-            }
-        }
+    if slot.as_ref().is_some_and(|t| Arc::ptr_eq(&t.done, done)) {
+        *slot = None;
+        Some(())
+    } else {
+        None
     }
 }
 
@@ -125,8 +108,19 @@ fn try_reclaim(done: &Arc<AtomicBool>, hwnd: isize) -> Option<()> {
 /// `func(ctx)` 在主线程 wndproc 里被直接调用；`ctx` 指向的对象必须
 /// 在本函数返回前保持有效（调用方持有）。
 pub fn invoke_c(func: TaskFn, ctx: *mut c_void) -> Result<(), String> {
+    invoke_until(
+        func,
+        ctx,
+        Instant::now() + Duration::from_millis(INVOKE_TIMEOUT_MS as u64),
+    )
+}
+
+pub fn invoke_until(func: TaskFn, ctx: *mut c_void, deadline: Instant) -> Result<(), String> {
+    if crate::mcp::server::shutting_down() || Instant::now() >= deadline {
+        return Err("main-thread invocation cancelled or timed out".into());
+    }
     let caller_tid = unsafe { GetCurrentThreadId() };
-    let done = Arc::new(AtomicBool::new(false));
+    let done = Arc::new(Completion::default());
 
     // 已经在主线程上：直接执行。否则 PostMessage 到自己的窗口要等消息泵
     // 取走这条消息才返回 —— 而消息泵此刻正卡在本调用里，必死锁。
@@ -149,6 +143,12 @@ pub fn invoke_c(func: TaskFn, ctx: *mut c_void) -> Result<(), String> {
             ctx,
             done: done.clone(),
         });
+        // Keep the slot locked until posting succeeds. A stale WM_INVOKE must
+        // not take ctx between a failed post and its cleanup.
+        if unsafe { PostMessageW(hwnd as HWND, WM_INVOKE, 0, 0) } == 0 {
+            *slot = None;
+            return Err("PostMessageW failed".into());
+        }
     }
 
     super::diag::verbose(&format!(
@@ -156,52 +156,32 @@ pub fn invoke_c(func: TaskFn, ctx: *mut c_void) -> Result<(), String> {
         caller_tid, hwnd
     ));
 
-    // PostMessageW 是内核调用，天然构成内存屏障：主线程一定能看到槽位写入。
-    let posted = unsafe { PostMessageW(hwnd as HWND, WM_INVOKE, 0, 0) };
-    if posted == 0 {
-        // 投递失败：清空槽位，避免残留任务被下一次调用误执行。
-        let mut slot = PENDING_TASK.lock().unwrap_or_else(|p| p.into_inner());
-        *slot = None;
-        return Err("PostMessageW failed".to_string());
-    }
+    wait_for_completion(done, deadline)
+}
 
-    // 忙等主线程完成。db_query_search2 是异步提交（很快返回），
-    // read_results 读取本地内存也很快；给足上界防死锁。
-    // 每轮自旋后让出一次 CPU —— 纯自旋会把主线程饿死（本线程与主线程
-    // 可能同优先级），反而更容易撞上超时。
-    let start = std::time::Instant::now();
-    let deadline = std::time::Duration::from_millis(INVOKE_TIMEOUT_MS as u64);
-    let mut spins: u64 = 0;
-    while !done.load(Ordering::SeqCst) {
-        if start.elapsed() >= deadline {
-            // 超时。关键：不能直接返回让调用方释放 ctx —— 主线程可能已经
-            // 取走任务、此刻正在解引用 ctx。只有确认槽位里还是我们的任务
-            // （主线程尚未取走）时才清槽位并返回错误。
-            if try_reclaim(&done, hwnd).is_some() {
-                super::diag::write("invoke_c: timeout, task reclaimed");
-                return Err("invoke_c timeout".to_string());
-            }
-            // 主线程已经接手 —— 只能继续等它置位 done。此时返回会让调用方
-            // 释放正在被执行的 ctx，比多等一会儿危险得多。
-            super::diag::write("invoke_c: timeout but task may be running — waiting");
-            while !done.load(Ordering::SeqCst) {
-                // 槽位空 + 窗口已销毁 ⇒ 任务被丢弃、永远不会执行，
-                // 这时才可以安全返回错误让调用方回收 ctx。
-                if try_reclaim(&done, hwnd).is_some() {
-                    super::diag::write("invoke_c: window gone, task discarded");
-                    return Err("invoke_c aborted — main window destroyed".to_string());
-                }
-                unsafe { Sleep(1) };
-            }
+fn wait_for_completion(done: Arc<Completion>, deadline: Instant) -> Result<(), String> {
+    loop {
+        let finished = done.done.lock().unwrap_or_else(|p| p.into_inner());
+        if *finished {
             return Ok(());
         }
-        spins += 1;
-        std::hint::spin_loop();
-        if spins.is_multiple_of(4096) {
-            unsafe { Sleep(0) };
+        drop(finished);
+        if crate::mcp::server::shutting_down() || Instant::now() >= deadline {
+            // A running task retains ownership of ctx until it signals completion.
+            // Only a task still queued can be reclaimed.
+            if try_reclaim(&done).is_some() {
+                return Err("main-thread invocation cancelled or timed out".into());
+            }
         }
+        let finished = done.done.lock().unwrap_or_else(|p| p.into_inner());
+        if *finished {
+            return Ok(());
+        }
+        let _wait = done
+            .wake
+            .wait_timeout(finished, Duration::from_millis(20))
+            .unwrap_or_else(|p| p.into_inner());
     }
-    Ok(())
 }
 
 /// 主线程窗口的 wndproc。
@@ -235,7 +215,8 @@ pub unsafe extern "system" fn wnd_proc(
             super::diag::verbose("wnd_proc: task completed");
             // 先置位完成标志，再让调用方解除阻塞 —— 顺序不能反，
             // 否则调用方可能提前返回并释放 ctx 指向的内存。
-            t.done.store(true, Ordering::SeqCst);
+            *t.done.done.lock().unwrap_or_else(|p| p.into_inner()) = true;
+            t.done.wake.notify_all();
         } else {
             super::diag::write("wnd_proc: PENDING_TASK empty");
         }
@@ -300,15 +281,15 @@ pub fn install_on_main_thread() -> Result<(), String> {
             0, // dwExStyle
             CLASS_NAME.as_ptr(),
             c"".to_bytes().as_ptr(), // lpWindowName —— 空字符串（含结尾 NUL）
-            0,                     // dwStyle
-            0,                     // x
-            0,                     // y
-            0,                     // nWidth
-            0,                     // nHeight
-            0 as HostHwnd,         // hWndParent
-            0 as HMENU,            // hMenu
-            hinstance,             // hInstance
-            core::ptr::null_mut(), // lpParam
+            0,                       // dwStyle
+            0,                       // x
+            0,                       // y
+            0,                       // nWidth
+            0,                       // nHeight
+            0 as HostHwnd,           // hWndParent
+            0 as HMENU,              // hMenu
+            hinstance,               // hInstance
+            core::ptr::null_mut(),   // lpParam
         )
     };
     if hwnd.is_null() {
@@ -332,7 +313,7 @@ pub fn install_on_main_thread() -> Result<(), String> {
 ///
 /// **刻意不清空 PENDING_TASK**：可能有 MCP 工作线程正带着任务在等。
 /// 抢清槽位会让它误以为「任务已被主线程取走」而永久等 done。留着不动，
-/// 它的 invoke_c 超时后会发现窗口已销毁、自行回收（见 try_reclaim）。
+/// 它的等待方在停机或超时时自行取回尚未执行的任务（见 try_reclaim）。
 pub fn destroy_main_window() {
     let h = MAIN_HWND.swap(0, Ordering::AcqRel);
     if h == 0 {
@@ -340,4 +321,37 @@ pub fn destroy_main_window() {
     }
     super::diag::write(&format!("main_thread: destroying hwnd=0x{:x}", h));
     unsafe { DestroyWindow(h as HWND) };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    unsafe extern "system" fn unused_task(_: *mut c_void) {}
+
+    #[test]
+    fn timeout_reclaims_queued_task_but_waits_for_running_owner() {
+        let done = Arc::new(Completion::default());
+        *PENDING_TASK.lock().unwrap() = Some(PendingTask {
+            func: unused_task,
+            ctx: core::ptr::null_mut(),
+            done: done.clone(),
+        });
+        assert!(wait_for_completion(done, Instant::now()).is_err());
+        assert!(PENDING_TASK.lock().unwrap().is_none());
+
+        // Once the callback takes the task, expiry must not release its ctx.
+        let done = Arc::new(Completion::default());
+        let worker_done = done.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            tx.send(wait_for_completion(worker_done, Instant::now()))
+                .unwrap();
+        });
+        assert!(rx.recv_timeout(Duration::from_millis(60)).is_err());
+        *done.done.lock().unwrap() = true;
+        done.wake.notify_all();
+        assert!(rx.recv_timeout(Duration::from_secs(1)).unwrap().is_ok());
+        waiter.join().unwrap();
+    }
 }

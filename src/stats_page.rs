@@ -19,7 +19,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::SetTimer;
 
 use crate::abi_ok;
 use crate::options::{
-    cstr_bytes, expand_min_wide, labels, set_rect, client_size_logical, LoadOptionsPage,
+    client_size_logical, cstr_bytes, expand_min_wide, labels, set_rect, LoadOptionsPage,
     OptionsPageProc, DLG_BUTTON_HIGH, DLG_STATIC_HIGH, SS_LEFTNOWORDWRAP, SS_RIGHT, WM_COMMAND,
     WS_GROUP,
 };
@@ -225,11 +225,7 @@ pub(crate) fn load_stats_page(page: &LoadOptionsPage) -> *mut c_void {
                 .unwrap_or(labels.stats_unknown_tool);
             let cells = stats_row_cells(&snap.tools[i], name);
             for (c, text) in cells.iter().enumerate() {
-                let style = if c == 0 {
-                    SS_LEFTNOWORDWRAP
-                } else {
-                    SS_RIGHT
-                };
+                let style = if c == 0 { SS_LEFTNOWORDWRAP } else { SS_RIGHT };
                 create_static(
                     page_hwnd,
                     stats_cell_id(i, c),
@@ -258,7 +254,12 @@ pub(crate) fn load_stats_page(page: &LoadOptionsPage) -> *mut c_void {
     // 页面打开期间每秒刷一次文本（page_proc 只收到 WM_COMMAND，WM_TIMER
     // 走 TIMERPROC 回调直达，不依赖主程序转发）。窗口销毁时定时器自动回收。
     unsafe {
-        SetTimer(page_hwnd, ID_STATS_TIMER, STATS_REFRESH_MS, Some(stats_timer_proc));
+        SetTimer(
+            page_hwnd,
+            ID_STATS_TIMER,
+            STATS_REFRESH_MS,
+            Some(stats_timer_proc),
+        );
     }
     diag::write("options: stats page loaded");
     abi_ok()
@@ -428,7 +429,10 @@ mod tests {
         let content = 376; // 400 最小宽 - 24 边距
         let cols = stats_column_rects(12, content);
         // 名字列吃满剩余（376 - 242 数值列 = 134），数值列逐列相接、不重叠。
-        assert_eq!(cols[0], (12, content - STATS_NUM_COL_WIDE.iter().sum::<i32>()));
+        assert_eq!(
+            cols[0],
+            (12, content - STATS_NUM_COL_WIDE.iter().sum::<i32>())
+        );
         let mut cx = cols[0].0 + cols[0].1;
         for (i, w) in STATS_NUM_COL_WIDE.iter().enumerate() {
             assert_eq!(cols[i + 1], (cx, *w));
@@ -447,7 +451,12 @@ mod tests {
             }
         }
         // 与汇总行、清空按钮、表头的 ID 不相撞。
-        for id in [ID_STATS_TOTAL, ID_STATS_CONNECTIONS, ID_STATS_REQUESTS, ID_STATS_CLEAR] {
+        for id in [
+            ID_STATS_TOTAL,
+            ID_STATS_CONNECTIONS,
+            ID_STATS_REQUESTS,
+            ID_STATS_CLEAR,
+        ] {
             assert!(!seen.contains(&id));
         }
         for c in 0..STATS_COLS {
@@ -493,7 +502,10 @@ mod tests {
         assert_eq!(cache.connections, 7);
         assert_eq!(cache.requests_total, 9);
         assert_eq!(cache.rows[0], [3, 2, 1, 30, 300]);
-        assert_eq!(cache.rows[crate::plugin::stats::TOOL_SLOT_COUNT - 1], [5, 4, 1, 50, 500]);
+        assert_eq!(
+            cache.rows[crate::plugin::stats::TOOL_SLOT_COUNT - 1],
+            [5, 4, 1, 50, 500]
+        );
         // 中间行保持零 —— diff 依赖「没动的行 rows 相等」来跳过推送。
         assert_eq!(cache.rows[1], [0, 0, 0, 0, 0]);
     }
