@@ -56,6 +56,7 @@ jobs:
 
       # cdylib 产物存在性检查：插件 DLL 是唯一交付物，编译成功但没出 DLL 也算失败。
       - name: Verify DLL artifact
+        timeout-minutes: 3
         shell: pwsh
         run: |
           $dll = Get-ChildItem "target/${{ matrix.target }}/release/*.dll" | Select-Object -First 1
@@ -64,17 +65,22 @@ jobs:
           # 导出表校验：Everything 只认 everything_plugin_proc 这一个入口。
           # 重命名/漏导出要在这里暴露，而不是装进 Everything 后
           # GetProcAddress 失败才追查。
-          $dumpbin = Get-ChildItem "C:\Program Files\Microsoft Visual Studio" -Recurse -Filter dumpbin.exe -ErrorAction SilentlyContinue |
-            Where-Object { $_.FullName -match ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64' ? 'ARM64' : 'Hostx64') } |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vs) { throw "Visual Studio C++ tools not found" }
+          $dumpbin = Get-ChildItem "$vs\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" |
+            Sort-Object FullName -Descending |
             Select-Object -First 1
           if (-not $dumpbin) { throw "dumpbin.exe not found" }
           $exports = & $dumpbin.FullName /EXPORTS $dll.FullName | Out-String
+          if ($LASTEXITCODE -ne 0) { throw "dumpbin /EXPORTS failed" }
           if ($exports -notmatch 'everything_plugin_proc') {
             throw "DLL must export everything_plugin_proc; dumpbin /EXPORTS output:`n$exports"
           }
           "export check: everything_plugin_proc found"
 
           $dependencies = & $dumpbin.FullName /DEPENDENTS $dll.FullName | Out-String
+          if ($LASTEXITCODE -ne 0) { throw "dumpbin /DEPENDENTS failed" }
           $allowed = '^(kernel32|user32|ws2_32|advapi32|ntdll|userenv|bcrypt|bcryptprimitives|gdi32|comctl32|ole32|shell32|secur32|crypt32|rpcrt4|shlwapi|version|winmm|dbghelp|api-ms-win-[a-z0-9-]+|ext-ms-win-[a-z0-9-]+)\.dll$'
           $imports = [regex]::Matches($dependencies, '(?im)^\s+([a-z0-9_.-]+\.dll)\s*$')
           if ($imports.Count -eq 0) { throw "could not read DLL import table" }
