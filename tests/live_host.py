@@ -1,7 +1,7 @@
 """Exercise a running Everything plugin using only isolated synthetic fixtures.
 
 Run with Python 3.10+: python tests/live_host.py
-The installed plugin must be 1.4.0; override --expected-version for a baseline.
+The installed plugin must match Cargo.toml; override --expected-version for a baseline.
 No Everything settings are modified. Fixtures and JSON results stay in target/.
 """
 
@@ -9,6 +9,7 @@ import argparse
 import concurrent.futures
 import http.client
 import json
+import re
 from pathlib import Path
 import socket
 import time
@@ -21,13 +22,20 @@ def check(condition, message):
 
 
 def main():
+    repo = Path(__file__).resolve().parents[1]
+    version = re.search(r'^version\s*=\s*"([^"]+)"',
+                        (repo / "Cargo.toml").read_text(encoding="utf-8"), re.MULTILINE).group(1)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--port", type=int, default=8285)
-    parser.add_argument("--expected-version", default="1.4.0")
+    parser.add_argument("--expected-version", default=version)
+    parser.add_argument("--index-timeout", type=float, default=120,
+                        help="Seconds to wait for the real host index after startup")
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--fixture-parent", type=Path, default=repo / "target",
+                        help="Already indexed directory for isolated host tests")
     args = parser.parse_args()
     marker = "mcp-live-" + uuid.uuid4().hex[:12]
-    root = (Path(__file__).resolve().parents[1] / "target" / marker).resolve()
+    root = (args.fixture_parent / marker).resolve()
     fixtures = root / "fixtures"
     report = {"expected_version": args.expected_version, "fixture_root": str(fixtures),
               "started_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "checks": []}
@@ -93,15 +101,22 @@ def main():
         (fixtures / ".env").write_text("SYNTHETIC_TEST_VALUE=not-a-secret\n", encoding="utf-8")
         (fixtures / "id_rsa").write_text("SYNTHETIC_TEST_VALUE\n", encoding="utf-8")
         with (fixtures / "oversized.txt").open("wb") as stream:
-            stream.write(b"x" * (8 * 1024 * 1024 + 1))
+            # Metadata exercises the size guard; zero-filled content avoids
+            # adding megabytes of synthetic text to the user's content index.
+            stream.seek(8 * 1024 * 1024)
+            stream.write(b"\0")
         folder = {"folder": str(fixtures)}
 
         def indexed():
-            deadline = time.monotonic() + 30
+            deadline = time.monotonic() + args.index_timeout
+            data = None
             while time.monotonic() < deadline:
-                data = success("count", {**folder, "pattern": "ext:txt"})
-                if data["count"] == 5:
-                    return "5 synthetic text files indexed"
+                try:
+                    data = success("search_in_folder", {**folder, "pattern": "ext:txt", "timeout_ms": 1000})
+                    if data["total"] == 5:
+                        return "5 synthetic text files indexed"
+                except (AssertionError, OSError) as error:
+                    data = str(error)
                 time.sleep(0.25)
             raise AssertionError(f"index did not converge: {data}")
 
@@ -187,6 +202,17 @@ def main():
             check(status == 200 and result["result"]["resultType"] == "complete", str(result))
             check(len(result["result"]["tools"]) == 8, "tool count")
         case("modern protocol and tool discovery", modern)
+
+        def release_compatibility():
+            data = success("grep", {**folder, "pattern": "needle"})
+            check(data["binary_skipped"] == 2, str(data))
+            check(data["files_skipped"] >= data["binary_skipped"], str(data))
+            diagnostics = success("server_diagnostics", {})
+            check("formats" in diagnostics["content_indexing"], "missing indexed-format diagnostic")
+            check(diagnostics["content_indexing"].get("apply_error") is None, str(diagnostics["content_indexing"]))
+            check(all("total_ms" in row for row in diagnostics["stats"]["tools"]), "missing timing counters")
+            return "1.4.1 binary counter, indexed formats and precise timing fields retained"
+        case("previous release response compatibility", release_compatibility)
 
         def envelopes():
             for body in [{}, {"jsonrpc": "1.0", "id": 1, "method": "ping"},

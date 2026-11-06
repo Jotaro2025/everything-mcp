@@ -1,7 +1,7 @@
 # Everything 实机验收
 
 `tests/live_host.py` 使用 Python 标准库，通过 localhost HTTP 调用真实 Everything
-进程内的 MCP 插件。默认要求已安装的版本为 `1.4.0`，版本不符时直接失败，避免把
+进程内的 MCP 插件。默认要求已安装的版本与 `Cargo.toml` 一致，版本不符时直接失败，避免把
 旧插件的结果误算为新版本通过。
 
 ```powershell
@@ -11,9 +11,11 @@ python tests/live_host.py
 要求 Everything 已完成索引，MCP 在 `127.0.0.1:8285` 启用；全局搜索检查需要当前
 配置允许全局搜索。脚本不会更改 Everything 设置。可以通过 `--port` 修改端口，
 通过 `--expected-version 1.3.1` 对旧版执行同样的基线检查。
+`--fixture-parent <目录>` 可把测试文件放进隔离实例已索引的专用目录。
+大型正文索引建议使用独立实例验收设置开关，避免反复重建日常数据库。
 
-脚本在仓库 `target/mcp-live-<随机标识>/fixtures` 下创建合成文件，最多等待 30 秒
-让索引出现，再验证：
+脚本在仓库 `target/mcp-live-<随机标识>/fixtures` 下创建合成文件，默认最多等待 120 秒
+让索引出现（大型数据库启动可用 `--index-timeout 300` 调整），再验证：
 
 - 递归搜索、直接子项、计数、排除、排序及分页；
 - UTF-8 中文/emoji、UTF-16 和行窗口读取；
@@ -24,6 +26,10 @@ python tests/live_host.py
 - legacy/modern 协议、JSON-RPC 信封、CORS 与冲突 HTTP 帧；
 - 变更日志未启用时的前置条件提示，或仅查询测试目录的现有日志。
 
+内容索引设置专项：从插件设置页切换开关并保存，确认 `pending_enabled` 为目标值；
+关闭选项窗口后等待 `pending_enabled=null`、`apply_error=null`，检查 INI 和
+诊断的 `enabled` 一致，并重新执行搜索。测试结束必须恢复原开关值。
+
 结果保存在该目录的 `report.json`；`--output <路径>` 可指定报告路径。报告中的
 `actual_version` 是真实握手结果。失败时退出码为 1，成功为 0。合成文件保留供复查。
 
@@ -31,3 +37,7 @@ python tests/live_host.py
 安装后还应单独验证：开启日志时的创建/修改/重命名/删除事件、部分 HTTP 请求
 仍连接时的卸载或退出、随后重新启动并查询成功。退出总耗时包含 Everything
 数据库保存耗时，不能直接当成插件停止耗时。
+
+多实例测试需使用 `-instance <名称> -config <独立 INI>`，独立端口、插件配置、
+数据库和日志目录；仅索引测试目录。英文日志标签以真实宿主输出为准，
+文件夹索引的移动可能表现为删除+创建。日志落盘有延迟，须等待后再判断。

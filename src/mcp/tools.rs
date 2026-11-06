@@ -440,6 +440,7 @@ pub fn dispatch(name: &str, args: &Value) -> Result<ToolOutput, (i32, String)> {
 /// 目的是让 LLM 在工具行为异常时先自查，再决定是重试、换工具还是请用户
 /// 去设置页处理。
 fn tool_server_diagnostics(_args: &Value) -> Result<ToolOutput, (i32, String)> {
+    let (content_pending, content_error) = crate::content_indexing::status();
     let (enabled, bind, configured_port) = crate::options::settings_snapshot();
     let mode = crate::options::global_search_mode();
     // 实际监听端口：None = 服务没在跑（未启用，或 Apply 失败）。
@@ -473,7 +474,10 @@ fn tool_server_diagnostics(_args: &Value) -> Result<ToolOutput, (i32, String)> {
                 "calls": t.calls,
                 "ok": t.ok,
                 "err": t.err,
+                // avg_ms 是整数，累计越大反推单次耗时越糊（可达秒级误差）；
+                // total_ms 是精确值，两者一起给才能算出「最近这几次」的真实耗时。
                 "avg_ms": t.avg_ms(),
+                "total_ms": t.total_ms,
             })
         })
         .collect();
@@ -501,8 +505,14 @@ fn tool_server_diagnostics(_args: &Value) -> Result<ToolOutput, (i32, String)> {
             // 只读回显：设置页的「启用内容索引」开关读写的就是这个核心设置。
             // 读不到（ini 缺失/键缺失）时为 null —— 设置页会按未勾选显示。
             "enabled": crate::options::content_indexing_enabled(),
+            "pending_enabled": content_pending,
+            "apply_error": content_error,
             "setting": "content_indexing_enabled",
-            "note": "Everything core setting (Advanced page in newer builds). Only folders with 'Index file content' enabled are covered.",
+            // content: 的覆盖范围由这个白名单决定；不在名单里的格式（代码、
+            // .md/.json 等）content: 一律返回 0，要用 grep。
+            "formats": crate::options::content_indexing_formats(),
+            "formats_setting": "content_indexing_include_only_files",
+            "note": "Everything core setting (Advanced page in newer builds). Only folders with 'Index file content' enabled are covered; 'formats' limits which extensions content: can find — use grep for anything outside it.",
         },
         "index_changes_prerequisite": {
             "journal_log_directory": journal_dir_str,
@@ -974,6 +984,7 @@ fn tool_grep(args: &Value) -> Result<ToolOutput, (i32, String)> {
                 "candidates_truncated": o.candidates_truncated,
                 "files_scanned": o.files_scanned,
                 "bytes_scanned": o.bytes_scanned,
+                "binary_skipped": o.binary_skipped,
                 "files_with_matches": o.files_with_matches,
                 "clipped_lines": o.clipped_lines,
                 "count": o.payload.len(),

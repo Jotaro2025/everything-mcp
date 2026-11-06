@@ -74,6 +74,7 @@ const ID_GLOBAL_REVIEW: i32 = 9;
 const ID_GLOBAL_ALLOW: i32 = 10;
 const ID_CONTENT_INDEXING: i32 = 11;
 const ID_CONTENT_NOTE: i32 = 12;
+const ID_CONTENT_FORMATS: i32 = 13;
 
 pub(crate) const WM_COMMAND: u32 = 0x0111;
 const EN_CHANGE: u32 = 0x0300;
@@ -81,6 +82,8 @@ pub(crate) const WS_GROUP: u32 = 0x0002_0000;
 // 与 winuser.h 一致（历史上误抄成 0x0C00，低 4 位才是样式位：
 // 0x0C00 低 4 位为 0 = SS_LEFT，「不换行」从未生效过）。
 pub(crate) const SS_LEFTNOWORDWRAP: u32 = 0x000C;
+/// 允许自动换行的静态文本（SS_LEFT，样式位为 0）。
+pub(crate) const SS_LEFT: u32 = 0x0000;
 pub(crate) const SS_RIGHT: u32 = 0x0002;
 
 /// everything_plugin.h 里的对话框控件高度/间距常量（逻辑像素）。
@@ -92,8 +95,8 @@ const DLG_SEPARATOR: i32 = 6;
 
 /// 选项页最小尺寸（逻辑像素）—— PM_GET_OPTIONS_PAGE_MINMAX 报告给主程序。
 const PAGE_MIN_WIDE: i32 = 200;
-// 底部多出「内容索引」复选框 + 一行说明（2026-10），最小高度相应加 35。
-const PAGE_MIN_HIGH: i32 = 190;
+// 底部多出「内容索引」复选框 + 说明行 + 两行格式列表，最小高度相应加 65。
+const PAGE_MIN_HIGH: i32 = 220;
 
 /// Everything 选项对话框里 Apply 按钮的固定 ID（http_server.c 的
 /// http_server_enable_options_apply 用的同一个值）。
@@ -302,7 +305,10 @@ pub fn load_page(data: *mut c_void) -> *mut c_void {
     };
     // 内容索引是 Everything 的核心设置（不在 Plugins.ini），从 Everything.ini
     // 读当前值；读不到按未勾选显示（与官方默认一致）。
-    let content_indexing = read_content_indexing().unwrap_or(false) as i32;
+    let content_indexing = crate::content_indexing::status()
+        .0
+        .or_else(read_content_indexing)
+        .unwrap_or(false) as i32;
 
     unsafe {
         // 启用复选框
@@ -419,6 +425,22 @@ pub fn load_page(data: *mut c_void) -> *mut c_void {
             SS_LEFTNOWORDWRAP,
             cstr_bytes(labels.content_indexing_note).as_ptr(),
         );
+        // 只读展示 Everything 实际索引了哪些文件类型 —— 让「content: 为什么
+        // 搜不到我的代码」这个问题在页面上就能自答（要用 grep）。
+        // 用 SS_LEFT 而非 NOWORDWRAP：格式列表放一行必然被右边裁掉。
+        let formats = content_formats_text(labels);
+        create_static(
+            page_hwnd,
+            ID_CONTENT_FORMATS,
+            SS_LEFT,
+            cstr_bytes(&formats).as_ptr(),
+        );
+        add_tooltip(
+            tooltip_hwnd,
+            page_hwnd,
+            ID_CONTENT_FORMATS,
+            cstr_bytes(labels.content_formats_help).as_ptr(),
+        );
 
         // 恢复默认按钮
         create_button(
@@ -467,15 +489,28 @@ pub fn save_page(data: *mut c_void) -> *mut c_void {
     // 内容索引与 MCP 服务无关，独立应用（先于端口校验，端口写错也不该
     // 拦下这个开关）。只在值真的变化时才写 ini / 调 -add-config。
     let content_indexing = unsafe { is_checked(page_hwnd, ID_CONTENT_INDEXING) };
-    if read_content_indexing() != Some(content_indexing) {
-        match apply_content_indexing(content_indexing) {
+    let mut content_indexing_failed = false;
+    if crate::content_indexing::status()
+        .0
+        .or_else(read_content_indexing)
+        != Some(content_indexing)
+    {
+        let options_window = unsafe {
+            windows_sys::Win32::UI::WindowsAndMessaging::GetAncestor(
+                page_hwnd,
+                windows_sys::Win32::UI::WindowsAndMessaging::GA_ROOT,
+            )
+        };
+        match crate::content_indexing::schedule(content_indexing, options_window as isize) {
             Ok(()) => diag::write(&format!(
-                "options: content_indexing set to {}",
+                "options: content_indexing queued for {} after options close",
                 content_indexing as i32
             )),
             Err(e) => {
                 diag::write(&format!("options: content_indexing apply failed: {}", e));
                 Host::debug("everything_mcp: content indexing apply failed");
+                // 没生效就留住 Apply，让用户改完能再试一次。
+                content_indexing_failed = true;
             }
         }
     }
@@ -495,8 +530,9 @@ pub fn save_page(data: *mut c_void) -> *mut c_void {
         apply()
     };
 
-    if !ok {
-        // 应用失败（例如端口被占用）—— 保持 Apply 可点，改完再试。
+    if !ok || content_indexing_failed {
+        // 应用失败（例如端口被占用，或内容索引开关没生效）——
+        // 保持 Apply 可点，改完再试。
         page.enable_apply = 1;
     }
     abi_ok()
@@ -604,7 +640,7 @@ pub fn size_page(data: *mut c_void) -> *mut c_void {
         cx += wide + 6;
     }
 
-    // 内容索引开关 + 一行说明（紧跟全局搜索行下方）。
+    // 内容索引开关 + 两行说明（紧跟全局搜索行下方）。
     y += DLG_CHECKBOX_HIGH + DLG_SEPARATOR;
     set_rect(
         page_hwnd,
@@ -616,6 +652,16 @@ pub fn size_page(data: *mut c_void) -> *mut c_void {
     );
     y += DLG_CHECKBOX_HIGH + 3;
     set_rect(page_hwnd, ID_CONTENT_NOTE, x, y, wide, DLG_STATIC_HIGH);
+    y += DLG_STATIC_HIGH;
+    // 格式列表会换行，预留两行高度（窄对话框下默认那串扩展名就占两行）。
+    set_rect(
+        page_hwnd,
+        ID_CONTENT_FORMATS,
+        x,
+        y,
+        wide,
+        DLG_STATIC_HIGH * 2,
+    );
 
     // 恢复默认按钮贴在页面底部右角。
     let button_wide = expand_min_wide(page_hwnd, labels.restore, 75 - 24) + 24;
@@ -770,14 +816,21 @@ fn apply() -> bool {
 // 新版 Everything 把这个开关从「索引 → 文件夹」挪到了「高级」页，位置不
 // 直观。本页提供一个直达开关：
 //   - 读：解析 Everything.ini 的 [Everything] 段；
-//   - 写：原位改键（保留编码与行尾），并调官方命令行 `-add-config`
-//     合并进运行中实例（1.5 实机验证：改 window_title_format 后窗口
-//     标题立刻变化）；配合 db_save_on_exit=1，退出时落盘。
+//   - 写：保存目标值，关闭选项窗口后后台调官方 `-add-config`，等待转发
+//     完成并稳定回读。不在主线程等待、不自行覆写 INI 伪装成功。
 // 不用推测出来的 config_set_int_value：签名未公开，调错会崩宿主。
 // ============================================================
 
 /// Everything 核心 ini 键：内容索引总开关。
 const CORE_KEY_CONTENT_INDEXING: &str = "content_indexing_enabled";
+
+/// Everything 核心 ini 键：参与内容索引的文件类型白名单。
+///
+/// 本页**只读展示**这个键，不提供编辑。理由：它是全局设置，新增扩展名会让
+/// Everything 对那类文件做内容提取（PDF/DOCX 走 IFilter），索引体积与 CPU
+/// 都会涨；写错时 Everything 不报错、只是静默不索引。这个半径不该由一个
+/// 插件页承担 —— 要改请到 Everything 高级页。
+const CORE_KEY_CONTENT_FORMATS: &str = "content_indexing_include_only_files";
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum IniEncoding {
@@ -788,17 +841,22 @@ enum IniEncoding {
 
 /// Everything.ini 的候选路径：app_data 安装（默认）与便携安装（exe 旁）。
 fn core_ini_candidates() -> Vec<std::path::PathBuf> {
+    let context = crate::host_context::HostContext::current();
+    let name = context.ini_name("Everything");
+    if let Some(config) = context.config {
+        return vec![config];
+    }
     let mut paths = Vec::new();
     if let Ok(appdata) = std::env::var("APPDATA") {
         paths.push(
             std::path::PathBuf::from(appdata)
                 .join("Everything")
-                .join("Everything.ini"),
+                .join(&name),
         );
     }
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            paths.push(dir.join("Everything.ini"));
+            paths.push(dir.join(&name));
         }
     }
     paths
@@ -834,6 +892,7 @@ fn decode_core_ini(bytes: &[u8]) -> Option<(String, IniEncoding)> {
         .map(|s| (s.to_string(), IniEncoding::Utf8))
 }
 
+#[cfg(test)]
 fn encode_core_ini(content: &str, enc: IniEncoding) -> Vec<u8> {
     match enc {
         IniEncoding::Utf8 => content.as_bytes().to_vec(),
@@ -883,13 +942,18 @@ pub(crate) fn content_indexing_enabled() -> Option<bool> {
     read_content_indexing()
 }
 
-/// 读取内容索引开关的当前值；ini 不存在或键缺失时返回 None。
-fn read_content_indexing() -> Option<bool> {
+/// 当前内容索引覆盖的文件类型（供设置页只读展示与 server_diagnostics 回显）。
+pub(crate) fn content_indexing_formats() -> Option<String> {
+    read_core_value(CORE_KEY_CONTENT_FORMATS).filter(|v| !v.trim().is_empty())
+}
+
+/// 读 `[Everything]` 段里某个键的原始值；ini 不存在或键缺失时返回 None。
+fn read_core_value(key: &str) -> Option<String> {
     for path in core_ini_candidates() {
         if let Ok(bytes) = std::fs::read(&path) {
             if let Some((content, _)) = decode_core_ini(&bytes) {
-                if let Some(v) = find_core_value(&content, CORE_KEY_CONTENT_INDEXING) {
-                    return Some(v.parse::<i64>().map(|n| n != 0).unwrap_or(false));
+                if let Some(v) = find_core_value(&content, key) {
+                    return Some(v);
                 }
             }
         }
@@ -897,8 +961,15 @@ fn read_content_indexing() -> Option<bool> {
     None
 }
 
+/// 读取内容索引开关的当前值；ini 不存在或键缺失时返回 None。
+fn read_content_indexing() -> Option<bool> {
+    read_core_value(CORE_KEY_CONTENT_INDEXING)
+        .map(|v| v.parse::<i64>().map(|n| n != 0).unwrap_or(false))
+}
+
 /// 把 [Everything] 段里的键改成 `value`；键不存在时插到段头后（没有段头
 /// 就先补 `[Everything]`）。其余行、行尾风格（CRLF/LF）原样保留。
+#[cfg(test)]
 fn set_core_value(content: &str, key: &str, value: &str) -> String {
     let mut out = String::with_capacity(content.len() + 40);
     let mut in_section = false;
@@ -967,81 +1038,6 @@ fn set_core_value(content: &str, key: &str, value: &str) -> String {
         final_out.insert_str(0, &format!("[Everything]\r\n{}={}\r\n", key, value));
     }
     final_out
-}
-
-/// 持久化内容索引开关到 Everything.ini（原子替换）。
-fn write_content_indexing(enabled: bool) -> Result<(), String> {
-    let path = core_ini_candidates()
-        .into_iter()
-        .find(|p| p.exists())
-        .ok_or_else(|| "Everything.ini not found".to_string())?;
-    let bytes = std::fs::read(&path).map_err(|e| format!("read {}: {}", path.display(), e))?;
-    let (content, enc) = decode_core_ini(&bytes)
-        .ok_or_else(|| format!("{} is not UTF-8/UTF-16; not rewriting it", path.display()))?;
-    let updated = set_core_value(
-        &content,
-        CORE_KEY_CONTENT_INDEXING,
-        &(enabled as i32).to_string(),
-    );
-    if updated == content {
-        return Ok(());
-    }
-    let out = encode_core_ini(&updated, enc);
-    let tmp = path.with_extension("ini.emcp.tmp");
-    std::fs::write(&tmp, &out).map_err(|e| format!("write {}: {}", tmp.display(), e))?;
-    std::fs::rename(&tmp, &path).map_err(|e| {
-        let _ = std::fs::remove_file(&tmp);
-        format!("replace {}: {}", path.display(), e)
-    })
-}
-
-/// 应用内容索引开关：写 ini + 通过官方 `-add-config` 合并进运行中实例。
-///
-/// `-add-config` 让新的配置进入 Everything 内存（实机验证），配合
-/// `db_save_on_exit=1` 退出时落盘；只写 ini 不够 —— Everything 退出时
-/// 会用内存值覆盖，等于白改。
-fn apply_content_indexing(enabled: bool) -> Result<(), String> {
-    if let Err(e) = write_content_indexing(enabled) {
-        // 落盘失败不阻塞内存应用；但要在诊断日志里留痕。
-        diag::write(&format!(
-            "options: content_indexing ini write failed: {}",
-            e
-        ));
-    }
-
-    let tmp = std::env::temp_dir().join(format!(
-        "everything_mcp_content_indexing_{}.ini",
-        std::process::id()
-    ));
-    std::fs::write(
-        &tmp,
-        format!(
-            "[Everything]\r\n{}={}\r\n",
-            CORE_KEY_CONTENT_INDEXING, enabled as i32
-        ),
-    )
-    .map_err(|e| format!("write temp config: {}", e))?;
-
-    let exe = std::env::current_exe().map_err(|e| format!("current_exe: {}", e))?;
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let mut child = std::process::Command::new(&exe)
-        .arg("-add-config")
-        .arg(&tmp)
-        .creation_flags(CREATE_NO_WINDOW)
-        .spawn()
-        .map_err(|e| format!("spawn -add-config: {}", e))?;
-
-    // 正常情况下转发进程毫秒级退出；最多等 5 秒，绝不长时间卡 UI 线程。
-    for _ in 0..500 {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(10)),
-            Err(_) => break,
-        }
-    }
-    let _ = std::fs::remove_file(&tmp);
-    Ok(())
 }
 
 // ============================================================
@@ -1245,6 +1241,9 @@ pub(crate) struct Labels {
     content_indexing: &'static str,
     content_indexing_help: &'static str,
     content_indexing_note: &'static str,
+    content_formats: &'static str,
+    content_formats_help: &'static str,
+    content_formats_unset: &'static str,
     restore: &'static str,
     restore_help: &'static str,
     // ---- Statistics 页 ----
@@ -1280,8 +1279,11 @@ const LABELS_EN: Labels = Labels {
     global_allow: "Allow",
     global_allow_help: "search_everywhere works directly without a confirmation prompt: it searches all indexed locations by file name and returns full paths.",
     content_indexing: "Enable content indexing",
-    content_indexing_help: "Everything 1.5 moved this switch to the Advanced page (Tools > Options > Advanced: content_indexing_enabled). Ticking this applies it directly: on folders configured to index file content, grep and content: searches become possible. Only folders with 'Index file content' enabled are covered; the first enable may start a reindex, and a restart may be required on some builds.",
-    content_indexing_note: "Advanced setting: content_indexing_enabled (a restart may be required)",
+    content_indexing_help: "Save with Apply or OK, then close Options to apply content indexing in the background. Everything may rebuild its index. This setting affects content:; grep and utf8content:/ansicontent: read files independently. See server_diagnostics for pending changes or errors.",
+    content_indexing_note: "Saved changes apply after closing Options.",
+    content_formats: "Content-indexed formats: ",
+    content_formats_help: "Read-only. This is Everything's content_indexing_include_only_files (Advanced page), which decides what content: can find. Edit it there, not here: changing it affects the size and CPU cost of the global content index.",
+    content_formats_unset: "Content-indexed formats: not set (Advanced: content_indexing_include_only_files)",
     restore: "Restore Defaults",
     restore_help: "Reset to 127.0.0.1:8285 with the server disabled and global search set to Deny.",
     stats_page_name: "MCP Server Statistics",
@@ -1316,8 +1318,11 @@ const LABELS_ZH: Labels = Labels {
     global_allow: "允许",
     global_allow_help: "search_everywhere 直接可用，不再弹确认框：按文件名搜索全部已索引位置，返回完整路径。",
     content_indexing: "启用内容索引",
-    content_indexing_help: "新版 Everything 把这个开关移到了「高级」页（工具 → 选项 → 高级：content_indexing_enabled）。勾选后本页直接应用：对已配置「索引文件内容」的文件夹，grep 与 content: 搜索才可用。只覆盖勾选了「索引文件内容」的文件夹；首次开启可能触发重建索引，部分版本需重启 Everything 生效。",
-    content_indexing_note: "对应高级页设置 content_indexing_enabled（可能需重启生效）",
+    content_indexing_help: "点应用或确定保存，关闭选项窗口后在后台应用内容索引设置；Everything 可能重建索引。它影响 content:，grep 和 utf8content:/ansicontent: 自行读取文件。待处理状态和失败原因可通过 server_diagnostics 查看。",
+    content_indexing_note: "保存后关闭选项窗口，内容索引设置才会应用。",
+    content_formats: "内容索引格式：",
+    content_formats_help: "只读展示。这是 Everything 高级页的 content_indexing_include_only_files，决定 content: 能搜到哪些文件类型。请到 Everything 高级页修改——改动会影响全局内容索引的体积与 CPU 开销。",
+    content_formats_unset: "内容索引格式：未设置（高级页 content_indexing_include_only_files）",
     restore: "恢复默认",
     restore_help: "恢复为 127.0.0.1:8285、不启用服务、全局搜索为「拒绝」。",
     stats_page_name: "MCP 服务器统计",
@@ -1335,6 +1340,17 @@ const LABELS_ZH: Labels = Labels {
     stats_clear_confirm: "再点一次确认",
     stats_clear_help: "清零所有计数并删除本地统计文件。",
 };
+
+/// 「内容索引格式」那一行的文案 —— 只读展示 Everything 当前配置的覆盖范围。
+///
+/// 展示而不提供编辑，是为了让用户一眼看到 `content:` 能搜哪些格式、
+/// 代码为什么搜不到（要用 grep），同时不把改写全局索引配置的能力放进插件页。
+fn content_formats_text(labels: &Labels) -> String {
+    match content_indexing_formats() {
+        Some(list) => format!("{}{}", labels.content_formats, list),
+        None => labels.content_formats_unset.to_string(),
+    }
+}
 
 /// 按主程序界面语言取文案（探测一次后缓存）。
 pub(crate) fn labels() -> &'static Labels {

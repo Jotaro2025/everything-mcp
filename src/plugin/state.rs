@@ -138,7 +138,15 @@ pub unsafe fn destroy() {
     if let Some(s) = STATE.get() {
         s.shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
     }
+    unsafe { release_query() };
+}
 
+/// Release an idle query before a core index change, without stopping the plugin.
+///
+/// # Safety
+/// Must run on the host main thread with no other DB caller (HOST_LOCK held,
+/// or every request drained during plugin shutdown).
+pub unsafe fn release_query() {
     let host = Host::get();
 
     // swap 取走即清空：即使 db_query_destroy 缺失，句柄也不再被后续

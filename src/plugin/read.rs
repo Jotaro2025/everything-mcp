@@ -542,10 +542,10 @@ pub(crate) fn read_text_budgeted(path: &str, budget: &mut ScanBudget) -> Result<
 }
 
 #[cfg(test)]
-fn read_text_for_matching(path: &str) -> Option<(String, u64)> {
+fn read_text_for_matching(path: &str) -> Result<(String, u64), ReadError> {
     let mut budget = ScanBudget::new(MAX_FILE_BYTES + 1, Duration::from_secs(30));
-    let text = read_text_budgeted(path, &mut budget).ok()?;
-    Some((text, budget.bytes))
+    let text = read_text_budgeted(path, &mut budget)?;
+    Ok((text, budget.bytes))
 }
 
 /// 按行窗口取出的正文。
@@ -1035,9 +1035,14 @@ mod tests {
         )
         .unwrap();
         assert!(read_file(&txt.to_string_lossy(), 1, 10).is_ok());
-        // grep 那条路同样跳过二进制
-        assert!(read_text_for_matching(&path.to_string_lossy()).is_none());
-        assert!(read_text_for_matching(&txt.to_string_lossy()).is_some());
+        // grep 那条路同样跳过二进制，并且要给出 Binary 这个原因
+        assert_eq!(
+            read_text_for_matching(&path.to_string_lossy())
+                .unwrap_err()
+                .code,
+            ERR_BINARY_CONTENT
+        );
+        assert!(read_text_for_matching(&txt.to_string_lossy()).is_ok());
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(&txt);

@@ -162,6 +162,7 @@ const ACTION_KEYWORDS: &[(Action, &[&str])] = &[
             "名前の変更",
             "이름 변경",
             "renamed",
+            "rename",
             "renommé",
             "renombrado",
             "umbenannt",
@@ -180,6 +181,7 @@ const ACTION_KEYWORDS: &[(Action, &[&str])] = &[
             "移動",
             "이동",
             "moved",
+            "move",
             "déplacé",
             "movido",
             "verschoben",
@@ -198,6 +200,7 @@ const ACTION_KEYWORDS: &[(Action, &[&str])] = &[
             "削除",
             "삭제",
             "deleted",
+            "delete",
             "supprimé",
             "eliminado",
             "gelöscht",
@@ -218,6 +221,7 @@ const ACTION_KEYWORDS: &[(Action, &[&str])] = &[
             "수정",
             "변경",
             "modified",
+            "modify",
             "modifié",
             "modificado",
             "geändert",
@@ -237,6 +241,7 @@ const ACTION_KEYWORDS: &[(Action, &[&str])] = &[
             "作成",
             "생성",
             "created",
+            "create",
             "créé",
             "creado",
             "erstellt",
@@ -448,15 +453,20 @@ pub fn parse_line(line: &str) -> Option<Change> {
 /// `std::env::current_exe()` 在 DLL 里返回宿主 exe 路径，因此最后一项覆盖
 /// Everything 的便携安装（ini 挨着 `Everything.exe`）；前两项覆盖常规安装。
 fn ini_candidates() -> Vec<PathBuf> {
+    let context = crate::host_context::HostContext::current();
+    let name = context.ini_name("Everything");
+    if let Some(config) = context.config {
+        return vec![config];
+    }
     let mut v = Vec::new();
     for base in ["APPDATA", "LOCALAPPDATA"] {
         if let Ok(dir) = std::env::var(base) {
-            v.push(Path::new(&dir).join("Everything").join("Everything.ini"));
+            v.push(Path::new(&dir).join("Everything").join(&name));
         }
     }
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            v.push(dir.join("Everything.ini"));
+            v.push(dir.join(&name));
         }
     }
     v
@@ -561,6 +571,8 @@ pub fn log_directory() -> PathBuf {
 ///
 /// 文件名里的日期既是回溯跨度的依据，也天然可按字典序比较。
 fn day_files(dir: &Path) -> Vec<(String, PathBuf)> {
+    let context = crate::host_context::HostContext::current();
+    let instance = context.instance.as_deref().and_then(|s| s.to_str());
     let mut out: Vec<(String, PathBuf)> = Vec::new();
     if let Ok(rd) = fs::read_dir(dir) {
         for entry in rd.flatten() {
@@ -568,7 +580,7 @@ fn day_files(dir: &Path) -> Vec<(String, PathBuf)> {
             let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
                 continue;
             };
-            if let Some(day) = day_from_filename(name) {
+            if let Some(day) = day_from_filename_for_instance(name, instance) {
                 out.push((day, path));
             }
         }
@@ -579,8 +591,12 @@ fn day_files(dir: &Path) -> Vec<(String, PathBuf)> {
 }
 
 /// 从 `index-journal-YYYY-MM-DD.txt` 取出 `YYYY-MM-DD`。
-fn day_from_filename(name: &str) -> Option<String> {
-    let day = name.strip_prefix("index-journal-")?.strip_suffix(".txt")?;
+fn day_from_filename_for_instance(name: &str, instance: Option<&str>) -> Option<String> {
+    let stem = name.strip_prefix("index-journal-")?.strip_suffix(".txt")?;
+    let day = match instance {
+        Some(instance) => stem.strip_suffix(instance)?.strip_suffix('-')?,
+        None => stem,
+    };
     let b = day.as_bytes();
     let shape_ok = b.len() == 10
         && b[4] == b'-'
@@ -1225,6 +1241,12 @@ mod tests {
         assert_eq!(classify("File moved"), Action::Moved);
         assert_eq!(classify("Folder created"), Action::Created);
         assert_eq!(classify("Folder deleted"), Action::Deleted);
+        // Observed English Everything 1.5.0.1423b journal labels.
+        assert_eq!(classify("File Create"), Action::Created);
+        assert_eq!(classify("File Modify"), Action::Modified);
+        assert_eq!(classify("File Delete"), Action::Deleted);
+        assert_eq!(classify("File Rename"), Action::Renamed);
+        assert_eq!(classify("File Move"), Action::Moved);
     }
 
     #[test]
@@ -1388,6 +1410,7 @@ mod tests {
 
     #[test]
     fn day_from_filename_extracts_date_and_rejects_noise() {
+        let day_from_filename = |name| day_from_filename_for_instance(name, None);
         assert_eq!(
             day_from_filename("index-journal-2026-09-23.txt").as_deref(),
             Some("2026-09-23")
@@ -1395,6 +1418,21 @@ mod tests {
         assert_eq!(day_from_filename("index-journal-2026-09-2.txt"), None);
         assert_eq!(day_from_filename("other-2026-09-23.txt"), None);
         assert_eq!(day_from_filename("index-journal-2026-09-23.log"), None);
+        assert_eq!(
+            day_from_filename("index-journal-2026-09-23-other.txt"),
+            None
+        );
+        assert_eq!(
+            day_from_filename_for_instance(
+                "index-journal-2026-09-23-test-中文.txt",
+                Some("test-中文")
+            ),
+            Some("2026-09-23".into())
+        );
+        assert_eq!(
+            day_from_filename_for_instance("index-journal-2026-09-23-other.txt", Some("test-中文")),
+            None
+        );
     }
 
     #[test]

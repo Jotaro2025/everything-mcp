@@ -14,7 +14,10 @@
 use std::path::PathBuf;
 
 /// 部署后的 DLL 文件名 —— 主程序按它给 Plugins.ini 里的段命名。
+#[cfg(target_pointer_width = "64")]
 const SECTION: &str = "everything_mcp64.dll";
+#[cfg(target_pointer_width = "32")]
+const SECTION: &str = "everything_mcp32.dll";
 
 /// 从 Plugins.ini 解析出来的设置。段存在但没有 `mcp_enabled` 键时为 None。
 pub struct PersistedSettings {
@@ -113,18 +116,15 @@ fn decode_ini(bytes: &[u8]) -> String {
 }
 
 fn candidate_paths() -> Vec<PathBuf> {
+    let name = crate::host_context::HostContext::current().ini_name("Plugins");
     let mut paths = Vec::new();
     if let Ok(appdata) = std::env::var("APPDATA") {
-        paths.push(
-            PathBuf::from(appdata)
-                .join("Everything")
-                .join("Plugins.ini"),
-        );
+        paths.push(PathBuf::from(appdata).join("Everything").join(&name));
     }
     // current_exe() 是宿主进程的 Everything.exe；便携安装时 Plugins.ini 在它旁边。
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            paths.push(dir.join("Plugins.ini"));
+            paths.push(dir.join(&name));
         }
     }
     paths
@@ -182,6 +182,14 @@ fn parse_section(content: &str) -> Option<PersistedSettings> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The same persistence cases must cover the installed DLL name on x86.
+    fn parse_section(content: &str) -> Option<PersistedSettings> {
+        let content = content
+            .replace("everything_mcp64.dll", SECTION)
+            .replace("Everything_MCP64.DLL", &SECTION.to_uppercase());
+        super::parse_section(&content)
+    }
 
     #[test]
     fn parses_our_section_with_all_keys() {

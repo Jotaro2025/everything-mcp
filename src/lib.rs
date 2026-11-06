@@ -20,6 +20,8 @@
 
 // mcp 模块设为 pub：DLL 导出表由 everything_mcp.def 控制（仅导出
 // everything_plugin_proc），pub 只为让 tests/ 下的集成测试能链接 rlib。
+mod content_indexing;
+mod host_context;
 pub mod mcp;
 mod options;
 mod plugin;
@@ -215,6 +217,7 @@ unsafe fn everything_plugin_proc_impl(msg: u32, data: *mut c_void) -> *mut c_voi
         plugin::PM_STOP => {
             Host::debug("everything_mcp: PM_STOP");
             mcp::server::stop();
+            content_indexing::stop();
             // 排空已完成（server::stop 等在途请求），落最后一笔统计并
             // 收掉刷盘线程 —— 必须在 FreeLibrary 前 join。
             plugin::stats::stop_flusher();
@@ -227,6 +230,7 @@ unsafe fn everything_plugin_proc_impl(msg: u32, data: *mut c_void) -> *mut c_voi
         plugin::PM_KILL => {
             Host::debug("everything_mcp: PM_KILL");
             mcp::server::stop();
+            content_indexing::stop();
             plugin::stats::stop_flusher();
             options::mark_stopped();
             plugin::main_thread::destroy_main_window();
