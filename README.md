@@ -170,8 +170,8 @@ powershell -ExecutionPolicy Bypass -File build-installers.ps1
 
 | 安装包                              | 架构 | 内嵌插件 dll           |
 | ----------------------------------- | ---- | ---------------------- |
-| `everything-mcp-1.4.2-x64-setup.exe` | x64  | `everything_mcp64.dll` |
-| `everything-mcp-1.4.2-x86-setup.exe` | x86  | `everything_mcp32.dll` |
+| `everything-mcp-1.5.0-x64-setup.exe` | x64  | `everything_mcp64.dll` |
+| `everything-mcp-1.5.0-x86-setup.exe` | x86  | `everything_mcp32.dll` |
 
 安装：运行对应架构的安装包 → Everything 弹出「设置插件」对话框 → 点「安装」。
 两个安装包可以一起分发，`Plugins\` 下 `everything_mcp64.dll` 与

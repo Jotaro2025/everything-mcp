@@ -43,7 +43,16 @@ const DENIED_FILE_NAMES: &[&str] = &[
 
 /// 后缀黑名单（密钥库 / 证书私钥）。
 const DENIED_SUFFIXES: &[&str] = &[
-    ".pem", ".key", ".p12", ".pfx", ".jks", ".keystore", ".ppk", ".kdbx", ".keychain", ".p8",
+    ".pem",
+    ".key",
+    ".p12",
+    ".pfx",
+    ".jks",
+    ".keystore",
+    ".ppk",
+    ".kdbx",
+    ".keychain",
+    ".p8",
     ".pkcs12",
 ];
 

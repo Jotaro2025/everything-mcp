@@ -346,14 +346,22 @@ fn binary_message(path: &str, reason: &str) -> String {
 /// 就是这个行为，所以没用它）。
 fn decode_bytes(raw: &[u8]) -> (String, &'static str) {
     if raw.starts_with(&[0xFF, 0xFE]) {
-        let iter = raw[2..].as_chunks::<2>().0.iter().map(|&c| u16::from_le_bytes(c));
+        let iter = raw[2..]
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&c| u16::from_le_bytes(c));
         let s: String = char::decode_utf16(iter)
             .map(|r| r.unwrap_or(char::REPLACEMENT_CHARACTER))
             .collect();
         return (s, "utf-16le");
     }
     if raw.starts_with(&[0xFE, 0xFF]) {
-        let iter = raw[2..].as_chunks::<2>().0.iter().map(|&c| u16::from_be_bytes(c));
+        let iter = raw[2..]
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&c| u16::from_be_bytes(c));
         let s: String = char::decode_utf16(iter)
             .map(|r| r.unwrap_or(char::REPLACEMENT_CHARACTER))
             .collect();

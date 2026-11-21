@@ -186,8 +186,8 @@ Outputs (in `installer\dist\`):
 
 | Installer                            | Arch | Embedded plugin dll   |
 | ------------------------------------ | ---- | --------------------- |
-| `everything-mcp-1.4.2-x64-setup.exe` | x64  | `everything_mcp64.dll` |
-| `everything-mcp-1.4.2-x86-setup.exe` | x86  | `everything_mcp32.dll` |
+| `everything-mcp-1.5.0-x64-setup.exe` | x64  | `everything_mcp64.dll` |
+| `everything-mcp-1.5.0-x86-setup.exe` | x86  | `everything_mcp32.dll` |
 
 To install, run the installer for your architecture; Everything then shows its
 "Setup Plugin" dialog, where you click Install. Both installers can be
