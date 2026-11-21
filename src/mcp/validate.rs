@@ -153,6 +153,40 @@ pub fn translate_globstar(pattern: &str) -> String {
     p.to_string()
 }
 
+/// 把常见的大模型语法习惯转换为 Everything 1.5 原生搜索语法。
+///
+/// 大模型常常按照习惯书写参数，如：
+///   - `extension:rs` 或 `extension:rs;toml` -> `ext:rs` 或 `ext:rs;toml`
+///   - `modified:today` -> `dm:today`
+///   - `created:today` -> `dc:today`
+///   - `filename:readme` -> `name:readme`
+///   - `*.{rs,toml}` -> `ext:rs;toml`
+pub fn translate_syntax_aliases(pattern: &str) -> String {
+    let p = pattern.trim();
+    if p.is_empty() {
+        return String::new();
+    }
+    let mut out_tokens = Vec::new();
+    for token in p.split_whitespace() {
+        if let Some(rest) = token.strip_prefix("extension:").or_else(|| token.strip_prefix("Extension:")) {
+            out_tokens.push(format!("ext:{}", rest));
+        } else if let Some(rest) = token.strip_prefix("modified:").or_else(|| token.strip_prefix("Modified:")) {
+            out_tokens.push(format!("dm:{}", rest));
+        } else if let Some(rest) = token.strip_prefix("created:").or_else(|| token.strip_prefix("Created:")) {
+            out_tokens.push(format!("dc:{}", rest));
+        } else if let Some(rest) = token.strip_prefix("filename:").or_else(|| token.strip_prefix("Filename:")) {
+            out_tokens.push(format!("name:{}", rest));
+        } else if token.starts_with("*.{") && token.ends_with('}') {
+            let inner = &token[3..token.len() - 1];
+            let exts = inner.replace(',', ";");
+            out_tokens.push(format!("ext:{}", exts));
+        } else {
+            out_tokens.push(token.to_string());
+        }
+    }
+    out_tokens.join(" ")
+}
+
 /// 一个搜索项里是否用了 `content:` 搜索函数。
 ///
 /// 统一小写查子串即可：Windows 文件名里不允许冒号，`content:` 出现在搜索串里

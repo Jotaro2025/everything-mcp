@@ -20,21 +20,32 @@ const DENIED_FILE_NAMES: &[&str] = &[
     ".env",
     ".netrc",
     ".git-credentials",
+    "credentials",
     "credentials.json",
+    "service-account.json",
+    "service_account.json",
+    "client_secret.json",
     // SSH 私钥（对应的 .pub 是公钥，不在名单里）
     "id_rsa",
     "id_dsa",
     "id_ecdsa",
     "id_ed25519",
+    "id_ecdsa_sk",
+    "id_ed25519_sk",
     // 常见私钥副本命名 —— 它们的存在目的与原文件相同。
     "id_rsa.old",
     "id_dsa.old",
     "id_ecdsa.old",
     "id_ed25519.old",
+    "id_ecdsa_sk.old",
+    "id_ed25519_sk.old",
 ];
 
 /// 后缀黑名单（密钥库 / 证书私钥）。
-const DENIED_SUFFIXES: &[&str] = &[".pem", ".key", ".p12", ".pfx", ".jks", ".keystore", ".ppk"];
+const DENIED_SUFFIXES: &[&str] = &[
+    ".pem", ".key", ".p12", ".pfx", ".jks", ".keystore", ".ppk", ".kdbx", ".keychain", ".p8",
+    ".pkcs12",
+];
 
 /// `.env.*` 里属于「说明配置而非保存配置」的变体，放行。
 const ENV_TEMPLATE_SUFFIXES: &[&str] = &[".example", ".sample", ".template", ".dist"];
@@ -230,6 +241,10 @@ mod tests {
     #[test]
     fn denies_sensitive_names_at_any_depth() {
         assert!(is_sensitive_path(r"C:\Users\me\.ssh\id_rsa"));
+        assert!(is_sensitive_path(r"C:\Users\me\.ssh\id_ed25519_sk"));
+        assert!(is_sensitive_path(r"C:\Users\me\.aws\credentials"));
+        assert!(is_sensitive_path(r"D:\proj\service-account.json"));
+        assert!(is_sensitive_path(r"D:\vault\passwords.kdbx"));
         assert!(is_sensitive_path(r"D:\proj\.env"));
         assert!(is_sensitive_path(r"D:\proj\config\server.pem"));
         assert!(!is_sensitive_path(r"D:\proj\src\main.rs"));

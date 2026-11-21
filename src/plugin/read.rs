@@ -184,7 +184,9 @@ pub struct FileContent {
     /// 判定出的编码：`utf-8` / `utf-16le` / `utf-16be` / `ansi` / `utf-8-lossy`。
     /// 回显给调用方，便于判断正文可信度（`ansi` 与 `utf-8-lossy` 属于猜测）。
     pub encoding: &'static str,
-    /// 窗口内的正文（不含行号）。
+    /// 是否在正文中带行号前缀（`line_numbers`）。
+    pub line_numbers: bool,
+    /// 窗口内的正文。
     pub text: String,
 }
 
@@ -296,19 +298,16 @@ fn binary_reason(raw: &[u8], path: &str) -> Option<&'static str> {
         // （如 UTF-32/加密 blob），不能豁免。字节序必须跟着 BOM 走 ——
         // 一律按 LE 解会把大端文本解成字节交换后的乱码，嗅探结果失真。
         let little_endian = raw[0] == 0xFF;
-        let units: Vec<u16> = raw[2..]
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .map(|c| {
-                if little_endian {
-                    u16::from_le_bytes(*c)
-                } else {
-                    u16::from_be_bytes(*c)
-                }
-            })
+        let iter = raw[2..].as_chunks::<2>().0.iter().map(|&[b0, b1]| {
+            if little_endian {
+                u16::from_le_bytes([b0, b1])
+            } else {
+                u16::from_be_bytes([b0, b1])
+            }
+        });
+        let decoded: String = char::decode_utf16(iter)
+            .map(|r| r.unwrap_or(char::REPLACEMENT_CHARACTER))
             .collect();
-        let decoded = String::from_utf16_lossy(&units);
         if looks_binary(decoded.as_bytes()) {
             return Some("content");
         }
@@ -347,22 +346,18 @@ fn binary_message(path: &str, reason: &str) -> String {
 /// 就是这个行为，所以没用它）。
 fn decode_bytes(raw: &[u8]) -> (String, &'static str) {
     if raw.starts_with(&[0xFF, 0xFE]) {
-        let units: Vec<u16> = raw[2..]
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .map(|c| u16::from_le_bytes(*c))
+        let iter = raw[2..].as_chunks::<2>().0.iter().map(|&c| u16::from_le_bytes(c));
+        let s: String = char::decode_utf16(iter)
+            .map(|r| r.unwrap_or(char::REPLACEMENT_CHARACTER))
             .collect();
-        return (String::from_utf16_lossy(&units), "utf-16le");
+        return (s, "utf-16le");
     }
     if raw.starts_with(&[0xFE, 0xFF]) {
-        let units: Vec<u16> = raw[2..]
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .map(|c| u16::from_be_bytes(*c))
+        let iter = raw[2..].as_chunks::<2>().0.iter().map(|&c| u16::from_be_bytes(c));
+        let s: String = char::decode_utf16(iter)
+            .map(|r| r.unwrap_or(char::REPLACEMENT_CHARACTER))
             .collect();
-        return (String::from_utf16_lossy(&units), "utf-16be");
+        return (s, "utf-16be");
     }
     // UTF-8 BOM 交给下面的分支处理（会作为 \u{feff} 留在串首），这里显式剥掉。
     let body = raw.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(raw);
@@ -569,7 +564,7 @@ struct Window {
 ///
 /// `max_lines` 必须 ≥ 1 —— 调用方（[`read_file`] / MCP 层）负责校验，
 /// 这里不做「0 = 不限」这种第二含义。
-fn build_window(text: &str, start_line: usize, max_lines: usize) -> Window {
+fn build_window(text: &str, start_line: usize, max_lines: usize, line_numbers: bool) -> Window {
     let start = start_line.saturating_sub(1);
     let mut out = String::new();
     let mut count = 0;
@@ -586,7 +581,12 @@ fn build_window(text: &str, start_line: usize, max_lines: usize) -> Window {
             continue;
         }
         let (piece, was_clipped) = clip_line(line);
-        let extra = piece.len() + usize::from(count > 0);
+        let prefix = if line_numbers {
+            format!("{} | ", idx + 1)
+        } else {
+            String::new()
+        };
+        let extra = prefix.len() + piece.len() + usize::from(count > 0);
         if out.len() + extra > MAX_WINDOW_BYTES {
             truncated = true;
             continue;
@@ -594,6 +594,7 @@ fn build_window(text: &str, start_line: usize, max_lines: usize) -> Window {
         if count > 0 {
             out.push('\n');
         }
+        out.push_str(&prefix);
         out.push_str(&piece);
         clipped += usize::from(was_clipped);
         count += 1;
@@ -611,10 +612,12 @@ fn build_window(text: &str, start_line: usize, max_lines: usize) -> Window {
 ///
 /// `start_line` 是 1 起的起始行号；`max_lines` 必须在
 /// `1..=`[`MAX_MAX_LINES`] 之间（仍受 [`MAX_WINDOW_BYTES`] 约束）。
+/// `line_numbers` 为 true 时在每行行首增加 `行号 | ` 前缀。
 pub fn read_file(
     path: &str,
     start_line: usize,
     max_lines: usize,
+    line_numbers: bool,
 ) -> Result<FileContent, ReadError> {
     let path = validate_path(path).map_err(|m| ReadError::new(ERR_INVALID_ARGUMENT, m))?;
     if max_lines == 0 || max_lines > MAX_MAX_LINES {
@@ -637,7 +640,7 @@ pub fn read_file(
     let raw = read_raw(&path, &mut budget)?;
     let (text, encoding) = decode_bytes(&raw);
 
-    let window = build_window(&text, start_line, max_lines);
+    let window = build_window(&text, start_line, max_lines, line_numbers);
     Ok(FileContent {
         path,
         size: raw.len() as u64,
@@ -650,6 +653,7 @@ pub fn read_file(
             .truncated
             .then_some(start_line + window.lines_returned),
         encoding,
+        line_numbers,
         text: window.text,
     })
 }
@@ -719,7 +723,7 @@ mod tests {
     #[test]
     fn window_handles_millions_of_empty_lines_with_small_output() {
         let text = "\n".repeat(MAX_FILE_BYTES as usize);
-        let window = build_window(&text, 2, 3);
+        let window = build_window(&text, 2, 3, false);
         assert_eq!(window.total_lines, MAX_FILE_BYTES as usize);
         assert_eq!(window.lines_returned, 3);
         assert_eq!(window.text, "\n\n");
@@ -747,24 +751,24 @@ mod tests {
     fn build_window_slices_by_one_based_line_number() {
         let text = "a\nb\nc\nd\ne";
         // 全部
-        let w = build_window(text, 1, 100);
+        let w = build_window(text, 1, 100, false);
         assert_eq!(w.text, "a\nb\nc\nd\ne");
         assert_eq!(
             (w.total_lines, w.lines_returned, w.truncated),
             (5, 5, false)
         );
         // 中间一段
-        let w = build_window(text, 2, 2);
+        let w = build_window(text, 2, 2, false);
         assert_eq!(w.text, "b\nc");
         assert_eq!((w.total_lines, w.lines_returned, w.truncated), (5, 2, true));
         // 尾部
-        let w = build_window(text, 5, 10);
+        let w = build_window(text, 5, 10, false);
         assert_eq!(
             (w.text.as_str(), w.lines_returned, w.truncated),
             ("e", 1, false)
         );
         // 起点超出末尾 —— 空窗口而不是报错
-        let w = build_window(text, 99, 10);
+        let w = build_window(text, 99, 10, false);
         assert_eq!(
             (w.text.as_str(), w.total_lines, w.lines_returned),
             ("", 5, 0)
@@ -774,7 +778,7 @@ mod tests {
 
     #[test]
     fn build_window_tolerates_crlf_and_missing_trailing_newline() {
-        let w = build_window("a\r\nb\r\n", 1, 100);
+        let w = build_window("a\r\nb\r\n", 1, 100, false);
         assert_eq!(
             (w.text.as_str(), w.total_lines, w.lines_returned),
             ("a\nb", 2, 2)
@@ -785,7 +789,7 @@ mod tests {
     fn build_window_clips_long_lines_and_counts_them() {
         let long = "x".repeat(MAX_LINE_CHARS + 500);
         let text = format!("short\n{long}\nshort2");
-        let w = build_window(&text, 1, MAX_MAX_LINES);
+        let w = build_window(&text, 1, MAX_MAX_LINES, false);
         assert_eq!(w.clipped_lines, 1);
         assert_eq!(w.lines_returned, 3, "裁短的行仍然算一行");
         let mid = w.text.lines().nth(1).unwrap();
@@ -796,7 +800,7 @@ mod tests {
     fn build_window_clip_is_char_boundary_safe() {
         // 每个字符 3 字节：裁剪点必然落在字符中间，必须回退到边界而不是 panic
         let long = "中".repeat(MAX_LINE_CHARS + 10);
-        let w = build_window(&long, 1, 100);
+        let w = build_window(&long, 1, 100, false);
         assert_eq!(w.clipped_lines, 1);
         assert_eq!(w.text.chars().count(), MAX_LINE_CHARS);
         assert!(w.text.chars().all(|c| c == '中'));
@@ -807,7 +811,7 @@ mod tests {
         // 每行 100 字节，预算 128 KiB → 只能放进约 1300 行，且必须是整行
         let line = "y".repeat(99);
         let text = vec![line.clone(); 6000].join("\n");
-        let w = build_window(&text, 1, MAX_MAX_LINES);
+        let w = build_window(&text, 1, MAX_MAX_LINES, false);
         assert!(w.truncated, "预算拦下时 truncated 应为真");
         assert!(w.text.len() <= MAX_WINDOW_BYTES);
         assert_eq!(w.lines_returned, w.text.lines().count());
@@ -892,13 +896,13 @@ mod tests {
         let p = path.to_string_lossy().to_string();
 
         for bad in [0usize, MAX_MAX_LINES + 1] {
-            let err = read_file(&p, 1, bad).unwrap_err();
+            let err = read_file(&p, 1, bad, false).unwrap_err();
             assert_eq!(err.code, ERR_INVALID_ARGUMENT, "max_lines={bad}");
             assert!(err.message.contains("max_lines"), "{}", err.message);
         }
         // 边界值可用
-        assert!(read_file(&p, 1, 1).is_ok());
-        assert!(read_file(&p, 1, MAX_MAX_LINES).is_ok());
+        assert!(read_file(&p, 1, 1, false).is_ok());
+        assert!(read_file(&p, 1, MAX_MAX_LINES, false).is_ok());
 
         let _ = std::fs::remove_file(&path);
     }
@@ -1024,7 +1028,7 @@ mod tests {
             b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\n%%EOF\n",
         )
         .unwrap();
-        let err = read_file(&path.to_string_lossy(), 1, 10).unwrap_err();
+        let err = read_file(&path.to_string_lossy(), 1, 10, false).unwrap_err();
         assert_eq!(err.code, ERR_BINARY_CONTENT);
         assert!(err.message.contains(".pdf"), "{}", err.message);
         // 同一份内容换个文本后缀就能读 —— 证明拦的是扩展名不是内容
@@ -1034,7 +1038,7 @@ mod tests {
             b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\n%%EOF\n",
         )
         .unwrap();
-        assert!(read_file(&txt.to_string_lossy(), 1, 10).is_ok());
+        assert!(read_file(&txt.to_string_lossy(), 1, 10, false).is_ok());
         // grep 那条路同样跳过二进制，并且要给出 Binary 这个原因
         assert_eq!(
             read_text_for_matching(&path.to_string_lossy())
@@ -1051,25 +1055,49 @@ mod tests {
     #[test]
     fn read_file_denies_sensitive_paths_before_touching_them() {
         // 黑名单在 stat 之前生效：不存在的敏感路径也报 PATH_DENIED 而不是 NOT_FOUND
-        let err = read_file(r"C:\definitely\missing\.ssh\id_rsa", 1, 10).unwrap_err();
+        let err = read_file(r"C:\definitely\missing\.ssh\id_rsa", 1, 10, false).unwrap_err();
         assert_eq!(err.code, ERR_PATH_DENIED);
         assert_eq!(
             err.path.as_deref(),
             Some(r"C:\definitely\missing\.ssh\id_rsa")
         );
 
-        let err = read_file(r"D:\proj\.env", 1, 10).unwrap_err();
+        let err = read_file(r"D:\proj\.env", 1, 10, false).unwrap_err();
         assert_eq!(err.code, ERR_PATH_DENIED);
 
-        let err = read_file(r"D:\repo\.git\objects\ab\cd", 1, 10).unwrap_err();
+        let err = read_file(r"D:\repo\.git\objects\ab\cd", 1, 10, false).unwrap_err();
         assert_eq!(err.code, ERR_PATH_DENIED);
     }
 
     #[test]
     fn read_file_reports_missing_files_with_their_own_code() {
         let missing = r"C:\definitely\missing\plain-file-that-is-not-there.txt";
-        let err = read_file(missing, 1, 10).unwrap_err();
+        let err = read_file(missing, 1, 10, false).unwrap_err();
         assert_eq!(err.code, ERR_NOT_FOUND);
         assert_eq!(err.path.as_deref(), Some(missing));
+    }
+
+    #[test]
+    fn read_file_formats_line_numbers_when_requested() {
+        let root = std::env::temp_dir().join(format!("emcp_ln_probe_{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("numbered.txt");
+        std::fs::write(&path, "first line\nsecond line\nthird line\n").unwrap();
+        let p = path.to_string_lossy();
+
+        let unnumbered = read_file(&p, 1, 10, false).unwrap();
+        assert!(!unnumbered.line_numbers);
+        assert_eq!(unnumbered.text, "first line\nsecond line\nthird line");
+
+        let numbered = read_file(&p, 1, 10, true).unwrap();
+        assert!(numbered.line_numbers);
+        assert_eq!(
+            numbered.text,
+            "1 | first line\n2 | second line\n3 | third line"
+        );
+
+        let sub_window = read_file(&p, 2, 2, true).unwrap();
+        assert_eq!(sub_window.text, "2 | second line\n3 | third line");
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

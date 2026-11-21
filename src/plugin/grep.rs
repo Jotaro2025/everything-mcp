@@ -25,6 +25,8 @@ use std::time::{Duration, Instant};
 pub const DEFAULT_HEAD_LIMIT: usize = 200;
 /// `head_limit` 上限。
 pub const MAX_HEAD_LIMIT: usize = 2000;
+/// `context_lines` 上限（前后最多各 5 行）。
+pub const MAX_CONTEXT_LINES: usize = 5;
 /// 候选文件数上限 —— 超过就只处理前这么多。
 pub const MAX_CANDIDATE_FILES: usize = 2000;
 /// 单次 grep 读取的字节总量上限。
@@ -69,13 +71,17 @@ impl OutputMode {
 }
 
 /// 一条命中行。
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub struct Hit {
     pub path: String,
     /// 1 起的行号。
     pub line: usize,
     /// 命中行正文（超长已按 [`read::MAX_LINE_CHARS`] 裁剪）。
     pub text: String,
+    /// 上下文行（命中前）。
+    pub before: Vec<String>,
+    /// 上下文行（命中后）。
+    pub after: Vec<String>,
 }
 
 /// 结果载荷，形状由 `mode` 决定。
@@ -101,6 +107,7 @@ impl GrepPayload {
 pub struct GrepOutcome {
     pub mode: OutputMode,
     pub head_limit: usize,
+    pub context_lines: usize,
     /// Everything 选出的候选文件总数（截断前）。
     pub candidates: usize,
     /// 候选超过 [`MAX_CANDIDATE_FILES`]，只处理了前一部分。
@@ -142,7 +149,7 @@ fn scan_text(
     budget: &mut usize,
 ) -> (usize, usize, bool) {
     let mut scan = ScanBudget::new(MAX_TOTAL_BYTES, Duration::from_secs(30));
-    scan_text_budgeted(re, path, text, mode, head_limit, out, budget, &mut scan)
+    scan_text_budgeted(re, path, text, mode, head_limit, 0, out, budget, &mut scan)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -152,13 +159,15 @@ fn scan_text_budgeted(
     text: &str,
     mode: OutputMode,
     head_limit: usize,
+    context_lines: usize,
     out: &mut Vec<Hit>,
     budget: &mut usize,
     scan: &mut ScanBudget,
 ) -> (usize, usize, bool) {
     let mut file_hits = 0usize;
     let mut clipped = 0usize;
-    for (idx, line) in text.lines().enumerate() {
+    let lines: Vec<&str> = text.lines().collect();
+    for (idx, &line) in lines.iter().enumerate() {
         if idx % 256 == 0 && !scan.check() {
             return (file_hits, clipped, true);
         }
@@ -176,8 +185,33 @@ fn scan_text_budgeted(
         if was_clipped {
             clipped += 1;
         }
-        // 粗算这条命中占的字节：正文 + 路径 + 行号字段的余量。
-        let cost = piece.len() + path.len() + 8;
+
+        let mut before = Vec::new();
+        let mut after = Vec::new();
+        let mut context_cost = 0usize;
+        if context_lines > 0 {
+            let start = idx.saturating_sub(context_lines);
+            for &prev_line in &lines[start..idx] {
+                let (clipped_prev, c) = read::clip_line(prev_line);
+                if c {
+                    clipped += 1;
+                }
+                context_cost += clipped_prev.len() + 4;
+                before.push(clipped_prev);
+            }
+            let end = (idx + 1 + context_lines).min(lines.len());
+            for &next_line in &lines[idx + 1..end] {
+                let (clipped_next, c) = read::clip_line(next_line);
+                if c {
+                    clipped += 1;
+                }
+                context_cost += clipped_next.len() + 4;
+                after.push(clipped_next);
+            }
+        }
+
+        // 粗算这条命中占的字节：正文 + 路径 + 行号字段的余量 + 上下文。
+        let cost = piece.len() + path.len() + 8 + context_cost;
         if cost > *budget {
             return (file_hits, clipped, true);
         }
@@ -186,6 +220,8 @@ fn scan_text_budgeted(
             path: path.to_string(),
             line: idx + 1,
             text: piece,
+            before,
+            after,
         });
         if out.len() >= head_limit {
             return (file_hits, clipped, true);
@@ -218,6 +254,7 @@ pub fn grep(
     filter: &str,
     mode: OutputMode,
     head_limit: usize,
+    context_lines: usize,
     case_insensitive: bool,
     timeout_ms: u32,
 ) -> Result<GrepOutcome, String> {
@@ -252,6 +289,7 @@ pub fn grep(
         &entries,
         mode,
         head_limit,
+        context_lines,
         &mut ScanBudget::until(MAX_TOTAL_BYTES, deadline),
     ))
 }
@@ -278,10 +316,12 @@ fn scan_candidates(
         entries,
         mode,
         head_limit,
+        0,
         &mut ScanBudget::new(MAX_TOTAL_BYTES, Duration::from_secs(30)),
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn scan_candidates_budgeted(
     re: &Regex,
     candidates: usize,
@@ -289,6 +329,7 @@ fn scan_candidates_budgeted(
     entries: &[(String, bool)],
     mode: OutputMode,
     head_limit: usize,
+    context_lines: usize,
     scan: &mut ScanBudget,
 ) -> GrepOutcome {
     let mut hits: Vec<Hit> = Vec::new();
@@ -342,6 +383,7 @@ fn scan_candidates_budgeted(
             &text,
             mode,
             head_limit,
+            context_lines,
             &mut hits,
             &mut budget,
             scan,
@@ -401,6 +443,7 @@ fn scan_candidates_budgeted(
     GrepOutcome {
         mode,
         head_limit,
+        context_lines,
         candidates,
         candidates_truncated,
         files_scanned,
@@ -433,6 +476,7 @@ mod tests {
             &entries,
             OutputMode::Content,
             200,
+            0,
             &mut scan,
         );
         assert_eq!(out.bytes_scanned, 6000);
@@ -619,10 +663,36 @@ mod tests {
     #[test]
     fn grep_rejects_empty_pattern_and_bad_regex() {
         // 这两条在触达 Everything 之前就该失败
-        let e = grep("C:\\", "   ", "", OutputMode::Content, 10, false, 1000).unwrap_err();
+        let e = grep("C:\\", "   ", "", OutputMode::Content, 10, 0, false, 1000).unwrap_err();
         assert!(e.contains("must not be empty"), "{e}");
-        let e = grep("C:\\", "a(", "", OutputMode::Content, 10, false, 1000).unwrap_err();
+        let e = grep("C:\\", "a(", "", OutputMode::Content, 10, 0, false, 1000).unwrap_err();
         assert!(e.contains("invalid regex"), "{e}");
+    }
+
+    #[test]
+    fn scan_text_extracts_context_lines() {
+        let text = "line 1\nline 2\ntarget line 3\nline 4\nline 5";
+        let mut out = Vec::new();
+        let mut b = 10000;
+        let mut scan = ScanBudget::new(MAX_TOTAL_BYTES, Duration::from_secs(5));
+        let (hits, _, _) = scan_text_budgeted(
+            &re("target"),
+            "test.txt",
+            text,
+            OutputMode::Content,
+            10,
+            2,
+            &mut out,
+            &mut b,
+            &mut scan,
+        );
+        assert_eq!(hits, 1);
+        assert_eq!(out.len(), 1);
+        let h = &out[0];
+        assert_eq!(h.line, 3);
+        assert_eq!(h.text, "target line 3");
+        assert_eq!(h.before, vec!["line 1", "line 2"]);
+        assert_eq!(h.after, vec!["line 4", "line 5"]);
     }
 
     #[test]

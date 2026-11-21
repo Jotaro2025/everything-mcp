@@ -32,7 +32,8 @@ fn pattern_arg(args: &Value) -> Result<String, (i32, String)> {
         Some(_) => return Err((INVALID_PARAMS, "'pattern' must be a string".into())),
     };
     let p = validate::validate_pattern(raw).map_err(|e| (INVALID_PARAMS, e))?;
-    Ok(validate::translate_globstar(&p))
+    let p = validate::translate_globstar(&p);
+    Ok(validate::translate_syntax_aliases(&p))
 }
 
 /// 取 exclude 参数：字符串或字符串数组，每项作为一条 Everything NOT 项。
@@ -489,6 +490,8 @@ fn tool_server_diagnostics(_args: &Value) -> Result<ToolOutput, (i32, String)> {
             "protocol_versions": crate::mcp::protocol::SUPPORTED_PROTOCOL_VERSIONS,
             "listening": bound_port.is_some(),
             "bound_port": bound_port,
+            "active_connections": bound_port.map(|_| crate::mcp::server::inflight_count()),
+            "peak_connections": bound_port.map(|_| crate::mcp::server::peak_inflight_count()),
             "enabled": enabled,
             "bind": bind,
             "configured_port": configured_port,
@@ -859,7 +862,9 @@ fn tool_read_file(args: &Value) -> Result<ToolOutput, (i32, String)> {
         ));
     }
 
-    match plugin::read::read_file(&path, start_line, max_lines) {
+    let line_numbers = bool_arg(args, "line_numbers", false)?;
+
+    match plugin::read::read_file(&path, start_line, max_lines, line_numbers) {
         Ok(c) => {
             let meta = serde_json::to_string_pretty(&json!({
                 "path": c.path,
@@ -871,6 +876,7 @@ fn tool_read_file(args: &Value) -> Result<ToolOutput, (i32, String)> {
                 "truncated": c.truncated,
                 "clipped_lines": c.clipped_lines,
                 "encoding": c.encoding,
+                "line_numbers": c.line_numbers,
             }))
             .unwrap_or_else(|_| "{\"error\":\"serialization failed\"}".into());
             Ok((content_meta_and_body(&meta, &c.text), false))
@@ -960,6 +966,12 @@ fn tool_grep(args: &Value) -> Result<ToolOutput, (i32, String)> {
             ),
         ));
     }
+    let context_lines = usize_arg(
+        args,
+        "context_lines",
+        0,
+        plugin::grep::MAX_CONTEXT_LINES as u64,
+    )?;
     let case_insensitive = bool_arg(args, "case_insensitive", false)?;
     let timeout_ms = timeout_arg(args, plugin::grep::DEFAULT_TIMEOUT_MS)?;
 
@@ -969,6 +981,7 @@ fn tool_grep(args: &Value) -> Result<ToolOutput, (i32, String)> {
         &candidate_filter,
         mode,
         head_limit,
+        context_lines,
         case_insensitive,
         timeout_ms,
     ) {
@@ -980,6 +993,7 @@ fn tool_grep(args: &Value) -> Result<ToolOutput, (i32, String)> {
                 "exclude": excludes,
                 "output_mode": o.mode.as_str(),
                 "head_limit": o.head_limit,
+                "context_lines": o.context_lines,
                 "candidates": o.candidates,
                 "candidates_truncated": o.candidates_truncated,
                 "files_scanned": o.files_scanned,
@@ -997,11 +1011,20 @@ fn tool_grep(args: &Value) -> Result<ToolOutput, (i32, String)> {
                 plugin::grep::GrepPayload::Content(hits) => {
                     out["matches"] = json!(hits
                         .iter()
-                        .map(|h| json!({
-                            "path": h.path,
-                            "line": h.line,
-                            "text": h.text,
-                        }))
+                        .map(|h| {
+                            let mut item = json!({
+                                "path": h.path,
+                                "line": h.line,
+                                "text": h.text,
+                            });
+                            if !h.before.is_empty() {
+                                item["before"] = json!(h.before);
+                            }
+                            if !h.after.is_empty() {
+                                item["after"] = json!(h.after);
+                            }
+                            item
+                        })
                         .collect::<Vec<_>>());
                 }
                 plugin::grep::GrepPayload::Files(files) => {

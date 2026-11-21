@@ -47,6 +47,15 @@ static SERVER: Mutex<Option<ServerHandle>> = Mutex::new(None);
 
 /// 在途连接计数：并发上限与 PM_STOP 排空共用。
 static INFLIGHT: AtomicUsize = AtomicUsize::new(0);
+static PEAK_INFLIGHT: AtomicUsize = AtomicUsize::new(0);
+
+pub fn inflight_count() -> usize {
+    INFLIGHT.load(Ordering::Relaxed)
+}
+
+pub fn peak_inflight_count() -> usize {
+    PEAK_INFLIGHT.load(Ordering::Relaxed)
+}
 
 /// 全局停机标志：停止时拒绝新的宿主任务；排队和查询等待均检查此标志。
 static STOPPING: AtomicBool = AtomicBool::new(false);
@@ -258,7 +267,8 @@ fn run_listener(listener: TcpListener, shutdown: std::sync::Arc<AtomicBool>) {
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
                     .push((id, control));
-                INFLIGHT.fetch_add(1, Ordering::SeqCst);
+                let current = INFLIGHT.fetch_add(1, Ordering::SeqCst) + 1;
+                PEAK_INFLIGHT.fetch_max(current, Ordering::Relaxed);
                 let s_clone = shutdown.clone();
                 let spawned = thread::Builder::new()
                     .name("everything-mcp-conn".into())

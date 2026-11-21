@@ -585,7 +585,7 @@ fn build_tools_list(mode: GlobalSearchMode) -> Value {
             },
             {
                 "name": "read_file",
-                "description": "Read one text file, optionally a window of lines. Companion to search_in_folder: search to locate, read_file to read. 'path' must be absolute and point at a single existing file — no wildcards (use search_in_folder) and no folders (the folder error carries 'suggested_tool' pointing at list_folder); files above 8 MiB are refused. Returns whole lines from 'start_line' (1-based), at most 'max_lines' (default 2000, max 4000), always within a 128 KiB text budget — whichever bites first, never mid-line. Response carries 'total_lines', 'lines_returned' and 'next_start_line' (pass it back as 'start_line'; stop when null). 'truncated' means content remains beyond the window; lines over 16384 chars are cut separately and counted in 'clipped_lines' — a different signal. 'encoding' is 'utf-8'/'utf-16le'/'utf-16be' when certain, 'ansi' when nothing was valid UTF-8 or a BOM so the machine's ANSI code page was assumed (right for GBK on a Chinese Windows, a guess elsewhere), 'utf-8-lossy' when undecodable bytes were replaced — distrust the last two. Never returned: private keys and credential bundles (id_rsa*/id_ed25519, .env, .netrc, .git-credentials, credentials.json, *.pem/*.key/*.p12/*.pfx/*.jks/*.keystore/*.ppk, .git/objects); that denylist is not configurable. Binary is rejected by extension (documents, archives, executables, media, fonts, databases) and by content (a NUL byte, or over 30% non-printable bytes in the first 4 KiB); text formats (.json/.xml/.svg/.log/.csv/.md/.dat) are never blocked by extension, and a UTF-16 BOM file is exempt from the sniff. Failures carry 'error' plus a 'code' (INVALID_ARGUMENT, NOT_FOUND, PATH_IS_DIRECTORY, PATH_DENIED, BINARY_CONTENT, TOO_LARGE, READ_FAILED) — branch on the code. This does not search contents: use grep for matching lines, or search_in_folder with 'content:\"...\"' for documents.",
+                "description": "Read one text file, optionally a window of lines. Companion to search_in_folder: search to locate, read_file to read. 'path' must be absolute and point at a single existing file — no wildcards (use search_in_folder) and no folders (folder error suggests list_folder); files above 8 MiB are refused. Returns whole lines from 'start_line' (1-based), at most 'max_lines' (default 2000, max 4000), always within a 128 KiB text budget — whichever bites first, never mid-line. Response carries 'total_lines', 'lines_returned' and 'next_start_line' (pass it back as 'start_line'; stop when null). 'truncated' means content remains beyond the window; lines over 16384 chars are cut separately and counted in 'clipped_lines'. 'encoding' reports detected encoding ('utf-8', 'utf-16le', 'utf-16be', 'ansi', 'utf-8-lossy'). Never returned: private keys and credential bundles (id_rsa*/id_ed25519, .env, .netrc, .git-credentials, credentials.json, *.pem/*.key/*.p12/*.pfx/*.kdbx, .git/objects); that denylist is not configurable. Binary is rejected by extension and by content (NUL byte or >30% non-printable bytes in first 4 KiB); text formats (.json/.xml/.svg/.log/.csv/.md/.dat) are not blocked by extension. Failures carry 'error' plus 'code' (INVALID_ARGUMENT, NOT_FOUND, PATH_IS_DIRECTORY, PATH_DENIED, BINARY_CONTENT, TOO_LARGE, READ_FAILED). This does not search contents: use grep for matching lines, or search_in_folder with 'content:\"...\"' for documents.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -604,6 +604,11 @@ fn build_tools_list(mode: GlobalSearchMode) -> Value {
                             "default": 2000,
                             "minimum": 1,
                             "maximum": 4000
+                        },
+                        "line_numbers": {
+                            "type": "boolean",
+                            "description": "Prepend 'line | ' numbers to each line (default false).",
+                            "default": false
                         }
                     },
                     "required": ["path"]
@@ -611,7 +616,7 @@ fn build_tools_list(mode: GlobalSearchMode) -> Value {
             },
             {
                 "name": "grep",
-                "description": "Search file CONTENTS by regex and return the matching lines with line numbers. Line-level companion to search_in_folder, which answers WHICH files contain something (paths only). Candidates come from the Everything index, so 'filter' decides how much gets read — an unfiltered grep reads every candidate. 'filter' uses Everything syntax ('ext:rs;toml', 'dm:lastweek', '!\\\\target\\\\') and is applied before any read; 'pattern' is a Rust regex matched against each line separately, so '^'/'$' anchor to line boundaries and a newline in the pattern can never match. 'output_mode': 'content' (default) returns {path, line, text}, 'filesWithMatches' returns paths, 'count' returns per-file counts. 'head_limit' caps matches (content) or files (others); default 200, max 2000. Limits: 2000 candidates, 64 MiB actual reads (including rejected samples), 128 KiB output, and timeout_ms for query+scan. 'truncation_reason' identifies the cap when truncated; 'files_skipped' counts rejected files; matched lines over 16384 chars are cut into 'clipped_lines'. Binary files, files above 8 MiB and denylisted paths are skipped and never returned. grep reads TEXT only: document formats (.pdf/.docx/.xlsx/.pptx/.odt/.rtf/.epub) are refused by extension and counted in 'binary_skipped' — a zero over a document folder usually means 'unreadable format', not 'no match'; use search_in_folder with 'content:\"...\"' for those, or 'utf8content:\"...\"' for paths only. Results are newest first, by file modification time. When nothing matches, 'folder_warning' distinguishes a bad path from a true empty. Prefer this over search_in_folder + read_file when you need to know WHERE inside files a term occurs.",
+                "description": "Search file CONTENTS by regex and return the matching lines with line numbers. Line-level companion to search_in_folder, which answers WHICH files contain something (paths only). Candidates come from the Everything index, so 'filter' decides how much gets read — an unfiltered grep reads every candidate. 'filter' uses Everything syntax ('ext:rs;toml', 'dm:lastweek', '!\\\\target\\\\') and is applied before any read; 'pattern' is a Rust regex matched against each line separately, so '^'/'$' anchor to line boundaries and a newline in the pattern can never match. 'output_mode': 'content' (default) returns {path, line, text}, 'filesWithMatches' returns paths, 'count' returns per-file counts. 'head_limit' caps matches (content) or files (others); default 200, max 2000. 'context_lines' returns surrounding context before/after matching lines. Limits: 2000 candidates, 64 MiB actual reads (including rejected samples), 128 KiB output, and timeout_ms for query+scan. 'truncation_reason' identifies the cap when truncated; 'files_skipped' counts rejected files; matched lines over 16384 chars are cut into 'clipped_lines'. Binary files, files above 8 MiB and denylisted paths are skipped and never returned. grep reads TEXT only: document formats (.pdf/.docx/.xlsx/.pptx/.odt/.rtf/.epub) are refused by extension and counted in 'binary_skipped' — use search_in_folder with 'content:\"...\"' for those. Results are newest first, by file modification time. When nothing matches, 'folder_warning' distinguishes a bad path from a true empty. Prefer this over search_in_folder + read_file when you need to know WHERE inside files a term occurs.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -639,6 +644,13 @@ fn build_tools_list(mode: GlobalSearchMode) -> Value {
                             "default": 200,
                             "minimum": 1,
                             "maximum": 2000
+                        },
+                        "context_lines": {
+                            "type": "integer",
+                            "description": "Lines of context before and after each match (0..5, default 0).",
+                            "default": 0,
+                            "minimum": 0,
+                            "maximum": 5
                         },
                         "case_insensitive": {
                             "type": "boolean",
